@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import re
+from decimal import Decimal
 from typing import Any
 
 from usagetrim.metrics.tokenizer import count_tokens
@@ -31,11 +32,31 @@ _MIN_ROWS = 3
 _UNWRAP_KEYS = frozenset({"result"})
 
 
+class _InexactNumber(ValueError):
+    """A JSON number whose value would change on the way through a float."""
+
+
+def _exact_float(literal: str) -> float:
+    value = float(literal)
+    # json.dumps writes repr(value); refuse numbers that would come back different,
+    # such as NUMERIC columns with more significant digits than a double holds.
+    if Decimal(literal) != Decimal(repr(value)):
+        raise _InexactNumber(literal)
+    return value
+
+
+def _loads(text: str) -> Any:
+    """Parse a payload that will be re-serialized, or raise if that would be lossy."""
+    return json.loads(text, parse_float=_exact_float)
+
+
 def _dump(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def _parses_as_json(text: str) -> bool:
+    # Deliberately lenient: any string that is valid JSON must be quoted in a cell,
+    # including one holding a number too precise for a float.
     try:
         json.loads(text)
     except ValueError:
@@ -104,7 +125,7 @@ def _compact_value(value: Any) -> str:
 def _compact_boundaries(text: str) -> str | None:
     def replace(match: re.Match[str]) -> str:
         try:
-            value = json.loads(match[3])
+            value = _loads(match[3])
         except ValueError:
             return match[0]
         return match[1] + _compact_value(value) + match[4]
@@ -115,7 +136,7 @@ def _compact_boundaries(text: str) -> str | None:
 
 def _transform(text: str) -> str | None:
     try:
-        value = json.loads(text)
+        value = _loads(text)
     except ValueError:
         return _compact_boundaries(text)
     if isinstance(value, dict) and len(value) == 1 and next(iter(value)) in _UNWRAP_KEYS:

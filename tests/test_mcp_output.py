@@ -122,3 +122,47 @@ def test_hook_compacts_other_mcp_servers_but_not_usagetrim(tmp_path, monkeypatch
         "mcp__plugin_usagetrim_usagetrim__usagetrim_read",
     ):
         assert native_hooks.claude_post_tool_use(_payload(own, response)) == {}
+
+
+# Literals with more significant digits than a double holds, as a Postgres NUMERIC
+# column produces them. Python floats cannot express these, so the rows are written
+# as JSON text rather than built with json.dumps.
+INEXACT = ["1000000000000000001.5", "12345678901234567.89", "0.30000000000000000001"]
+
+
+def _decimal_rows(*literals):
+    values = [*literals, *(f"{i}.25" for i in range(len(literals), 40))]
+    rows = (
+        f'{{"id":{i},"account":"account-{i:02d}","balance":{value}}}'
+        for i, value in enumerate(values)
+    )
+    return "[" + ",".join(rows) + "]"
+
+
+def test_numbers_a_float_cannot_hold_reach_the_model_unchanged():
+    raw = _decimal_rows(*INEXACT)
+    compact = compact_mcp_text(raw)
+    # Re-serializing through a float would print 1e+18 for the first balance.
+    shown = compact or raw
+    for literal in INEXACT:
+        assert literal in shown
+
+
+def test_supabase_decimals_keep_every_digit_after_unwrapping():
+    body = (
+        f"Below is the result of the SQL query.\n\n<{TAG}>\n{_decimal_rows(*INEXACT)}\n</{TAG}>"
+        "\n\nUse this data to inform your next steps."
+    )
+    compact = compact_mcp_text(json.dumps({"result": body}))
+    # The escaped wrapper is still removed; only the lossy table rewrite is skipped.
+    assert compact is not None and "\\" not in compact
+    for literal in INEXACT:
+        assert literal in compact
+
+
+def test_a_string_holding_an_inexact_decimal_stays_a_string():
+    rows = [{"id": i, "currency": "EUR", "amount": "12345678901234567.89"} for i in range(40)]
+    compact = compact_mcp_text(json.dumps(rows, indent=2))
+    assert compact is not None
+    # The cell must stay quoted, or the TSV rule would read it back as a number.
+    assert _decode_tsv(compact) == rows
