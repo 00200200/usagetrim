@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import re
 from decimal import Decimal
+from functools import lru_cache
 from typing import Any
 
 from usagetrim.metrics.tokenizer import count_tokens
@@ -54,6 +55,7 @@ def _dump(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+@lru_cache(maxsize=1024)
 def _parses_as_json(text: str) -> bool:
     # Deliberately lenient: any string that is valid JSON must be quoted in a cell,
     # including one holding a number too precise for a float.
