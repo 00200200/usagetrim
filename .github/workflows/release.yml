@@ -12,10 +12,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
@@ -40,7 +40,7 @@ jobs:
       - name: Build distributions
         run: uv build
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: python-distributions
           path: dist/*
@@ -50,7 +50,7 @@ jobs:
       - name: Pack Claude Desktop extension
         run: mkdir -p mcpb && npx -y @anthropic-ai/mcpb@2.1.2 pack extensions/claude-desktop "mcpb/usagetrim-${GITHUB_REF_NAME#v}.mcpb"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: claude-desktop-extension
           path: mcpb/*.mcpb
@@ -60,7 +60,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build portable app and verify signature
         run: |
           bash macos/build.sh
@@ -75,7 +75,7 @@ jobs:
           PY
           mkdir -p dist
           ditto -c -k --sequesterRsrc --keepParent macos/build/UsageTrim.app "dist/UsageTrim-macos-$(uname -m).zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-app
           path: dist/*.zip
@@ -93,7 +93,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: python-distributions
           path: dist
@@ -105,14 +105,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
       - name: Compute checksums
         run: cd dist && sha256sum *.whl *.tar.gz *.zip *.mcpb > SHA256SUMS.txt
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*
