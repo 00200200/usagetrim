@@ -1,0 +1,32 @@
+[
+  {
+    "id": 1,
+    "title": "feat(specialized): Next.js & TurboPack SSR compilation log & hydration error compactor",
+    "labels": ["enhancement", "help wanted"],
+    "body": "## Problem Statement / Background\n\nWhen running `next dev` or `next build`, Next.js and TurboPack output thousands of lines detailing module compilation, static route generation, font optimizations, and webpack chunks. When a React hydration error or server component error occurs, the actual stack trace is buried in verbose chunk compilation logs.\n\n## Inspiration from State-of-the-Art Tools\n\nNext.js error overlays and Vite error formatters isolate the root React stack trace and hide repetitive bundle compilation steps.\n\n## Proposed Solution & Architecture\n\nImplement `src/usagetrim/filters/nextjs.py`:\n1. Fold chunk generation tables and module compilation timings.\n2. Preserve hydration failure root causes, component call stacks, and dynamic import errors.\n3. Add test fixtures from real-world Next.js 14/15 build traces.\n\n## Acceptance Criteria & Test Plan\n\n- [ ] Compresses standard Next.js build output by >85% tokens.\n- [ ] Zero loss of React server component error traces.\n- [ ] Tested with mock Next.js fixture in `tests/test_nextjs.py`."
+  },
+  {
+    "id": 2,
+    "title": "feat(specialized): Apache Spark & PySpark executor log compactor & task skew detector",
+    "labels": ["enhancement", "help wanted"],
+    "body": "## Problem Statement / Background\n\nPySpark and Spark standalone driver logs produce millions of lines of heartbeats, stage completion metrics, and block manager gossip. Finding executor OutOfMemory errors or data skew bottlenecks consumes huge context windows.\n\n## Inspiration from State-of-the-Art Tools\n\nSpark UI and Dr. Elephant summarize stage task distributions into percentile histograms rather than printing every executor event.\n\n## Proposed Solution & Architecture\n\nImplement `src/usagetrim/filters/spark.py`:\n1. Compact repetitive TaskSetManager and BlockManager INFO logs.\n2. Summarize stage metrics (min/median/max duration).\n3. Retain complete Py4J Java gateway exceptions and PySpark stack traces.\n\n## Acceptance Criteria & Test Plan\n\n- [ ] Reduces verbose Spark logs by >90% tokens.\n- [ ] Captures exact Java/Python traceback on executor failure.\n- [ ] Full unit test coverage in `tests/test_spark.py`."
+  },
+  {
+    "id": 3,
+    "title": "feat(specialized): Android Gradle & adb logcat verbose filter and crash extractor",
+    "labels": ["enhancement", "help wanted"],
+    "body": "## Problem Statement / Background\n\nMobile development agents debugging Android applications face flooded terminal logs from `adb logcat` and `:app:compileDebugJavaWithJavac`. 99% of logcat lines are background OS noise (system_server, SurfaceFlinger, audio_hw).\n\n## Inspiration from State-of-the-Art Tools\n\n`pidcat` and Android Studio Logcat 2.0 filter logs by active application PID/package and highlight FATAL EXCEPTION blocks.\n\n## Proposed Solution & Architecture\n\nImplement `src/usagetrim/filters/android.py`:\n1. Filter logcat entries to the target package or crash signatures (`FATAL EXCEPTION`, `ANR in`).\n2. Compact repetitive Proguard/R8 and DEX optimization output.\n3. Recover full tombstone native stack traces on SIGSEGV.\n\n## Acceptance Criteria & Test Plan\n\n- [ ] Strips OS noise from `adb logcat`.\n- [ ] Preserves complete Android runtime exceptions.\n- [ ] Added unit tests in `tests/test_android.py`."
+  },
+  {
+    "id": 4,
+    "title": "feat(specialized): Swift & Xcodebuild compiler warning and asset compilation compactor",
+    "labels": ["enhancement", "help wanted"],
+    "body": "## Problem Statement / Background\n\n`xcodebuild` generates gigabytes of raw compiler output, printing every individual `CompileSwiftSources`, `CpResource`, and `CodeSign` invocation. Agents need clean error summaries without thousands of lines of command line flag echoes.\n\n## Inspiration from State-of-the-Art Tools\n\n`xcbeautify` and `xcpretty` parse xcodebuild streams into clean, single-line progress steps and formatted failure cards.\n\n## Proposed Solution & Architecture\n\nImplement `src/usagetrim/filters/xcodebuild.py`:\n1. Suppress redundant compiler flag expansions and provisioning profile validations.\n2. Extract and format Swift compiler syntax errors with line/column context.\n3. Output compact summary on build completion.\n\n## Acceptance Criteria & Test Plan\n\n- [ ] Folds normal xcodebuild compilation by >95% tokens.\n- [ ] Preserves full diagnostic messages for build failures.\n- [ ] Tested with real xcodebuild log fixtures."
+  },
+  {
+    "id": 5,
+    "title": "feat(cache): Semantic KV cache eviction policy based on Least Recently Inquired (LRI)",
+    "labels": ["enhancement", "help wanted"],
+    "body": "## Problem Statement / Background\n\nUsageTrim's reference-recoverable storage caches full output blocks in local SQLite. Currently, cache pruning is simple FIFO. Retaining frequently referenced error logs while evicting stale build outputs preserves recovery guarantees without disk bloating.\n\n## Inspiration from State-of-the-Art Tools\n\nRedis cache eviction policies (LFU, LRU) and vLLM PagedAttention prefix caching algorithms.\n\n## Proposed Solution & Architecture\n\nImplement Least Recently Inquired (LRI) in `src/usagetrim/core/cache.py`:\n1. Track read/expansion hits for cached output references.\n2. Weight reference retention by recency of recall and frequency.\n3. Automatic background vacuuming when cache size exceeds configured budget (default 500MB).\n\n## Acceptance Criteria & Test Plan\n\n- [ ] LRI eviction preserves recovered blocks over unreferenced outputs.\n- [ ] Cache cleanup runs safely in <50ms.\n- [ ] Unit tests in `tests/test_cache_policy.py`."
+  }
+]
