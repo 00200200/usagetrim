@@ -1,3 +1,4 @@
+import json
 import re
 
 import pytest
@@ -24,6 +25,7 @@ from usagetrim.core.specialized import (
     filter_npm_install,
     filter_pip_install,
     filter_pyright,
+    filter_ripgrep_output,
     filter_ruff,
     filter_terraform,
     filter_tsc,
@@ -1739,3 +1741,179 @@ def test_gh_run_log_filter_only_applies_to_log_views(tmp_path, monkeypatch):
     assert compact is not None and "LIT002" in compact and "Runner Image" not in compact
     assert auto_specialize_command_output("gh run view 123", _GH_RUN_LOG) is None
     assert filter_gh_run_log("plain text\nwithout any tab-separated gh log prefixes\n" * 20) is None
+
+
+def _rg_json_event(event_type: str, path: str, **extra) -> str:
+    data: dict = {"path": {"text": path}}
+    data.update(extra)
+    return json.dumps({"type": event_type, "data": data}, separators=(",", ":"))
+
+
+def _rg_json_match(path: str, line_number: int, text: str, matched: str = "needle") -> str:
+    start = text.find(matched)
+    if start < 0:
+        start = 0
+        matched = text[: max(1, min(6, len(text)))]
+    return _rg_json_event(
+        "match",
+        path,
+        lines={"text": text if text.endswith("\n") else text + "\n"},
+        line_number=line_number,
+        absolute_offset=line_number * 40,
+        submatches=[{"match": {"text": matched}, "start": start, "end": start + len(matched)}],
+    )
+
+
+def _rg_json_context(path: str, line_number: int, text: str) -> str:
+    return _rg_json_event(
+        "context",
+        path,
+        lines={"text": text if text.endswith("\n") else text + "\n"},
+        line_number=line_number,
+        absolute_offset=line_number * 40,
+        submatches=[],
+    )
+
+
+def _sample_rg_json_dense() -> str:
+    """Authored ``rg --json`` stream: one hot file, context noise, many other hits."""
+    lines: list[str] = []
+    hot = "vendor/third_party/bundle.js"
+    lines.append(_rg_json_event("begin", hot))
+    for i in range(1, 16):
+        lines.append(
+            _rg_json_context(hot, i * 10 - 1, f"// padding context line {i} " + ("x" * 60))
+        )
+        lines.append(_rg_json_match(hot, i * 10, f"function needle_helper_{i}() {{ return {i}; }}"))
+        lines.append(_rg_json_context(hot, i * 10 + 1, f"// trailing context {i} " + ("y" * 60)))
+    lines.append(
+        _rg_json_event(
+            "end",
+            hot,
+            binary_offset=None,
+            stats={
+                "elapsed": {"secs": 0, "nanos": 1},
+                "searches": 1,
+                "searches_with_match": 1,
+                "bytes_searched": 9000,
+                "bytes_printed": 8000,
+                "matched_lines": 15,
+                "matches": 15,
+            },
+        )
+    )
+    for file_i in range(20):
+        path = f"src/mod_{file_i}/handler.py"
+        lines.append(_rg_json_event("begin", path))
+        for j in range(4):
+            lines.append(_rg_json_context(path, 20 + j * 5 - 1, f"# ctx before {file_i}.{j}"))
+            lines.append(_rg_json_match(path, 20 + j * 5, f"def use_needle_{file_i}_{j}(): pass"))
+            lines.append(_rg_json_context(path, 20 + j * 5 + 1, f"# ctx after {file_i}.{j}"))
+        lines.append(_rg_json_event("end", path, binary_offset=None, stats={}))
+    lines.append(
+        json.dumps(
+            {
+                "type": "summary",
+                "data": {
+                    "elapsed_total": {"human": "0.05s", "nanos": 5e7, "secs": 0},
+                    "stats": {"matched_lines": 95, "matches": 95},
+                },
+            },
+            separators=(",", ":"),
+        )
+    )
+    return "\n".join(lines)
+
+
+SAMPLE_RG_JSON_DENSE = _sample_rg_json_dense()
+
+SAMPLE_RG_TEXT_CONTEXT = "\n".join(
+    [
+        "src/utils.py-9-# helpers",
+        "src/utils.py:10:def needle_a():",
+        "src/utils.py-11-    return 1",
+        "--",
+        "src/utils.py-19-# more",
+        "src/utils.py:20:def needle_b():",
+        "src/utils.py-21-    return 2",
+        "--",
+        "src/utils.py-29-# again",
+        "src/utils.py:30:def needle_c():",
+        "src/utils.py-31-    return 3",
+        "--",
+        "src/utils.py-39-# again",
+        "src/utils.py:40:def needle_d():",
+        "src/utils.py-41-    return 4",
+        "--",
+        "src/app.py-4-import os",
+        "src/app.py:5:from utils import needle_a",
+        "src/app.py-6-print('ok')",
+    ]
+)
+
+
+def test_filter_ripgrep_json_clusters_by_file_and_drops_context():
+    compact = filter_ripgrep_output(SAMPLE_RG_JSON_DENSE)
+
+    assert "vendor/third_party/bundle.js: 15 matches (3 shown, 12 omitted by usagetrim)" in compact
+    assert "function needle_helper_1()" in compact
+    assert "function needle_helper_2()" in compact
+    assert "function needle_helper_3()" in compact
+    assert "function needle_helper_4()" not in compact
+    assert "padding context line" not in compact
+    assert "trailing context" not in compact
+    assert '"type":"context"' not in compact
+    assert '"type":"begin"' not in compact
+    assert "src/mod_0/handler.py" in compact
+    # Global cap stops flooding the rest of the tree.
+    assert "more files omitted by usagetrim" in compact
+    assert "src/mod_19/handler.py" not in compact
+
+
+def test_filter_ripgrep_json_saves_majority_of_tokens():
+    compact = filter_ripgrep_output(SAMPLE_RG_JSON_DENSE)
+    raw_tokens = count_tokens(SAMPLE_RG_JSON_DENSE).openai
+    out_tokens = count_tokens(compact).openai
+    reduction = 100 * (raw_tokens - out_tokens) / raw_tokens
+    assert reduction >= 70.0, (
+        f"expected >=70% savings on rg --json, got {reduction:.1f}% ({raw_tokens}->{out_tokens})"
+    )
+    assert len(compact) < len(SAMPLE_RG_JSON_DENSE) * 0.3
+
+
+def test_filter_ripgrep_text_caps_per_file_and_drops_context():
+    compact = filter_ripgrep_output(SAMPLE_RG_TEXT_CONTEXT)
+
+    assert "src/utils.py: 4 matches (3 shown, 1 omitted by usagetrim)" in compact
+    assert "10: def needle_a():" in compact
+    assert "20: def needle_b():" in compact
+    assert "30: def needle_c():" in compact
+    assert "40: def needle_d():" not in compact
+    assert "src/app.py: 1 match" in compact
+    assert "5: from utils import needle_a" in compact
+    assert "# helpers" not in compact
+    assert "src/utils.py-9-" not in compact
+
+
+def test_filter_ripgrep_leaves_unrelated_output_unchanged():
+    raw = "rg: unrecognized flag --nope\n"
+    assert filter_ripgrep_output(raw) == raw
+
+
+def test_auto_specialize_routes_rg_and_grep_r():
+    compact = auto_specialize_command_output("rg --json needle", SAMPLE_RG_JSON_DENSE)
+    assert compact is not None
+    assert "omitted by usagetrim" in compact
+    assert "padding context line" not in compact
+
+    compact_abs = auto_specialize_command_output(
+        "/opt/homebrew/bin/rg -n needle src", SAMPLE_RG_TEXT_CONTEXT
+    )
+    assert compact_abs is not None
+    assert "src/utils.py: 4 matches" in compact_abs
+
+    compact_grep = auto_specialize_command_output("grep -rn needle .", SAMPLE_RG_TEXT_CONTEXT)
+    assert compact_grep is not None
+    assert "omitted by usagetrim" in compact_grep
+
+    assert auto_specialize_command_output("grep needle file.txt", SAMPLE_RG_TEXT_CONTEXT) is None

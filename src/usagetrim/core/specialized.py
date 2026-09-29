@@ -1895,6 +1895,269 @@ def _is_sql_dense_output(raw_output: str) -> bool:
     return matches >= 4
 
 
+# ---------------------------------------------------------------------------
+# ripgrep / recursive grep — cluster matches by file, drop context, cap density
+# ---------------------------------------------------------------------------
+
+_RG_JSON_TYPES = frozenset({"begin", "match", "context", "end", "summary"})
+_RG_TEXT_MATCH_RE = re.compile(r"^(.+?):(\d+):(.*)$")
+_RG_TEXT_CONTEXT_RE = re.compile(r"^(.+?)-(\d+)-(.*)$")
+
+
+def _rg_path_from_data(data: object) -> str:
+    if not isinstance(data, dict):
+        return "?"
+    path = data.get("path")
+    if isinstance(path, dict):
+        text = path.get("text")
+        if isinstance(text, str):
+            return text
+        raw = path.get("bytes")
+        if isinstance(raw, str):
+            return raw
+    if isinstance(path, str):
+        return path
+    return "?"
+
+
+def _rg_line_text_from_data(data: object) -> str:
+    if not isinstance(data, dict):
+        return ""
+    lines = data.get("lines")
+    if isinstance(lines, dict):
+        text = lines.get("text")
+        if isinstance(text, str):
+            return text.rstrip("\n")
+        raw = lines.get("bytes")
+        if isinstance(raw, str):
+            return raw.rstrip("\n")
+    return ""
+
+
+def _looks_like_rg_json(raw_output: str) -> bool:
+    """True when output is mostly ripgrep ``--json`` NDJSON events."""
+    parsed = 0
+    checked = 0
+    for line in raw_output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        checked += 1
+        if checked > 40:
+            break
+        if not stripped.startswith("{"):
+            continue
+        try:
+            event = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(event, dict) and event.get("type") in _RG_JSON_TYPES:
+            parsed += 1
+    return parsed >= 2 and parsed >= max(1, checked // 2)
+
+
+def _parse_rg_json_matches(
+    raw_output: str,
+) -> tuple[list[tuple[str, int | None, str]], dict[str, int]]:
+    """Return (ordered match tuples, per-file total counts) from ``rg --json``."""
+    matches: list[tuple[str, int | None, str]] = []
+    counts: dict[str, int] = {}
+    for line in raw_output.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            event = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(event, dict) or event.get("type") != "match":
+            # begin / context / end / summary are dropped — context is the bulk.
+            continue
+        data = event.get("data")
+        path = _rg_path_from_data(data)
+        line_no = None
+        text = ""
+        if isinstance(data, dict):
+            raw_ln = data.get("line_number")
+            if isinstance(raw_ln, int):
+                line_no = raw_ln
+            text = _rg_line_text_from_data(data)
+        matches.append((path, line_no, text))
+        counts[path] = counts.get(path, 0) + 1
+    return matches, counts
+
+
+def _parse_rg_text_matches(
+    raw_output: str,
+) -> tuple[list[tuple[str, int | None, str]], dict[str, int]]:
+    """Parse classic ``rg`` / ``grep -rn`` text lines; drop ``-C`` context rows."""
+    matches: list[tuple[str, int | None, str]] = []
+    counts: dict[str, int] = {}
+    for line in raw_output.splitlines():
+        stripped = line.rstrip("\n")
+        if not stripped or stripped == "--":
+            continue
+        # Context lines use ``path-lineno-text``; matches use ``path:lineno:text``.
+        if _RG_TEXT_CONTEXT_RE.match(stripped) and not _RG_TEXT_MATCH_RE.match(stripped):
+            continue
+        match = _RG_TEXT_MATCH_RE.match(stripped)
+        if match:
+            path, lineno_s, text = match.group(1), match.group(2), match.group(3)
+            line_no = int(lineno_s)
+            matches.append((path, line_no, text))
+            counts[path] = counts.get(path, 0) + 1
+            continue
+        # ``grep -r`` without ``-n``: ``path:content`` (skip binary notices).
+        if ": matches binary file" in stripped.lower():
+            continue
+        if ":" in stripped and not stripped.startswith("{"):
+            path, text = stripped.split(":", 1)
+            looks_like_path = "/" in path or path.endswith(
+                (".py", ".js", ".ts", ".tsx", ".go", ".rs", ".java", ".c", ".h", ".md", ".txt")
+            )
+            if path and text and looks_like_path:
+                matches.append((path, None, text))
+                counts[path] = counts.get(path, 0) + 1
+    return matches, counts
+
+
+def _format_rg_clustered(
+    matches: list[tuple[str, int | None, str]],
+    counts: dict[str, int],
+    *,
+    max_matches_per_file: int,
+    max_total_matches: int,
+) -> str:
+    """Render clustered matches with per-file and global caps."""
+    if not matches:
+        return ""
+
+    # Preserve first-seen file order.
+    file_order: list[str] = []
+    by_file: dict[str, list[tuple[int | None, str]]] = {}
+    for path, line_no, text in matches:
+        if path not in by_file:
+            by_file[path] = []
+            file_order.append(path)
+        by_file[path].append((line_no, text))
+
+    result: list[str] = []
+    shown_total = 0
+    omitted_file_matches = 0
+    omitted_files = 0
+
+    for path in file_order:
+        file_matches = by_file[path]
+        total_in_file = counts.get(path, len(file_matches))
+        remaining_budget = max_total_matches - shown_total
+        if remaining_budget <= 0:
+            omitted_files += 1
+            omitted_file_matches += total_in_file
+            continue
+
+        keep_n = min(max_matches_per_file, remaining_budget, total_in_file)
+        shown = file_matches[:keep_n]
+        omitted_here = total_in_file - keep_n
+        if omitted_here > 0:
+            header = (
+                f"{path}: {total_in_file} matches "
+                f"({keep_n} shown, {omitted_here} omitted by usagetrim)"
+            )
+        elif total_in_file == 1:
+            header = f"{path}: 1 match"
+        else:
+            header = f"{path}: {total_in_file} matches"
+        result.append(header)
+        for line_no, text in shown:
+            if line_no is None:
+                result.append(f"  {text}")
+            else:
+                result.append(f"  {line_no}: {text}")
+        shown_total += keep_n
+
+    if omitted_files:
+        result.append(
+            f"[... {omitted_file_matches} matches across {omitted_files} more files "
+            f"omitted by usagetrim ...]"
+        )
+
+    return "\n".join(result)
+
+
+def filter_ripgrep_output(
+    raw_output: str,
+    max_matches_per_file: int = 3,
+    max_total_matches: int = 30,
+) -> str:
+    """Cluster ripgrep/grep matches by file; drop context; cap match density.
+
+    Handles both ``rg --json`` NDJSON event streams and classic ``path:line:text``
+    (or ``grep -rn``) text output. Context events/lines are dropped — they are the
+    bulk of tokens on ``-C`` / ``-A`` / ``-B`` searches. Files that dominate the
+    hit list fold to a count header plus the first ``max_matches_per_file`` rows.
+    """
+    if not raw_output.strip():
+        return raw_output
+
+    is_json = _looks_like_rg_json(raw_output)
+    if is_json:
+        matches, counts = _parse_rg_json_matches(raw_output)
+        had_context = any(
+            '"type":"context"' in line or '"type": "context"' in line
+            for line in raw_output.splitlines()
+        )
+    else:
+        matches, counts = _parse_rg_text_matches(raw_output)
+        had_context = any(
+            bool(_RG_TEXT_CONTEXT_RE.match(line)) and not _RG_TEXT_MATCH_RE.match(line)
+            for line in raw_output.splitlines()
+            if line.strip() and line.strip() != "--"
+        )
+
+    if not matches:
+        return raw_output
+
+    total = sum(counts.values())
+    max_per_file = max(counts.values()) if counts else 0
+    needs_fold = had_context or total > max_total_matches or max_per_file > max_matches_per_file
+
+    compact = _format_rg_clustered(
+        matches,
+        counts,
+        max_matches_per_file=max_matches_per_file,
+        max_total_matches=max_total_matches,
+    )
+    if not compact:
+        return raw_output
+    if needs_fold or len(compact) < len(raw_output):
+        return compact + ("\n" if raw_output.endswith("\n") else "")
+    return raw_output
+
+
+def _is_ripgrep_or_recursive_grep(command: str) -> bool:
+    """Recognize ``rg`` / ``grep -r`` (and absolute-path binaries)."""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    if not words:
+        return False
+    binary = PurePath(words[0]).name.lower()
+    if binary in {"rg", "rg.exe"}:
+        return True
+    if binary in {"grep", "grep.exe", "ggrep"}:
+        # Recursive forms: -r, -R, -rR, --recursive, or combined flags like -rn.
+        for word in words[1:]:
+            if word in {"-r", "-R", "--recursive"}:
+                return True
+            if word.startswith("-") and not word.startswith("--"):
+                # Combined short flags: -rn, -rI, -HR, etc.
+                if "r" in word[1:] or "R" in word[1:]:
+                    return True
+        return False
+    return False
+
+
 def _is_directory_scan_command(cmd_lower: str) -> bool:
     prefixes = (
         "find ",
@@ -1922,6 +2185,8 @@ def auto_specialize_command_output(command: str, raw_output: str) -> str | None:
         return filter_git_branch(raw_output)
     elif cmd_lower.startswith(("git diff", "git show")):
         return filter_git_diff(raw_output)
+    elif _is_ripgrep_or_recursive_grep(command.strip()):
+        return filter_ripgrep_output(raw_output)
     elif cmd_lower.startswith(("curl ", "curl\t", "wget ", "http ", "https ")):
         return filter_curl_http(raw_output)
     elif cargo_sub in {"test", "nextest"}:
