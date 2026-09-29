@@ -161,6 +161,28 @@ Recovered text is additional context, included as a cost in the net counter.
 References recover the redacted cached original, not secrets removed before
 storage. Secret-pattern matching is best effort, not a complete secret scanner.
 
+### MCP CallToolResult compaction
+
+Third-party MCP tool results are compacted as typed `CallToolResult` values, not
+flattened strings. The PostToolUse hook uses the default **lossless** policy.
+
+| Policy | What reaches the model | What is stored locally |
+| --- | --- | --- |
+| `lossless` (default) | Compacted `text` blocks; images, audio, resources, resource links, `structuredContent`, `isError`, annotations, `_meta`, and unknown extension keys unchanged | Nothing extra; optional session dedup only if other features already cache text |
+| `reference` (opt-in) | Same text compaction, plus oversized opaque blocks replaced by a truthful type/size summary naming the withheld block and a `usagetrim retrieve` ref | Redacted JSON of each replaced block in the local SQLite cache (`USAGETRIM_CACHE_DIR`) |
+
+`isError: true` results never use reference mode: error text, warnings, and opaque
+attachments stay inline so safety-relevant content is never summarized away.
+Lossless text rewrites may still shorten JSON tables inside error text when that
+is strictly smaller and round-trippable.
+
+Privacy and lifetime: recovery entries live in the local cache database until you
+clear it (`usagetrim` cache clear / deleting the DB). They are not uploaded.
+Recognized secret patterns are redacted before store; matching is best effort.
+Session dedup notices for identical reads expire after about 15 minutes; spilled
+MCP reference payloads persist until cleared. Per-result and per-block token
+savings are reported by `compact_mcp_result` for callers that record metrics.
+
 ### Code navigation and editing
 
 `usagetrim code` supports `map`, `symbols`, `occurrences`, `search`, `pattern`,

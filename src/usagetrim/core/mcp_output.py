@@ -1,4 +1,18 @@
-"""Lossless compaction of third-party MCP tool results.
+"""Protocol-safe compaction of third-party MCP tool results.
+
+MCP ``CallToolResult`` values are not plain strings: they carry typed content
+blocks, optional ``structuredContent``, ``isError``, annotations, and extension
+fields such as ``_meta``. Flattening the whole payload into text risks either
+missing compaction opportunities or changing what a client needs.
+
+This module:
+
+* applies existing lossless text/JSON rewrites only inside ``text`` blocks
+  (and bare string responses);
+* leaves ``structuredContent``, ``isError``, annotations, ``_meta``, unknown
+  extension keys, and unsupported block shapes untouched;
+* optionally replaces oversized opaque blocks (image/audio/resource) with a
+  truthful size/type summary plus a local recovery ref (explicit opt-in).
 
 MCP servers commonly return JSON rows that repeat every key per row, pretty-print
 with indentation, or wrap a JSON document in a ``{"result": "..."}`` string so
@@ -18,10 +32,12 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
 
+from usagetrim.core.cache import ContextCache
 from usagetrim.metrics.tokenizer import count_tokens
 
 _BOUNDARY = re.compile(
@@ -32,9 +48,66 @@ _MIN_ROWS = 3
 # Unwrapping other single keys (e.g. "error") would hide what the value means.
 _UNWRAP_KEYS = frozenset({"result"})
 
+# Content block types that cannot be rewritten losslessly as text.
+OPAQUE_BLOCK_TYPES = frozenset({"image", "audio", "resource", "resource_link"})
+# Default size floor before an opaque block may be replaced under reference policy.
+DEFAULT_OPAQUE_BYTES = 8 * 1024
+
+PolicyName = Literal["lossless", "reference"]
+
 
 class _InexactNumber(ValueError):
     """A JSON number whose value would change on the way through a float."""
+
+
+@dataclass(frozen=True)
+class BlockSavings:
+    """Token/byte delta for one content block (or the top-level string)."""
+
+    index: int
+    block_type: str
+    action: Literal["unchanged", "compacted", "referenced", "passthrough"]
+    raw_chars: int
+    compact_chars: int
+    raw_tokens: int
+    compact_tokens: int
+    ref_id: str | None = None
+
+    @property
+    def saved_chars(self) -> int:
+        return max(0, self.raw_chars - self.compact_chars)
+
+    @property
+    def saved_tokens(self) -> int:
+        return max(0, self.raw_tokens - self.compact_tokens)
+
+
+@dataclass(frozen=True)
+class ResultSavings:
+    """Aggregated savings for a CallToolResult or content-block list."""
+
+    policy: PolicyName
+    blocks: tuple[BlockSavings, ...]
+    raw_chars: int
+    compact_chars: int
+    raw_tokens: int
+    compact_tokens: int
+
+    @property
+    def saved_chars(self) -> int:
+        return max(0, self.raw_chars - self.compact_chars)
+
+    @property
+    def saved_tokens(self) -> int:
+        return max(0, self.raw_tokens - self.compact_tokens)
+
+
+@dataclass(frozen=True)
+class CompactedMcpResult:
+    """Compacted MCP payload plus a per-block savings report."""
+
+    result: Any
+    savings: ResultSavings
 
 
 def _exact_float(literal: str) -> float:
@@ -161,16 +234,281 @@ def compact_mcp_text(text: str) -> str | None:
     return candidate
 
 
-def compact_mcp_response(response: Any) -> Any:
-    """Apply ``compact_mcp_text`` to a hook ``tool_response`` of any known shape."""
+def _measure(text: str) -> tuple[int, int]:
+    return len(text), count_tokens(text).claude if text else 0
+
+
+def _block_type(block: Any) -> str:
+    if not isinstance(block, dict):
+        return "malformed"
+    block_type = block.get("type")
+    return block_type if isinstance(block_type, str) and block_type else "malformed"
+
+
+def _opaque_byte_size(block: dict[str, Any]) -> int:
+    return len(_dump(block).encode("utf-8"))
+
+
+def _opaque_summary(block: dict[str, Any], *, ref_id: str, byte_size: int) -> str:
+    block_type = _block_type(block)
+    mime = block.get("mimeType") if isinstance(block.get("mimeType"), str) else None
+    uri = None
+    if block_type == "resource_link" and isinstance(block.get("uri"), str):
+        uri = block["uri"]
+    elif block_type == "resource":
+        resource = block.get("resource")
+        if isinstance(resource, dict) and isinstance(resource.get("uri"), str):
+            uri = resource["uri"]
+    parts = [f"withheld {block_type} block"]
+    if mime:
+        parts.append(f"mimeType={mime}")
+    if uri:
+        parts.append(f"uri={uri}")
+    parts.append(f"{byte_size:,} bytes JSON")
+    detail = "; ".join(parts)
+    return f"[UsageTrim MCP reference: {detail}. Full redacted block: usagetrim retrieve {ref_id}]"
+
+
+def _reference_opaque(
+    block: dict[str, Any],
+    *,
+    cache: ContextCache,
+    threshold: int,
+) -> tuple[dict[str, Any], str] | None:
+    byte_size = _opaque_byte_size(block)
+    if byte_size < threshold:
+        return None
+    payload = _dump(block)
+    ref_id = cache.store(payload, source="mcp-result")
+    notice = _opaque_summary(block, ref_id=ref_id, byte_size=byte_size)
+    replacement: dict[str, Any] = {"type": "text", "text": notice}
+    for key in ("annotations", "_meta"):
+        if key in block:
+            replacement[key] = block[key]
+    return replacement, ref_id
+
+
+def _compact_content_blocks(
+    blocks: list[Any],
+    *,
+    policy: PolicyName,
+    cache: ContextCache | None,
+    opaque_bytes: int,
+    allow_reference: bool,
+) -> tuple[list[Any], list[BlockSavings]]:
+    out: list[Any] = []
+    savings: list[BlockSavings] = []
+    for index, block in enumerate(blocks):
+        block_type = _block_type(block)
+        if not isinstance(block, dict) or block_type == "malformed":
+            raw = _dump(block) if not isinstance(block, str) else block
+            raw_chars, raw_tokens = _measure(raw if isinstance(raw, str) else str(raw))
+            out.append(block)
+            savings.append(
+                BlockSavings(
+                    index=index,
+                    block_type=block_type,
+                    action="passthrough",
+                    raw_chars=raw_chars,
+                    compact_chars=raw_chars,
+                    raw_tokens=raw_tokens,
+                    compact_tokens=raw_tokens,
+                )
+            )
+            continue
+
+        if block_type == "text" and isinstance(block.get("text"), str):
+            original = block["text"]
+            compact = compact_mcp_text(original)
+            raw_chars, raw_tokens = _measure(original)
+            if compact is None:
+                out.append(block)
+                savings.append(
+                    BlockSavings(
+                        index=index,
+                        block_type="text",
+                        action="unchanged",
+                        raw_chars=raw_chars,
+                        compact_chars=raw_chars,
+                        raw_tokens=raw_tokens,
+                        compact_tokens=raw_tokens,
+                    )
+                )
+            else:
+                compact_chars, compact_tokens = _measure(compact)
+                # Preserve annotations, _meta, and any unknown extension keys.
+                out.append({**block, "text": compact})
+                savings.append(
+                    BlockSavings(
+                        index=index,
+                        block_type="text",
+                        action="compacted",
+                        raw_chars=raw_chars,
+                        compact_chars=compact_chars,
+                        raw_tokens=raw_tokens,
+                        compact_tokens=compact_tokens,
+                    )
+                )
+            continue
+
+        if (
+            allow_reference
+            and policy == "reference"
+            and block_type in OPAQUE_BLOCK_TYPES
+            and cache is not None
+        ):
+            referenced = _reference_opaque(block, cache=cache, threshold=opaque_bytes)
+            raw = _dump(block)
+            raw_chars, raw_tokens = _measure(raw)
+            if referenced is not None:
+                replacement, ref_id = referenced
+                compact_chars, compact_tokens = _measure(replacement["text"])
+                out.append(replacement)
+                savings.append(
+                    BlockSavings(
+                        index=index,
+                        block_type=block_type,
+                        action="referenced",
+                        raw_chars=raw_chars,
+                        compact_chars=compact_chars,
+                        raw_tokens=raw_tokens,
+                        compact_tokens=compact_tokens,
+                        ref_id=ref_id,
+                    )
+                )
+                continue
+
+        raw = _dump(block)
+        raw_chars, raw_tokens = _measure(raw)
+        out.append(block)
+        savings.append(
+            BlockSavings(
+                index=index,
+                block_type=block_type,
+                action="passthrough",
+                raw_chars=raw_chars,
+                compact_chars=raw_chars,
+                raw_tokens=raw_tokens,
+                compact_tokens=raw_tokens,
+            )
+        )
+    return out, savings
+
+
+def _aggregate(policy: PolicyName, blocks: list[BlockSavings]) -> ResultSavings:
+    return ResultSavings(
+        policy=policy,
+        blocks=tuple(blocks),
+        raw_chars=sum(b.raw_chars for b in blocks),
+        compact_chars=sum(b.compact_chars for b in blocks),
+        raw_tokens=sum(b.raw_tokens for b in blocks),
+        compact_tokens=sum(b.compact_tokens for b in blocks),
+    )
+
+
+def compact_mcp_result(
+    response: Any,
+    *,
+    policy: PolicyName = "lossless",
+    cache: ContextCache | None = None,
+    opaque_bytes: int = DEFAULT_OPAQUE_BYTES,
+) -> CompactedMcpResult:
+    """Compact an MCP tool response while preserving protocol channels.
+
+    ``policy="lossless"`` (default) only rewrites text with semantics-preserving
+    rules. ``policy="reference"`` may replace oversized opaque blocks with a
+    summary plus a recoverable cache ref; it never runs when ``isError`` is true,
+    so error and safety-relevant payloads stay fully visible to the model.
+    """
+    if policy not in ("lossless", "reference"):
+        raise ValueError(f"unsupported MCP compact policy: {policy!r}")
+
     if isinstance(response, str):
-        return compact_mcp_text(response) or response
+        compact = compact_mcp_text(response)
+        raw_chars, raw_tokens = _measure(response)
+        if compact is None:
+            block = BlockSavings(
+                index=0,
+                block_type="text",
+                action="unchanged",
+                raw_chars=raw_chars,
+                compact_chars=raw_chars,
+                raw_tokens=raw_tokens,
+                compact_tokens=raw_tokens,
+            )
+            return CompactedMcpResult(response, _aggregate(policy, [block]))
+        compact_chars, compact_tokens = _measure(compact)
+        block = BlockSavings(
+            index=0,
+            block_type="text",
+            action="compacted",
+            raw_chars=raw_chars,
+            compact_chars=compact_chars,
+            raw_tokens=raw_tokens,
+            compact_tokens=compact_tokens,
+        )
+        return CompactedMcpResult(compact, _aggregate(policy, [block]))
+
     if isinstance(response, list):
-        return [compact_mcp_response(block) for block in response]
+        # Bare content-block list (common in Claude Code PostToolUse payloads).
+        compacted, block_savings = _compact_content_blocks(
+            response,
+            policy=policy,
+            cache=cache or (ContextCache() if policy == "reference" else None),
+            opaque_bytes=opaque_bytes,
+            allow_reference=True,
+        )
+        return CompactedMcpResult(compacted, _aggregate(policy, block_savings))
+
     if isinstance(response, dict):
+        # Single content block passed alone.
         if response.get("type") == "text" and isinstance(response.get("text"), str):
-            compact = compact_mcp_text(response["text"])
-            return {**response, "text": compact} if compact else response
+            compacted, block_savings = _compact_content_blocks(
+                [response],
+                policy=policy,
+                cache=None,
+                opaque_bytes=opaque_bytes,
+                allow_reference=False,
+            )
+            return CompactedMcpResult(compacted[0], _aggregate(policy, block_savings))
+
         if isinstance(response.get("content"), list):
-            return {**response, "content": compact_mcp_response(response["content"])}
-    return response
+            is_error = response.get("isError") is True
+            # Errors stay fully visible: never spill opaque blocks to references.
+            allow_reference = not is_error
+            active_cache = None
+            if allow_reference and policy == "reference":
+                active_cache = cache or ContextCache()
+            compacted, block_savings = _compact_content_blocks(
+                response["content"],
+                policy=policy,
+                cache=active_cache,
+                opaque_bytes=opaque_bytes,
+                allow_reference=allow_reference,
+            )
+            # Copy the whole result so structuredContent, isError, _meta, and
+            # unknown extension keys survive exactly; only content may change.
+            result = {**response, "content": compacted}
+            return CompactedMcpResult(result, _aggregate(policy, block_savings))
+
+    # Unsupported shapes pass through unchanged with an empty savings report.
+    empty = ResultSavings(
+        policy=policy, blocks=(), raw_chars=0, compact_chars=0, raw_tokens=0, compact_tokens=0
+    )
+    return CompactedMcpResult(response, empty)
+
+
+def compact_mcp_response(
+    response: Any,
+    *,
+    policy: PolicyName = "lossless",
+    cache: ContextCache | None = None,
+    opaque_bytes: int = DEFAULT_OPAQUE_BYTES,
+) -> Any:
+    """Apply protocol-safe compaction; return only the updated payload.
+
+    Prefer :func:`compact_mcp_result` when callers need per-block savings.
+    """
+    return compact_mcp_result(
+        response, policy=policy, cache=cache, opaque_bytes=opaque_bytes
+    ).result
