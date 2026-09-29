@@ -417,41 +417,18 @@ def skeletonize_notebook(raw_ipynb: str, *, cache_full: bool = True) -> str:
 
 
 def strip_comments_and_blanks(content: str, suffix: str = ".py") -> str:
-    """Remove single-line comments, block comments, and excessive empty lines."""
-    lines = content.splitlines()
-    cleaned: list[str] = []
-    in_block = False
+    """Semantically fold license/dead-comment trivia, then strip remaining comments.
 
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if suffix in {".ts", ".js", ".tsx", ".jsx", ".go", ".rs", ".java", ".c", ".cpp"}:
-            if "/*" in stripped and "*/" in stripped:
-                line = re.sub(r"/\*.*?\*/", "", line)
-                stripped = line.strip()
-            elif "/*" in stripped:
-                in_block = True
-                continue
-            elif "*/" in stripped:
-                in_block = False
-                continue
-            if in_block:
-                continue
-            if stripped.startswith("//"):
-                continue
-            if "//" in line and not ('"' in line or "'" in line):
-                line = line.split("//")[0].rstrip()
-        elif suffix in {".py", ".sh", ".bash", ".yaml", ".yml", ".toml"}:
-            if stripped.startswith("#"):
-                continue
-            if "#" in line and not ('"' in line or "'" in line):
-                line = line.split("#")[0].rstrip()
+    Executable code is left unchanged. License banners and large commented-out
+    blocks become one-line notices; descriptive docstrings are retained.
+    """
+    from usagetrim.core.cleaner import CodeCleanerOptions, clean_source_code
 
-        if line.strip():
-            cleaned.append(line)
-
-    return "\n".join(cleaned)
+    return clean_source_code(
+        content,
+        suffix=suffix,
+        options=CodeCleanerOptions(strip_remaining_comments=True),
+    )
 
 
 def extract_symbol_or_range(
