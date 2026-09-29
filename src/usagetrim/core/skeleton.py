@@ -227,6 +227,195 @@ def skeletonize_json(json_str: str, max_array_items: int = 2) -> str:
     return json.dumps(pruned, indent=2)
 
 
+_IMAGE_MIME_PREFIXES = ("image/",)
+_BINARY_MIME_TYPES = frozenset(
+    {
+        "application/pdf",
+        "application/octet-stream",
+    }
+)
+_OUTPUT_TEXT_KEEP_LINES = 3
+
+
+def _notebook_join_text(value: Any) -> str:
+    """Normalize notebook source/text fields (string or list of lines) to one string."""
+    if isinstance(value, list):
+        return "".join(str(part) for part in value)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _notebook_as_source_lines(text: str) -> list[str]:
+    """Split text into nbformat-style source lines (newline retained except last)."""
+    if not text:
+        return []
+    lines = text.splitlines(keepends=True)
+    if text and not text.endswith("\n") and lines:
+        # splitlines(keepends=True) already drops a trailing bare line's newline correctly
+        pass
+    return lines
+
+
+def _is_base64_blob(value: str) -> bool:
+    """Heuristic: long contiguous base64-looking payload (typical embedded chart)."""
+    if len(value) < 200:
+        return False
+    sample = value[:80].replace("\n", "").replace("\r", "")
+    if not sample:
+        return False
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+    return all(ch in allowed for ch in sample)
+
+
+def _fold_output_text(text: str, keep_lines: int = _OUTPUT_TEXT_KEEP_LINES) -> list[str]:
+    """Keep the first few output lines; fold the rest with an explicit marker."""
+    lines = text.splitlines()
+    if len(lines) <= keep_lines:
+        return _notebook_as_source_lines(text if text.endswith("\n") or not text else text)
+    kept = lines[:keep_lines]
+    omitted = len(lines) - keep_lines
+    folded = "\n".join(kept) + f"\n[... {omitted} output lines folded ...]\n"
+    return _notebook_as_source_lines(folded)
+
+
+def _slim_notebook_output(output: dict[str, Any]) -> dict[str, Any] | None:
+    """Strip binary/base64 payloads and truncate verbose text from one cell output."""
+    if not isinstance(output, dict):
+        return None
+
+    slimmed = dict(output)
+    output_type = slimmed.get("output_type")
+
+    if output_type == "stream":
+        text = _notebook_join_text(slimmed.get("text"))
+        slimmed["text"] = _fold_output_text(text)
+        return slimmed
+
+    if output_type in {"execute_result", "display_data"}:
+        data = slimmed.get("data")
+        if isinstance(data, dict):
+            new_data: dict[str, Any] = {}
+            for mime, payload in data.items():
+                mime_l = str(mime).lower()
+                joined = _notebook_join_text(payload)
+                if mime_l.startswith(_IMAGE_MIME_PREFIXES) or mime_l in _BINARY_MIME_TYPES:
+                    new_data[mime] = [f"[{mime} stripped by usagetrim]\n"]
+                elif _is_base64_blob(joined):
+                    new_data[mime] = [f"[{mime} base64 blob stripped by usagetrim]\n"]
+                elif mime_l in {"text/plain", "text/markdown", "text/html", "application/json"}:
+                    if mime_l == "application/json" and not isinstance(payload, str):
+                        # Keep small structured JSON; fold oversized string dumps only.
+                        dumped = json.dumps(payload, ensure_ascii=False)
+                        if len(dumped) > 400:
+                            new_data[mime] = _fold_output_text(dumped)
+                        else:
+                            new_data[mime] = payload
+                    else:
+                        new_data[mime] = _fold_output_text(joined)
+                else:
+                    if _is_base64_blob(joined) or len(joined) > 2000:
+                        new_data[mime] = [f"[{mime} payload stripped by usagetrim]\n"]
+                    else:
+                        new_data[mime] = payload
+            slimmed["data"] = new_data
+        # Drop bulky output-level metadata (e.g. image size hints).
+        slimmed["metadata"] = {}
+        return slimmed
+
+    if output_type == "error":
+        traceback = slimmed.get("traceback")
+        if isinstance(traceback, list) and len(traceback) > 8:
+            omitted = len(traceback) - 6
+            slimmed["traceback"] = (
+                traceback[:3] + [f"[... {omitted} traceback lines folded ...]"] + traceback[-3:]
+            )
+        return slimmed
+
+    # Unknown output types: drop binary-looking fields, keep the rest small.
+    return slimmed
+
+
+def _slim_cell_metadata(metadata: Any) -> dict[str, Any]:
+    """Drop noisy cell metadata (widgets, scrolled flags) while keeping tags."""
+    if not isinstance(metadata, dict):
+        return {}
+    keep_keys = {"tags"}
+    return {k: v for k, v in metadata.items() if k in keep_keys}
+
+
+def skeletonize_notebook(raw_ipynb: str, *, cache_full: bool = True) -> str:
+    """Strip notebook cell outputs and base64 images while preserving cell source.
+
+    Returns valid notebook JSON. Large binary / tabular outputs are removed or folded;
+    the original notebook is stored in the CCR cache when compression is meaningful.
+    """
+    trimmed = raw_ipynb.strip()
+    if not trimmed:
+        return raw_ipynb
+
+    try:
+        notebook = json.loads(trimmed)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return raw_ipynb
+
+    if not isinstance(notebook, dict) or "cells" not in notebook:
+        return raw_ipynb
+
+    cells_in = notebook.get("cells")
+    if not isinstance(cells_in, list):
+        return raw_ipynb
+
+    slim_cells: list[dict[str, Any]] = []
+    for cell in cells_in:
+        if not isinstance(cell, dict):
+            continue
+        new_cell = dict(cell)
+        # Preserve source verbatim (string or list-of-lines).
+        if "source" in new_cell:
+            new_cell["source"] = cell["source"]
+        new_cell["metadata"] = _slim_cell_metadata(cell.get("metadata"))
+        if new_cell.get("cell_type") == "code":
+            new_cell["execution_count"] = None
+            outputs = cell.get("outputs")
+            if isinstance(outputs, list):
+                slim_outputs = []
+                for out in outputs:
+                    slimmed = _slim_notebook_output(out) if isinstance(out, dict) else None
+                    if slimmed is not None:
+                        slim_outputs.append(slimmed)
+                new_cell["outputs"] = slim_outputs
+            else:
+                new_cell["outputs"] = []
+        slim_cells.append(new_cell)
+
+    result = dict(notebook)
+    result["cells"] = slim_cells
+
+    # Notebook-level widget state is a common token hog unrelated to source.
+    meta = dict(result.get("metadata") or {}) if isinstance(result.get("metadata"), dict) else {}
+    meta.pop("widgets", None)
+    result["metadata"] = meta
+
+    result_str = json.dumps(result, ensure_ascii=False, indent=1)
+
+    if cache_full and len(raw_ipynb) > len(result_str) * 1.3:
+        from usagetrim.core.cache import ContextCache
+
+        ref_id = ContextCache().store(raw_ipynb, source="notebook")
+        meta = dict(result.get("metadata") or {})
+        meta["usagetrim"] = {
+            "ref": ref_id,
+            "note": (
+                f"raw notebook ({len(raw_ipynb):,} bytes) compacted; recover via usagetrim retrieve"
+            ),
+        }
+        result["metadata"] = meta
+        result_str = json.dumps(result, ensure_ascii=False, indent=1)
+
+    return result_str
+
+
 def strip_comments_and_blanks(content: str, suffix: str = ".py") -> str:
     """Remove single-line comments, block comments, and excessive empty lines."""
     lines = content.splitlines()
@@ -305,6 +494,10 @@ def extract_symbol_or_range(
         selected = all_lines[start - 1 : end]
         header = f"# [{p.name} lines {start}-{end} of {len(all_lines)}]\n"
         return header + "\n".join(selected)
+
+    # Notebooks are always stripped on full reads: outputs/base64 dominate tokens.
+    if p.suffix.lower() == ".ipynb":
+        return skeletonize_notebook(content)
 
     if skeleton:
         if p.suffix == ".py":
