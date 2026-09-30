@@ -2577,7 +2577,9 @@ def auto_specialize_command_output(command: str, raw_output: str) -> str | None:
     elif _is_pyright_command(cmd_lower):
         return filter_pyright(raw_output)
     elif _is_kubectl_command(command.strip()):
-        return filter_kubectl(raw_output)
+        return filter_kubectl(raw_output, command=command)
+    elif _is_helm_command(command.strip()):
+        return filter_helm(raw_output, command=command)
     elif _is_terraform_command(command.strip()):
         return filter_terraform_plan(raw_output)
     elif _is_ci_log_command(command.strip()):
@@ -2811,13 +2813,31 @@ def _is_pyright_command(cmd_lower: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# kubectl get / describe — table noise and describe annotation/env/event dumps
+# kubectl / oc / helm — describe/get/logs noise and chart packaging chatter
 # ---------------------------------------------------------------------------
 
 _KUBECTL_GET_HEADER_RE = re.compile(
     r"^NAME\s+READY\s+STATUS\b|^NAME\s+STATUS\b|^NAME\s+AGE\b", re.I
 )
 _KUBECTL_EVENT_ROW_RE = re.compile(r"^\s*(Normal|Warning|Error)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$")
+# Successful readiness/liveness/startup probe chatter in kubectl logs.
+_KUBECTL_PROBE_OK_RE = re.compile(
+    r"(?i)(?:"
+    r"\bkube-probe\b|"
+    r'(?:GET|HEAD)\s+/(?:healthz|readyz|livez|health|ready|live)\b[^"\n]*\b200\b|'
+    r'"(?:GET|HEAD)\s+/(?:healthz|readyz|livez|health|ready|live)[^"]*"\s+200\b|'
+    r"\b(?:readiness|liveness|startup)\s+probe\s+succeeded\b|"
+    r'"Probe succeeded".*probeType='
+    r")"
+)
+_KUBECTL_PROBE_FAIL_RE = re.compile(
+    r"(?i)(?:"
+    r"probe\s+failed|"
+    r"\b(?:healthz|readyz|livez)\b[^.\n]*(?:5\d\d|error|refused|timeout|unhealthy)|"
+    r"\bUnhealthy\b"
+    r")"
+)
+_KUBECTL_MIN_PROBE_FOLD = 3
 # Refresh/read chatter from terraform plan/apply/destroy and OpenTofu (tofu).
 _TF_REFRESH_RE = re.compile(
     r"^(\S+):\s+(?:Reading\.\.\.|Read complete after\b|Refreshing state\.\.\.|Refreshing\.\.\.)"
@@ -2837,9 +2857,37 @@ _TF_RESOURCE_HEADER_RE = re.compile(
 _TF_ERROR_WARNING_RE = re.compile(r"(?i)(?:^\s*(?:Warning|Error):|^\s*[╷│╵]|\berror\b|\bwarning\b)")
 _TF_MIN_UNCHANGED_FOLD = 3
 
+_HELM_NOISE_RE = re.compile(
+    r"(?i)^\.{0,3}(?:"
+    r"Hang tight while we|"
+    r"Successfully got an update from|"
+    r"Update Complete\b|"
+    r"Saving \d+ charts?\b|"
+    r"Deleting outdated charts\b|"
+    r"Downloading \S|"
+    r"Pulled:\s|"
+    r"Digest:\s|"
+    r".*Happy Helming|"
+    r"Skipping chart\b|"
+    r"already exists and is not different\b|"
+    r"Successfully packaged chart and saved it to:"
+    r")"
+)
+_HELM_FOLD_NOTICE_RE = re.compile(r"chart/repo lines collapsed", re.IGNORECASE)
+_HELM_MIN_NOISE_FOLD = 3
 
-def filter_kubectl(raw_output: str) -> str:
-    """Compact kubectl get tables and describe dumps; keep unhealthy signal."""
+
+def filter_kubectl(raw_output: str, command: str = "") -> str:
+    """Compact kubectl/oc get tables, describe dumps, and probe-heavy logs.
+
+    Keeps unhealthy table rows, describe failure signal (State/Reason/Message,
+    Warning events), and non-200 / failed probes. Folds routine annotations,
+    env dumps, tolerations, Normal lifecycle events, and repetitive
+    healthz/readyz/livez pings. Pure and idempotent on short / already-compacted
+    input. Optional ``command`` is accepted for call-site clarity; content
+    detection drives the path taken.
+    """
+    del command  # content-driven; kept for API symmetry with issue #52
     if not raw_output.strip():
         return raw_output
 
@@ -2848,7 +2896,7 @@ def filter_kubectl(raw_output: str) -> str:
         return _filter_kubectl_get(lines)
     if lines and lines[0].startswith("Name:"):
         return _filter_kubectl_describe(lines)
-    return raw_output
+    return _filter_kubectl_logs(lines, raw_output)
 
 
 _KUBECTL_READY_RE = re.compile(r"^(\d+)/(\d+)$")
@@ -2909,6 +2957,44 @@ def _filter_kubectl_get(lines: list[str]) -> str:
     return "\n".join(result)
 
 
+def _kubectl_is_probe_ok_line(line: str) -> bool:
+    """True for routine successful health/readiness probe log lines."""
+    if _KUBECTL_PROBE_FAIL_RE.search(line):
+        return False
+    return bool(_KUBECTL_PROBE_OK_RE.search(line))
+
+
+def _filter_kubectl_logs(lines: list[str], raw_output: str) -> str:
+    """Collapse consecutive successful health-probe lines; keep failures verbatim."""
+    probe_ok_count = sum(1 for line in lines if _kubectl_is_probe_ok_line(line))
+    if probe_ok_count < _KUBECTL_MIN_PROBE_FOLD:
+        return raw_output
+
+    result: list[str] = []
+    pending: list[str] = []
+    for line in lines:
+        if _kubectl_is_probe_ok_line(line):
+            pending.append(line)
+            continue
+        if len(pending) >= _KUBECTL_MIN_PROBE_FOLD:
+            result.append(f"[UsageTrim: {len(pending)} health/ready probe lines collapsed]")
+        else:
+            result.extend(pending)
+        pending = []
+        result.append(line)
+    if len(pending) >= _KUBECTL_MIN_PROBE_FOLD:
+        result.append(f"[UsageTrim: {len(pending)} health/ready probe lines collapsed]")
+    else:
+        result.extend(pending)
+
+    ret = "\n".join(result)
+    if raw_output.endswith("\n") and not ret.endswith("\n"):
+        ret += "\n"
+    if len(ret) >= len(raw_output):
+        return raw_output
+    return ret
+
+
 def _filter_kubectl_describe(lines: list[str]) -> str:
     result: list[str] = []
     index = 0
@@ -2952,6 +3038,31 @@ def _filter_kubectl_describe(lines: list[str]) -> str:
             else:
                 result.append("Annotations:      <none>")
             collapsed = True
+            continue
+
+        # Routine Tolerations: (default NotReady/Unreachable etc.)
+        if stripped.startswith("Tolerations:"):
+            rest = stripped[len("Tolerations:") :].strip()
+            index += 1
+            tol_count = 1 if rest and rest != "<none>" else 0
+            while index < len(lines):
+                nxt = lines[index]
+                if not nxt.strip():
+                    break
+                if nxt[:1] not in " \t" and ":" in nxt:
+                    break
+                if re.match(r"^\s+\S", nxt):
+                    tol_count += 1
+                    index += 1
+                    continue
+                break
+            if tol_count:
+                result.append(
+                    f"Tolerations:      [UsageTrim: {tol_count} routine tolerations collapsed]"
+                )
+                collapsed = True
+            else:
+                result.append("Tolerations:      <none>")
             continue
 
         # Environment: under a container — collapse keys, keep secret refs briefly.
@@ -3046,6 +3157,50 @@ def _filter_kubectl_describe(lines: list[str]) -> str:
     if not collapsed:
         return "\n".join(lines)
     return "\n".join(result)
+
+
+def filter_helm(raw_output: str, command: str = "") -> str:
+    """Compact helm install/upgrade/dependency/package chatter; keep release signal.
+
+    Preserves NOTES, Error/Warning lines, and release status fields (NAME, STATUS,
+    REVISION, NAMESPACE, LAST DEPLOYED). Folds repetitive chart repository /
+    packaging noise (Hang tight…, Saving N charts, Digests, Happy Helming).
+    Pure and idempotent on short / already-compacted input.
+    """
+    del command
+    if not raw_output.strip():
+        return raw_output
+    if _HELM_FOLD_NOTICE_RE.search(raw_output):
+        return raw_output
+
+    lines = raw_output.splitlines()
+    noise_count = sum(1 for line in lines if _HELM_NOISE_RE.search(line.strip()))
+    if noise_count < _HELM_MIN_NOISE_FOLD:
+        return raw_output
+
+    result: list[str] = []
+    pending: list[str] = []
+    for line in lines:
+        if _HELM_NOISE_RE.search(line.strip()):
+            pending.append(line)
+            continue
+        if len(pending) >= _HELM_MIN_NOISE_FOLD:
+            result.append(f"[UsageTrim: {len(pending)} chart/repo lines collapsed]")
+        else:
+            result.extend(pending)
+        pending = []
+        result.append(line)
+    if len(pending) >= _HELM_MIN_NOISE_FOLD:
+        result.append(f"[UsageTrim: {len(pending)} chart/repo lines collapsed]")
+    else:
+        result.extend(pending)
+
+    ret = "\n".join(result)
+    if raw_output.endswith("\n") and not ret.endswith("\n"):
+        ret += "\n"
+    if len(ret) >= len(raw_output):
+        return raw_output
+    return ret
 
 
 def _tf_is_simple_unchanged_attr(line: str) -> bool:
@@ -3165,49 +3320,30 @@ def filter_terraform(raw_output: str) -> str:
 
 
 def _is_kubectl_command(command: str) -> bool:
-    """Recognize kubectl get/describe (flags may precede the verb)."""
+    """Recognize kubectl/oc argv (get, describe, logs, and other cluster ops)."""
     try:
         words = shlex.split(command)
     except ValueError:
         return False
-    if not words or PurePath(words[0]).name.lower() not in {"kubectl", "kubectl.exe"}:
+    if not words:
         return False
-    value_flags = {
-        "-n",
-        "--namespace",
-        "--context",
-        "--kubeconfig",
-        "--cluster",
-        "--user",
-        "-l",
-        "--selector",
-        "-o",
-        "--output",
-        "-f",
-        "--filename",
-        "--field-selector",
-        "--token",
-        "--server",
-        "-s",
-        "--request-timeout",
+    return PurePath(words[0]).name.lower() in {
+        "kubectl",
+        "kubectl.exe",
+        "oc",
+        "oc.exe",
     }
-    index = 1
-    while index < len(words):
-        word = words[index]
-        if word in {"get", "describe"}:
-            return True
-        if word in value_flags:
-            index += 2
-            continue
-        if word.startswith("--") and "=" in word:
-            index += 1
-            continue
-        if word.startswith("-"):
-            index += 1
-            continue
-        # Positional resource type before we saw get/describe — not our target.
+
+
+def _is_helm_command(command: str) -> bool:
+    """Recognize helm argv (install, upgrade, dependency, package, status, …)."""
+    try:
+        words = shlex.split(command)
+    except ValueError:
         return False
-    return False
+    if not words:
+        return False
+    return PurePath(words[0]).name.lower() in {"helm", "helm.exe"}
 
 
 def _is_terraform_command(command: str) -> bool:
@@ -3335,6 +3471,11 @@ def author_kubectl_describe_fixture() -> str:
             "QoS Class:                   Burstable",
             "Node-Selectors:              <none>",
             "Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s",
+            "                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s",
+            "                             node.kubernetes.io/disk-pressure:NoSchedule op=Exists",
+            "                             node.kubernetes.io/memory-pressure:NoSchedule op=Exists",
+            "                             node.kubernetes.io/pid-pressure:NoSchedule op=Exists",
+            "                             node.kubernetes.io/network-unavailable:NoSchedule op=Exists",
             "Events:",
             "  Type     Reason     Age    From               Message",
             "  ----     ------     ----   ----               -------",
@@ -3369,6 +3510,66 @@ def author_kubectl_get_fixture() -> str:
         "2m    <none>        <none>"
     )
     return "\n".join(rows)
+
+
+def author_kubectl_logs_fixture() -> str:
+    """Authored kubectl logs: repetitive health probes dwarf a real error."""
+    probes: list[str] = []
+    for i in range(40):
+        probes.append(f'2026-09-21T10:00:{i:02d}Z 10.0.0.1 - - "GET /healthz HTTP/1.1" 200 2')
+        probes.append(f'2026-09-21T10:00:{i:02d}Z 10.0.0.1 - - "GET /readyz HTTP/1.1" 200 1')
+        probes.append(f"2026-09-21T10:00:{i:02d}Z kube-probe: readiness check ok for container api")
+    return "\n".join(
+        [
+            *probes[:60],
+            "2026-09-21T10:01:00Z ERROR auth: jwt verification failed: token expired",
+            "Traceback (most recent call last):",
+            '  File "/app/main.py", line 42, in handle',
+            "    raise AuthError(token)",
+            "AuthError: token expired",
+            *probes[60:],
+            "2026-09-21T10:02:00Z Liveness probe failed: HTTP probe failed with statuscode: 500",
+            "2026-09-21T10:02:01Z GET /healthz 500 12ms",
+        ]
+    )
+
+
+def author_helm_install_fixture() -> str:
+    """Authored helm upgrade: repo/packaging noise around release status + NOTES."""
+    noise = [
+        "Hang tight while we grab the latest from your chart repositories...",
+        '...Successfully got an update from the "bitnami" chart repository',
+        '...Successfully got an update from the "stable" chart repository',
+        '...Successfully got an update from the "ingress-nginx" chart repository',
+        "Update Complete. ⎈Happy Helming!⎈",
+        "Saving 5 charts",
+        "Downloading nginx from repo https://charts.bitnami.com/bitnami",
+        "Downloading common from repo https://charts.bitnami.com/bitnami",
+        "Downloading postgresql from repo https://charts.bitnami.com/bitnami",
+        "Pulled: registry-1.docker.io/bitnamicharts/nginx:15.0.2",
+        "Digest: sha256:" + ("ab" * 32),
+        "Deleting outdated charts",
+        "Successfully packaged chart and saved it to: /tmp/api-1.4.2.tgz",
+        "Skipping chart postgresql: already exists and is not different",
+    ]
+    return "\n".join(
+        [
+            *noise,
+            'Release "api" has been upgraded. Happy Helming!',
+            "NAME: api",
+            "LAST DEPLOYED: Mon Sep 21 10:00:00 2026",
+            "NAMESPACE: production",
+            "STATUS: deployed",
+            "REVISION: 4",
+            "TEST SUITE: None",
+            "NOTES:",
+            "1. Get the application URL by running these commands:",
+            "  export POD_NAME=$(kubectl get pods -l app=api -o jsonpath='{.items[0].metadata.name}')",
+            "  echo http://127.0.0.1:8080/",
+            "  kubectl port-forward $POD_NAME 8080:8080",
+            "Warning: chart appVersion differs from image tag",
+        ]
+    )
 
 
 def author_terraform_plan_fixture() -> str:

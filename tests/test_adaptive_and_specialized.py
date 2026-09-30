@@ -6,8 +6,10 @@ import pytest
 from usagetrim.core.adaptive import compress_to_budget
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.specialized import (
+    author_helm_install_fixture,
     author_kubectl_describe_fixture,
     author_kubectl_get_fixture,
+    author_kubectl_logs_fixture,
     author_terraform_plan_fixture,
     auto_specialize_command_output,
     filter_cargo_build,
@@ -19,6 +21,7 @@ from usagetrim.core.specialized import (
     filter_git_log,
     filter_git_status,
     filter_go_test,
+    filter_helm,
     filter_jest_vitest,
     filter_json_output,
     filter_kubectl,
@@ -37,6 +40,8 @@ from usagetrim.metrics.tokenizer import count_tokens
 
 SAMPLE_KUBECTL_DESCRIBE = author_kubectl_describe_fixture()
 SAMPLE_KUBECTL_GET = author_kubectl_get_fixture()
+SAMPLE_KUBECTL_LOGS = author_kubectl_logs_fixture()
+SAMPLE_HELM_INSTALL = author_helm_install_fixture()
 SAMPLE_TERRAFORM_PLAN = author_terraform_plan_fixture()
 
 SAMPLE_GIT_LOG = """commit a1b2c3d4e5f67890abcdef1234567890abcdef12
@@ -1400,6 +1405,8 @@ def test_filter_kubectl_describe_keeps_failure_signal_drops_noise():
     assert "last-applied-configuration" not in compact
     assert "CFG_VAR_0:" not in compact
     assert "Successfully assigned production/api-7d8f9c-0000" not in compact
+    assert "node.kubernetes.io/not-ready" not in compact
+    assert "routine tolerations collapsed" in compact
     assert "annotations" in compact.lower()
     assert "env" in compact.lower() or "Environment" in compact
     before = count_tokens(SAMPLE_KUBECTL_DESCRIBE).openai
@@ -1477,6 +1484,24 @@ def test_filter_kubectl_get_keeps_rows_with_an_unreadable_restart_column():
     assert "api-aaaa" in filter_kubectl(raw)
 
 
+def test_filter_kubectl_logs_collapses_probes_keeps_errors():
+    compact = filter_kubectl(SAMPLE_KUBECTL_LOGS)
+
+    assert "health/ready probe lines collapsed" in compact
+    assert "jwt verification failed" in compact
+    assert "AuthError: token expired" in compact
+    assert "Liveness probe failed" in compact
+    assert "GET /healthz 500" in compact
+    assert compact.count("GET /readyz") < 5
+    before = count_tokens(SAMPLE_KUBECTL_LOGS).openai
+    after = count_tokens(compact).openai
+    assert after < before * 0.35
+    # Idempotent on compacted + short input.
+    assert filter_kubectl(compact) == compact
+    short = "pod started\n"
+    assert filter_kubectl(short) == short
+
+
 def test_auto_specialize_routes_kubectl():
     compact = auto_specialize_command_output(
         "kubectl -n production describe pod api-7d8f9c-xk2m9", SAMPLE_KUBECTL_DESCRIBE
@@ -1489,6 +1514,49 @@ def test_auto_specialize_routes_kubectl():
     assert compact_get is not None
     assert "CrashLoopBackOff" in compact_get
     assert "api-7d8f9c-0000" not in compact_get
+
+    compact_logs = auto_specialize_command_output(
+        "kubectl logs api-7d8f9c-xk2m9 --all-containers", SAMPLE_KUBECTL_LOGS
+    )
+    assert compact_logs is not None
+    assert "health/ready probe lines collapsed" in compact_logs
+    assert "AuthError: token expired" in compact_logs
+
+    compact_oc = auto_specialize_command_output("oc get pods -n production", SAMPLE_KUBECTL_GET)
+    assert compact_oc is not None
+    assert "CrashLoopBackOff" in compact_oc
+
+
+def test_filter_helm_folds_packaging_keeps_notes_and_status():
+    compact = filter_helm(SAMPLE_HELM_INSTALL)
+
+    assert "NAME: api" in compact
+    assert "STATUS: deployed" in compact
+    assert "REVISION: 4" in compact
+    assert "NAMESPACE: production" in compact
+    assert "NOTES:" in compact
+    assert "kubectl port-forward" in compact
+    assert "Warning: chart appVersion differs from image tag" in compact
+    assert "chart/repo lines collapsed" in compact
+    assert "Hang tight while we grab" not in compact
+    assert "Saving 5 charts" not in compact
+    assert "Deleting outdated charts" not in compact
+    before = count_tokens(SAMPLE_HELM_INSTALL).openai
+    after = count_tokens(compact).openai
+    assert after < before * 0.55
+    assert filter_helm(compact) == compact
+    short = "STATUS: deployed\n"
+    assert filter_helm(short) == short
+
+
+def test_auto_specialize_routes_helm():
+    compact = auto_specialize_command_output(
+        "helm upgrade --install api ./charts/api -n production", SAMPLE_HELM_INSTALL
+    )
+    assert compact is not None
+    assert "STATUS: deployed" in compact
+    assert "NOTES:" in compact
+    assert "Hang tight while we grab" not in compact
 
 
 def test_filter_terraform_plan_collapses_refresh_keeps_plan():

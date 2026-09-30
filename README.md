@@ -68,7 +68,7 @@ verbose tool text  →  keep the failure  →  recover the rest by reference
 `usagetrim demo` is offline — **no model calls**. Failures stay; originals recover exactly.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/00200200/usagetrim/main/assets/cuts.svg" width="920" alt="Measured savings: docker 99.4%, go 98%, terraform 95.7%, cargo 95.1%, kubectl 92.5%">
+  <img src="https://raw.githubusercontent.com/00200200/usagetrim/main/assets/cuts.svg" width="920" alt="Measured savings: docker 99.4%, go 98%, terraform 95.7%, cargo 95.1%, kubectl 92.7%">
 </p>
 
 <p align="center">
@@ -82,7 +82,7 @@ verbose tool text  →  keep the failure  →  recover the rest by reference
 | `terraform plan` refresh/read | 6,409 → **276** (95.7%) |
 | `cargo test` + backtrace | 3,795 → **185** (95.1%) |
 | pytest noisy (xdist + I/O) | 5,111 → **349** (93.2%) |
-| `kubectl describe` pod | 8,049 → **601** (92.5%) |
+| `kubectl describe` pod | 8,127 → **595** (92.7%) |
 | pytest recovery demo | 1,562 → **174** (88.9%) |
 | `vitest` / `eslint` / `tsc` | up to **98.8%** / **79%** |
 
