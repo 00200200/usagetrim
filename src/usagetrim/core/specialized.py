@@ -2579,7 +2579,7 @@ def auto_specialize_command_output(command: str, raw_output: str) -> str | None:
     elif _is_kubectl_command(command.strip()):
         return filter_kubectl(raw_output)
     elif _is_terraform_command(command.strip()):
-        return filter_terraform(raw_output)
+        return filter_terraform_plan(raw_output)
     elif _is_ci_log_command(command.strip()):
         res = filter_ci_logs(raw_output)
         if res != raw_output:
@@ -2818,9 +2818,24 @@ _KUBECTL_GET_HEADER_RE = re.compile(
     r"^NAME\s+READY\s+STATUS\b|^NAME\s+STATUS\b|^NAME\s+AGE\b", re.I
 )
 _KUBECTL_EVENT_ROW_RE = re.compile(r"^\s*(Normal|Warning|Error)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$")
+# Refresh/read chatter from terraform plan/apply/destroy and OpenTofu (tofu).
 _TF_REFRESH_RE = re.compile(
-    r"^(\S+):\s+(?:Reading\.\.\.|Read complete after\b|Refreshing state\.\.\.)"
+    r"^(\S+):\s+(?:Reading\.\.\.|Read complete after\b|Refreshing state\.\.\.|Refreshing\.\.\.)"
 )
+_TF_REFRESH_NOTICE_RE = re.compile(r"refresh/read lines collapsed", re.IGNORECASE)
+_TF_UNCHANGED_FOLD_RE = re.compile(r"unchanged attributes folded", re.IGNORECASE)
+_TF_CHANGED_LINE_RE = re.compile(r"^(\s*)([+~-])(?:\s|$)")
+_TF_SIMPLE_ATTR_RE = re.compile(r"^(\s+)(?![+~-])(\S[^=\n]*?)\s*=\s*(.*)$")
+_TF_PLAN_SUMMARY_RE = re.compile(
+    r"^(?:Plan|No changes\.):\s+\d+\s+to add,\s+\d+\s+to change,\s+\d+\s+to destroy",
+    re.IGNORECASE,
+)
+_TF_RESOURCE_HEADER_RE = re.compile(
+    r"^\s*#\s+\S.+\s+will be\s+(?:created|updated|destroyed|replaced|read)",
+    re.IGNORECASE,
+)
+_TF_ERROR_WARNING_RE = re.compile(r"(?i)(?:^\s*(?:Warning|Error):|^\s*[╷│╵]|\berror\b|\bwarning\b)")
+_TF_MIN_UNCHANGED_FOLD = 3
 
 
 def filter_kubectl(raw_output: str) -> str:
@@ -3033,34 +3048,120 @@ def _filter_kubectl_describe(lines: list[str]) -> str:
     return "\n".join(result)
 
 
-def filter_terraform(raw_output: str) -> str:
-    """Collapse terraform/tofu plan refresh/read chatter; keep the plan body."""
-    if not raw_output.strip():
-        return raw_output
+def _tf_is_simple_unchanged_attr(line: str) -> bool:
+    """True for scalar unchanged attribute lines inside a plan resource block.
 
-    lines = raw_output.splitlines()
-    if not any(_TF_REFRESH_RE.match(line.strip()) for line in lines):
-        return raw_output
+    Actionable ``+`` / ``~`` / ``-`` lines, block openers ending in ``{`` / ``[``,
+    and already-emitted fold notices are never treated as foldable attributes.
+    """
+    if _TF_UNCHANGED_FOLD_RE.search(line) or _TF_REFRESH_NOTICE_RE.search(line):
+        return False
+    if _TF_CHANGED_LINE_RE.match(line):
+        return False
+    if _TF_RESOURCE_HEADER_RE.match(line):
+        return False
+    if _TF_PLAN_SUMMARY_RE.match(line.strip()):
+        return False
+    if _TF_ERROR_WARNING_RE.search(line):
+        return False
+    match = _TF_SIMPLE_ATTR_RE.match(line)
+    if not match:
+        return False
+    value = match.group(3).rstrip()
+    # Keep structural openers so nested blocks stay balanced.
+    if value.endswith("{") or value.endswith("["):
+        return False
+    return True
 
+
+def _tf_fold_unchanged_attributes(lines: list[str]) -> list[str]:
+    """Fold runs of ≥3 simple unchanged attributes into one notice line."""
+    result: list[str] = []
+    run: list[str] = []
+
+    def flush_run() -> None:
+        nonlocal run
+        if not run:
+            return
+        if len(run) >= _TF_MIN_UNCHANGED_FOLD:
+            indent = re.match(r"^(\s*)", run[0]).group(1) if run[0] else "  "
+            result.append(f"{indent}[... {len(run)} unchanged attributes folded ...]")
+        else:
+            result.extend(run)
+        run = []
+
+    for line in lines:
+        if _tf_is_simple_unchanged_attr(line):
+            run.append(line)
+            continue
+        flush_run()
+        result.append(line)
+    flush_run()
+    return result
+
+
+def _tf_collapse_refresh_lines(lines: list[str]) -> list[str]:
+    """Collapse consecutive refresh/read chatter into a short count summary."""
     result: list[str] = []
     refresh_count = 0
 
-    def flush_refresh():
+    def flush_refresh() -> None:
         nonlocal refresh_count
         if refresh_count:
             result.append(f"[UsageTrim: {refresh_count} refresh/read lines collapsed]")
             refresh_count = 0
 
     for line in lines:
-        stripped = line.strip()
-        if _TF_REFRESH_RE.match(stripped):
+        if _TF_REFRESH_RE.match(line.strip()):
             refresh_count += 1
             continue
         flush_refresh()
         result.append(line)
-
     flush_refresh()
-    return "\n".join(result)
+    return result
+
+
+def filter_terraform_plan(raw_output: str) -> str:
+    """Compact terraform/tofu plan|apply|destroy output for agent context.
+
+    Collapses repeated ``Refreshing state...`` / ``Reading...`` / ``Refreshing...``
+    chatter into a short count summary, folds long runs of unchanged scalar
+    attributes inside resource diffs, and preserves Plan summaries, resource
+    change headers (``# ... will be created/updated/destroyed``), actionable
+    ``+`` / ``~`` / ``-`` lines, and error/warning blocks. Works for both
+    Terraform and OpenTofu wording. Pure and order-preserving for kept lines;
+    idempotent on already-short or already-compacted input.
+    """
+    if not raw_output.strip():
+        return raw_output
+
+    lines = raw_output.splitlines()
+    has_refresh = any(_TF_REFRESH_RE.match(line.strip()) for line in lines)
+    foldable_attr_count = sum(1 for line in lines if _tf_is_simple_unchanged_attr(line))
+    has_foldable_attrs = foldable_attr_count >= _TF_MIN_UNCHANGED_FOLD
+
+    # Already short / no foldable terraform noise → leave alone (idempotent).
+    if not has_refresh and not has_foldable_attrs:
+        return raw_output
+
+    compacted = lines
+    if has_refresh:
+        compacted = _tf_collapse_refresh_lines(compacted)
+    if sum(1 for line in compacted if _tf_is_simple_unchanged_attr(line)) >= _TF_MIN_UNCHANGED_FOLD:
+        compacted = _tf_fold_unchanged_attributes(compacted)
+
+    ret = "\n".join(compacted)
+    if raw_output.endswith("\n") and not ret.endswith("\n"):
+        ret += "\n"
+    # Never expand the prompt.
+    if len(ret) >= len(raw_output):
+        return raw_output
+    return ret
+
+
+def filter_terraform(raw_output: str) -> str:
+    """Alias for :func:`filter_terraform_plan` (kept for older call sites)."""
+    return filter_terraform_plan(raw_output)
 
 
 def _is_kubectl_command(command: str) -> bool:
@@ -3110,7 +3211,7 @@ def _is_kubectl_command(command: str) -> bool:
 
 
 def _is_terraform_command(command: str) -> bool:
-    """Recognize terraform/tofu plan (and apply, which also emits refresh noise)."""
+    """Recognize terraform/tofu plan|apply|destroy (refresh noise + plan body)."""
     try:
         words = shlex.split(command)
     except ValueError:
@@ -3120,7 +3221,7 @@ def _is_terraform_command(command: str) -> bool:
     binary = PurePath(words[0]).name.lower()
     if binary not in {"terraform", "terraform.exe", "tofu", "tofu.exe"}:
         return False
-    return any(word in {"plan", "apply"} for word in words[1:])
+    return any(word in {"plan", "apply", "destroy"} for word in words[1:])
 
 
 def author_kubectl_describe_fixture() -> str:
@@ -3271,7 +3372,7 @@ def author_kubectl_get_fixture() -> str:
 
 
 def author_terraform_plan_fixture() -> str:
-    """Authored terraform plan: refresh/read chatter dwarfs the actionable plan."""
+    """Authored terraform/tofu plan: refresh/read chatter dwarfs the actionable plan."""
     lines: list[str] = []
     for i in range(80):
         lines.append(f"data.aws_iam_policy_document.policy_{i}: Reading...")
@@ -3282,6 +3383,32 @@ def author_terraform_plan_fixture() -> str:
     for i in range(60):
         lines.append(f"aws_security_group.svc_{i}: Refreshing state... [id=sg-{'b' * 8}{i:04d}]")
         lines.append(f"aws_instance.worker_{i}: Refreshing state... [id=i-{'c' * 8}{i:04d}]")
+    for i in range(20):
+        lines.append(f"module.vpc.aws_subnet.private[{i}]: Refreshing...")
+    unchanged_attrs = [
+        '        ami                         = "ami-0abcdef1234567890"',
+        '        arn                         = "arn:aws:ec2:us-east-1:123456789012:instance/i-0abc"',
+        "        associate_public_ip_address = false",
+        '        availability_zone           = "us-east-1a"',
+        "        cpu_core_count              = 1",
+        "        cpu_threads_per_core        = 2",
+        "        disable_api_termination     = false",
+        "        ebs_optimized               = true",
+        '        id                          = "i-0abc123def456"',
+        '        instance_state              = "running"',
+        '        key_name                    = "deploy"',
+        "        monitoring                  = false",
+        '        private_dns                 = "ip-10-0-1-10.ec2.internal"',
+        '        private_ip                  = "10.0.1.10"',
+        '        public_dns                  = ""',
+        '        public_ip                   = ""',
+        "        secondary_private_ips       = []",
+        "        security_groups             = []",
+        '        subnet_id                   = "subnet-0aabbccddeeff0011"',
+        '        tenancy                     = "default"',
+        "        user_data                   = null",
+        '        vpc_security_group_ids      = ["sg-0123456789abcdef0"]',
+    ]
     lines.extend(
         [
             "",
@@ -3294,8 +3421,9 @@ def author_terraform_plan_fixture() -> str:
             "",
             "  # aws_instance.api will be updated in-place",
             '  ~ resource "aws_instance" "api" {',
-            '      ~ instance_type = "t3.small" -> "t3.medium"',
-            '        id            = "i-0abc123def456"',
+            *unchanged_attrs[:11],
+            '      ~ instance_type               = "t3.small" -> "t3.medium"',
+            *unchanged_attrs[11:],
             "    }",
             "",
             "  # aws_lb_listener_rule.canary will be created",
@@ -3306,6 +3434,11 @@ def author_terraform_plan_fixture() -> str:
             "    }",
             "",
             "Plan: 1 to add, 1 to change, 0 to destroy.",
+            "",
+            "Warning: Deprecated attribute",
+            "",
+            '  on main.tf line 42, in resource "aws_instance" "api":',
+            "  42:   ebs_optimized = true",
             "",
             "─────────────────────────────────────────────────────────────────────────────",
             "",
