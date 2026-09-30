@@ -29,6 +29,7 @@ from usagetrim.core.specialized import (
     filter_ripgrep_output,
     filter_ruff,
     filter_terraform,
+    filter_terraform_plan,
     filter_tsc,
     filter_uv_project,
 )
@@ -1491,21 +1492,68 @@ def test_auto_specialize_routes_kubectl():
 
 
 def test_filter_terraform_plan_collapses_refresh_keeps_plan():
-    compact = filter_terraform(SAMPLE_TERRAFORM_PLAN)
+    compact = filter_terraform_plan(SAMPLE_TERRAFORM_PLAN)
 
     assert "Plan: 1 to add, 1 to change, 0 to destroy." in compact
     assert 'resource "aws_instance" "api"' in compact
+    assert "# aws_instance.api will be updated in-place" in compact
+    assert "# aws_lb_listener_rule.canary will be created" in compact
     assert "t3.small" in compact
     assert "t3.medium" in compact
     assert 'resource "aws_lb_listener_rule" "canary"' in compact
+    assert "Warning: Deprecated attribute" in compact
     assert "Refreshing state..." not in compact
+    assert "Refreshing..." not in compact
     assert "Reading..." not in compact
     assert "Read complete after" not in compact
-    assert "refresh" in compact.lower() or "UsageTrim" in compact
+    assert "refresh/read lines collapsed" in compact
+    assert "unchanged attributes folded" in compact
+    assert "ami-0abcdef1234567890" not in compact
+    assert "associate_public_ip_address" not in compact
+    # Alias stays wired.
+    assert filter_terraform(SAMPLE_TERRAFORM_PLAN) == compact
     before = count_tokens(SAMPLE_TERRAFORM_PLAN).openai
     after = count_tokens(compact).openai
-    assert after < before * 0.25
+    assert after < before * 0.2
     assert before - after > 1_500
+
+
+def test_filter_terraform_plan_idempotent_on_short_and_compacted():
+    short = "Plan: 0 to add, 0 to change, 0 to destroy.\n"
+    assert filter_terraform_plan(short) == short
+    once = filter_terraform_plan(SAMPLE_TERRAFORM_PLAN)
+    assert filter_terraform_plan(once) == once
+
+
+def test_filter_terraform_plan_opentofu_wording():
+    raw = "\n".join(
+        [
+            "aws_s3_bucket.data: Refreshing state... [id=bucket]",
+            "module.vpc.aws_subnet.a: Refreshing...",
+            "data.aws_ami.ubuntu: Reading...",
+            "data.aws_ami.ubuntu: Read complete after 1s [id=ami-1]",
+            "",
+            "OpenTofu will perform the following actions:",
+            "",
+            "  # aws_s3_bucket.logs will be created",
+            '  + resource "aws_s3_bucket" "logs" {',
+            '      + bucket = "app-logs"',
+            "    }",
+            "",
+            "Plan: 1 to add, 0 to change, 0 to destroy.",
+            "",
+            "Error: Invalid configuration",
+            "│ on main.tf line 1",
+        ]
+    )
+    compact = filter_terraform_plan(raw)
+    assert "OpenTofu will perform the following actions:" in compact
+    assert "# aws_s3_bucket.logs will be created" in compact
+    assert "Plan: 1 to add, 0 to change, 0 to destroy." in compact
+    assert "Error: Invalid configuration" in compact
+    assert "Refreshing state..." not in compact
+    assert "Reading..." not in compact
+    assert "refresh/read lines collapsed" in compact
 
 
 def test_auto_specialize_routes_terraform_and_tofu():
@@ -1517,6 +1565,19 @@ def test_auto_specialize_routes_terraform_and_tofu():
     compact_tofu = auto_specialize_command_output("tofu plan", SAMPLE_TERRAFORM_PLAN)
     assert compact_tofu is not None
     assert "aws_instance" in compact_tofu
+
+    for command in (
+        "terraform apply -auto-approve",
+        "tofu destroy -auto-approve",
+        "/usr/local/bin/terraform plan",
+        "terraform.exe plan",
+    ):
+        routed = auto_specialize_command_output(command, SAMPLE_TERRAFORM_PLAN)
+        assert routed is not None, command
+        assert "Plan: 1 to add, 1 to change, 0 to destroy." in routed
+
+    assert auto_specialize_command_output("terraform version", SAMPLE_TERRAFORM_PLAN) is None
+    assert auto_specialize_command_output("terraform fmt", SAMPLE_TERRAFORM_PLAN) is None
 
 
 def test_compress_to_budget():

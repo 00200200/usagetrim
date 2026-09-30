@@ -106,9 +106,9 @@ def test_demo_measures_recovery_and_preserves_user_cache(tmp_path, monkeypatch):
         "reduction_pct": 92.5,
     }
     assert data["specialized"]["terraform_plan"] == {
-        "raw_tokens": 5885,
-        "output_tokens": 236,
-        "reduction_pct": 96.0,
+        "raw_tokens": 6409,
+        "output_tokens": 276,
+        "reduction_pct": 95.7,
     }
     assert data["checks"]["cargo_keeps_failure_drops_passes"]
     assert data["checks"]["go_keeps_failure_drops_passes"]

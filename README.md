@@ -68,7 +68,7 @@ verbose tool text  →  keep the failure  →  recover the rest by reference
 `usagetrim demo` is offline — **no model calls**. Failures stay; originals recover exactly.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/00200200/usagetrim/main/assets/cuts.svg" width="920" alt="Measured savings: docker 99.4%, go 98%, terraform 96%, cargo 95.1%, kubectl 92.5%">
+  <img src="https://raw.githubusercontent.com/00200200/usagetrim/main/assets/cuts.svg" width="920" alt="Measured savings: docker 99.4%, go 98%, terraform 95.7%, cargo 95.1%, kubectl 92.5%">
 </p>
 
 <p align="center">
@@ -79,7 +79,7 @@ verbose tool text  →  keep the failure  →  recover the rest by reference
 | --- | ---: |
 | `docker build` BuildKit | 18,360 → **107** (99.4%) |
 | `go test` + goroutine dump | 3,281 → **64** (98.0%) |
-| `terraform plan` refresh/read | 5,885 → **236** (96.0%) |
+| `terraform plan` refresh/read | 6,409 → **276** (95.7%) |
 | `cargo test` + backtrace | 3,795 → **185** (95.1%) |
 | pytest noisy (xdist + I/O) | 5,111 → **349** (93.2%) |
 | `kubectl describe` pod | 8,049 → **601** (92.5%) |
@@ -104,7 +104,7 @@ usagetrim run -- npx eslint . --format codeframe
 
 - **Compact other MCP servers, losslessly.** The Claude Code hook rewrites results from *other* MCP servers: uniform JSON rows become TSV with the keys once, `{"result": "…"}` wrappers lose their escaping, and indentation goes. Every value and type survives, and prompt-injection boundaries such as Supabase's `<untrusted-data-…>` stay verbatim. [Measured below](#measured-on-real-sessions).
 - **Spend Haiku, not Opus, on reading.** The plugin adds `scout` (read-only search) and `runner` (tests and builds, failures only) agents on Haiku, so the main model gets conclusions instead of files and logs. `usagetrim install --cheap-explore` moves Claude Code's built-in Explore, which now inherits the main model, back to Haiku. `/output-style usagetrim:lean` trims reply preambles and recaps.
-- **Cut noise, keep the failure.** Specialized filters for pytest, Docker, cargo, go, vitest, eslint, tsc, mypy, pyright, kubectl, terraform, GitHub Actions / GitLab CI log folding (`gh run view --log-failed`, `glab ci trace`), `uv sync`/`uv add`, git diff, ruff…
+- **Cut noise, keep the failure.** Specialized filters for pytest, Docker, cargo, go, vitest, eslint, tsc, mypy, pyright, kubectl, terraform/tofu plan|apply|destroy, GitHub Actions / GitLab CI log folding (`gh run view --log-failed`, `glab ci trace`), `uv sync`/`uv add`, git diff, ruff…
 - **Session dedup + spill.** Same `run` output *or* identical `cat` / MCP `usagetrim_read` view within ~15 minutes → short cache ref. Payloads over ~20 KiB → file + preview (`USAGETRIM_SPILL_BYTES`).
 - **Recover by reference.** Omitted text stays in a local CCR cache: `usagetrim retrieve tc_…`
 - **Measure it.** `usagetrim gain` / MCP `usagetrim_gain` — per-tool-family savings and passthrough candidates (local estimates, not account quotas).
