@@ -1060,6 +1060,320 @@ def filter_gh_run_log(raw_output: str) -> str | None:
     return header + compact
 
 
+# ---------------------------------------------------------------------------
+# CI log folding — GitHub Actions groups, GitLab sections, CircleCI banners
+# ---------------------------------------------------------------------------
+
+_CI_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+")
+_CI_GH_GROUP_START = re.compile(r"^##\[group\](.*)$")
+_CI_GH_GROUP_END = re.compile(r"^##\[endgroup\]\s*$")
+# GitLab: optional ANSI clear, then section_start:EPOCH:name (name may include [collapsed=true]).
+_CI_GL_SECTION_START = re.compile(r"^(?:\x1b\[0K)?section_start:\d+:([^\r\n]+?)(?:\r.*)?$")
+_CI_GL_SECTION_END = re.compile(r"^(?:\x1b\[0K)?section_end:\d+:")
+# CircleCI 2.x machine executor commonly prints ``====>> Step Name``.
+_CI_CIRCLE_BANNER = re.compile(r"^={3,}>>\s*(.+?)\s*$")
+_CI_ERROR_RE = re.compile(
+    r"(?:##\[error\]|\bError\b|\bAssertionError\b|\bFAILED\b|\bTraceback\b"
+    r"|\berror\b(?!-)|exit code [1-9])",
+    re.IGNORECASE,
+)
+_CI_SETUP_TEARDOWN_RE = re.compile(
+    r"(?i)(?:"
+    r"set\s*up\s*job|complete\s*job|post\s*job\s*cleanup|post\s+.+"
+    r"|operating\s*system|runner\s*image|included\s*software"
+    r"|actions/checkout|actions/cache|checkout|restore\s*cache|save\s*cache"
+    r"|setup[- ](?:job|python|node|java|go|ruby|dotnet|php)"
+    r"|get_sources|get-sources|prepare_script|cleanup_file_variables"
+    r"|upload[- ]artifact|download[- ]artifact"
+    r"|spin\s*up|spinning\s*up\s*environment|preparing\s*environment"
+    r")"
+)
+_CI_FOLD_NOTICE_RE = re.compile(r"folded by usagetrim", re.IGNORECASE)
+_CI_FAILED_TAIL = 20
+_CI_MIN_FOLD_LINES = 3
+_CI_MARKER_THRESHOLD = 2
+
+
+def _ci_strip_timestamp(line: str) -> str:
+    """Drop leading ISO-8601 runner timestamps for stable, denser output."""
+    return _CI_TIMESTAMP_RE.sub("", line)
+
+
+def _ci_clean_gl_title(raw: str) -> str:
+    """Normalize a GitLab section name (drop ``[collapsed=true]`` suffix noise)."""
+    title = raw.strip()
+    bracket = title.find("[")
+    if bracket > 0:
+        title = title[:bracket].rstrip()
+    return title or "section"
+
+
+def _ci_is_setup_teardown(title: str) -> bool:
+    return bool(_CI_SETUP_TEARDOWN_RE.search(title))
+
+
+def _ci_group_has_error(body: list[str]) -> bool:
+    return any(_CI_ERROR_RE.search(line) for line in body)
+
+
+def _ci_fold_notice(title: str, line_count: int) -> str:
+    display = title.strip() or "section"
+    if len(display) > 80:
+        display = display[:77] + "..."
+    return f"  [... {line_count} lines of '{display}' folded by usagetrim ...]"
+
+
+def _ci_emit_failed_group(title: str, body: list[str], kind: str) -> list[str]:
+    """Keep error-like lines and the tail of a failed group, preserving order."""
+    if not body:
+        header = f"##[group]{title}" if kind == "github" else f">> {title} (FAILED)"
+        return [header]
+
+    keep: set[int] = set()
+    for index, line in enumerate(body):
+        if _CI_ERROR_RE.search(line):
+            keep.add(index)
+    tail_start = max(0, len(body) - _CI_FAILED_TAIL)
+    keep.update(range(tail_start, len(body)))
+
+    ordered = sorted(keep)
+    out: list[str] = []
+    if kind == "github":
+        out.append(f"##[group]{title}")
+    elif kind == "gitlab":
+        out.append(f"section: {title}")
+    else:
+        out.append(f"====>> {title}")
+
+    previous = -1
+    for index in ordered:
+        if previous >= 0 and index - previous > 1:
+            out.append(f"  … {index - previous - 1} lines omitted")
+        elif previous < 0 and index > 0:
+            out.append(f"  … {index} lines omitted")
+        out.append(body[index])
+        previous = index
+    if kind == "github":
+        out.append("##[endgroup]")
+    return out
+
+
+def _ci_parse_segments(
+    lines: list[str],
+) -> list[tuple[str, str, list[str]]]:
+    """Split cleaned lines into ``(kind, title, body)`` segments.
+
+    ``kind`` is ``github``, ``gitlab``, ``circle``, or ``raw`` (ungrouped lines).
+    CircleCI banners open a segment that runs until the next banner or EOF.
+    """
+    segments: list[tuple[str, str, list[str]]] = []
+    raw_buf: list[str] = []
+    active_kind: str | None = None
+    active_title = ""
+    active_body: list[str] = []
+
+    def flush_raw() -> None:
+        nonlocal raw_buf
+        if raw_buf:
+            segments.append(("raw", "", raw_buf))
+            raw_buf = []
+
+    def flush_active() -> None:
+        nonlocal active_kind, active_title, active_body
+        if active_kind is not None:
+            segments.append((active_kind, active_title, active_body))
+            active_kind = None
+            active_title = ""
+            active_body = []
+
+    for line in lines:
+        gh_start = _CI_GH_GROUP_START.match(line)
+        if gh_start:
+            flush_raw()
+            flush_active()
+            active_kind = "github"
+            active_title = gh_start.group(1).strip() or "group"
+            active_body = []
+            continue
+        if _CI_GH_GROUP_END.match(line):
+            if active_kind == "github":
+                flush_active()
+            else:
+                raw_buf.append(line)
+            continue
+
+        gl_start = _CI_GL_SECTION_START.match(line)
+        if gl_start:
+            flush_raw()
+            flush_active()
+            active_kind = "gitlab"
+            active_title = _ci_clean_gl_title(gl_start.group(1))
+            active_body = []
+            continue
+        if _CI_GL_SECTION_END.match(line):
+            if active_kind == "gitlab":
+                flush_active()
+            else:
+                raw_buf.append(line)
+            continue
+
+        circle = _CI_CIRCLE_BANNER.match(line)
+        if circle:
+            flush_raw()
+            flush_active()
+            active_kind = "circle"
+            active_title = circle.group(1).strip() or "step"
+            active_body = []
+            continue
+
+        if active_kind is not None:
+            active_body.append(line)
+        else:
+            raw_buf.append(line)
+
+    flush_raw()
+    flush_active()
+    return segments
+
+
+def filter_ci_logs(raw_output: str) -> str:
+    """Fold noisy CI log groups into one-line summaries; keep failures and errors.
+
+    Handles GitHub Actions ``##[group]`` / ``##[endgroup]``, GitLab
+    ``section_start:`` / ``section_end:``, and CircleCI ``====>>`` step banners.
+    Successful setup/teardown groups (checkout, cache, set up job, post steps)
+    collapse to a single notice. Failed groups keep error-like lines and a short
+    tail. Leading ISO-8601 timestamps are stripped. Idempotent on already-short
+    or already-folded input. Pure function (no network / cache I/O).
+
+    CircleCI limitation: only the common ``====>>`` machine-executor banners are
+    recognized; orb-specific or UI-exported shapes without those banners are left
+    unchanged unless they also contain GitHub/GitLab markers.
+    """
+    if not raw_output.strip():
+        return raw_output
+
+    if _CI_FOLD_NOTICE_RE.search(raw_output):
+        return raw_output
+
+    original_lines = raw_output.splitlines()
+    cleaned = [_ci_strip_timestamp(line) for line in original_lines]
+
+    marker_hits = sum(
+        1
+        for line in cleaned
+        if (
+            _CI_GH_GROUP_START.match(line)
+            or _CI_GL_SECTION_START.match(line)
+            or _CI_CIRCLE_BANNER.match(line)
+        )
+    )
+    # Already short / no foldable structure → leave alone (idempotent).
+    if marker_hits < 1 and len(cleaned) < 40:
+        return raw_output
+    if marker_hits < 1:
+        return raw_output
+
+    segments = _ci_parse_segments(cleaned)
+    if not segments:
+        return raw_output
+
+    result: list[str] = []
+    folded_any = False
+
+    for kind, title, body in segments:
+        if kind == "raw":
+            for line in body:
+                result.append(line)
+            continue
+
+        has_error = _ci_group_has_error(body)
+        is_setup = _ci_is_setup_teardown(title)
+
+        if has_error:
+            result.extend(_ci_emit_failed_group(title, body, kind))
+            continue
+
+        if is_setup and len(body) >= _CI_MIN_FOLD_LINES:
+            result.append(_ci_fold_notice(title, len(body)))
+            folded_any = True
+            continue
+
+        # Non-setup success: keep body; re-emit a lightweight header for context.
+        if kind == "github":
+            result.append(f"##[group]{title}")
+            result.extend(body)
+            result.append("##[endgroup]")
+        elif kind == "gitlab":
+            result.append(f"section: {title}")
+            result.extend(body)
+        else:
+            result.append(f"====>> {title}")
+            result.extend(body)
+
+    if not folded_any and not any(_CI_ERROR_RE.search(line) for line in cleaned):
+        # Nothing useful changed (e.g. only tiny groups) — stay idempotent.
+        compact_probe = "\n".join(result)
+        if len(compact_probe) >= len(raw_output) * 0.9:
+            return raw_output
+
+    ret = "\n".join(result)
+    if raw_output.endswith("\n"):
+        ret += "\n"
+    # Never expand the prompt.
+    if len(ret) >= len(raw_output):
+        return raw_output
+    return ret
+
+
+def _is_ci_log_command(command: str) -> bool:
+    """True for ``glab ci …``, ``circleci …``, and similar CI trace viewers."""
+    try:
+        words = shlex.split(command.strip())
+    except ValueError:
+        words = command.strip().split()
+    if not words:
+        return False
+    binary = PurePath(words[0]).name.lower()
+    if binary in {"glab", "glab.exe"}:
+        return len(words) >= 2 and words[1].lower() == "ci"
+    if binary in {"circleci", "circleci.exe"}:
+        return True
+    # Downloaded artifact / raw log inspection via common readers when the
+    # path name itself signals a CI log (kept narrow to avoid false positives).
+    if binary in {"cat", "bat", "less", "tail", "head"} and len(words) >= 2:
+        joined = " ".join(words[1:]).lower()
+        return any(
+            token in joined
+            for token in (
+                "ci.log",
+                "ci-log",
+                "github-actions",
+                "actions.log",
+                "job.log",
+                "gitlab-ci",
+                "circleci",
+            )
+        )
+    return False
+
+
+def _looks_like_ci_log(raw_output: str) -> bool:
+    """Detect foldable CI markers without relying on the invoking command."""
+    hits = 0
+    for line in raw_output.splitlines()[:400]:
+        bare = _ci_strip_timestamp(line)
+        if (
+            _CI_GH_GROUP_START.match(bare)
+            or _CI_GL_SECTION_START.match(bare)
+            or _CI_CIRCLE_BANNER.match(bare)
+        ):
+            hits += 1
+            if hits >= _CI_MARKER_THRESHOLD:
+                return True
+    return False
+
+
 def filter_gh_command_output(command: str, raw_output: str) -> str | None:
     """Specialize ``gh pr view`` / ``gh api`` (and related) with JSON spill + slim.
 
@@ -2266,6 +2580,15 @@ def auto_specialize_command_output(command: str, raw_output: str) -> str | None:
         return filter_kubectl(raw_output)
     elif _is_terraform_command(command.strip()):
         return filter_terraform(raw_output)
+    elif _is_ci_log_command(command.strip()):
+        res = filter_ci_logs(raw_output)
+        if res != raw_output:
+            return res
+
+    if _looks_like_ci_log(raw_output):
+        res = filter_ci_logs(raw_output)
+        if res != raw_output:
+            return res
 
     if _is_directory_scan_command(cmd_lower):
         res = filter_directory_scan(raw_output)

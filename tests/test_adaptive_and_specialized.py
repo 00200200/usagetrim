@@ -12,6 +12,7 @@ from usagetrim.core.specialized import (
     auto_specialize_command_output,
     filter_cargo_build,
     filter_cargo_test,
+    filter_ci_logs,
     filter_docker_build,
     filter_eslint,
     filter_git_diff,
@@ -1917,3 +1918,128 @@ def test_auto_specialize_routes_rg_and_grep_r():
     assert "omitted by usagetrim" in compact_grep
 
     assert auto_specialize_command_output("grep needle file.txt", SAMPLE_RG_TEXT_CONTEXT) is None
+
+
+# ---------------------------------------------------------------------------
+# CI log folding (GitHub Actions / GitLab / CircleCI banners)
+# ---------------------------------------------------------------------------
+
+
+def _gha_line(ts: str, text: str) -> str:
+    return f"{ts} {text}"
+
+
+_SAMPLE_GHA_CI_LOG = "\n".join(
+    [
+        _gha_line("2026-09-27T12:01:00.123Z", "##[group]Operating System"),
+        *[_gha_line("2026-09-27T12:01:00.124Z", f"os-detail-line-{i}") for i in range(40)],
+        _gha_line("2026-09-27T12:01:00.300Z", "##[endgroup]"),
+        _gha_line("2026-09-27T12:01:01.000Z", "##[group]Run actions/checkout@v4"),
+        *[_gha_line("2026-09-27T12:01:01.010Z", f"git-fetch-{i}") for i in range(30)],
+        _gha_line("2026-09-27T12:01:02.000Z", "##[endgroup]"),
+        _gha_line("2026-09-27T12:01:05.000Z", "##[group]Run uv run pytest"),
+        *[_gha_line("2026-09-27T12:01:05.010Z", f"collected noise {i}") for i in range(50)],
+        _gha_line(
+            "2026-09-27T12:01:06.000Z",
+            "FAILED tests/test_api.py::test_auth - AssertionError: assert 401 == 200",
+        ),
+        _gha_line("2026-09-27T12:01:06.050Z", "Traceback (most recent call last):"),
+        _gha_line("2026-09-27T12:01:06.060Z", '  File "tests/test_api.py", line 10, in test_auth'),
+        _gha_line("2026-09-27T12:01:06.100Z", "##[error]Process completed with exit code 1."),
+        _gha_line("2026-09-27T12:01:06.200Z", "##[endgroup]"),
+        _gha_line("2026-09-27T12:01:07.000Z", "##[group]Post job cleanup"),
+        *[_gha_line("2026-09-27T12:01:07.010Z", f"cleanup-{i}") for i in range(25)],
+        _gha_line("2026-09-27T12:01:08.000Z", "##[endgroup]"),
+    ]
+)
+
+
+_SAMPLE_GITLAB_CI_LOG = "\n".join(
+    [
+        "section_start:1690000000:get_sources\rget_sources",
+        *[f"fetching object {i}" for i in range(35)],
+        "section_end:1690000000:get_sources\r",
+        "section_start:1690000001:script\rscript",
+        *[f"running step {i}" for i in range(40)],
+        "FAILED tests/test_api.py::test_auth - AssertionError: assert 401 == 200",
+        "Error: process exited with code 1",
+        "section_end:1690000001:script\r",
+        "section_start:1690000002:cleanup_file_variables\rcleanup_file_variables",
+        *[f"cleanup var {i}" for i in range(20)],
+        "section_end:1690000002:cleanup_file_variables\r",
+    ]
+)
+
+
+_SAMPLE_CIRCLE_CI_LOG = "\n".join(
+    [
+        "====>> Spin up Environment",
+        *[f"starting container layer {i}" for i in range(20)],
+        "====>> Checkout code",
+        *[f"cloning repo blob {i}" for i in range(20)],
+        "====>> Run tests",
+        *[f"test noise {i}" for i in range(30)],
+        "FAILED tests/test_api.py::test_auth - AssertionError: assert 401 == 200",
+        "Error: exit code 1",
+    ]
+)
+
+
+def test_filter_ci_logs_folds_github_setup_keeps_failure():
+    compact = filter_ci_logs(_SAMPLE_GHA_CI_LOG)
+    assert compact != _SAMPLE_GHA_CI_LOG
+    assert "folded by usagetrim" in compact
+    assert "Operating System" in compact
+    assert "actions/checkout@v4" in compact or "checkout" in compact.lower()
+    assert "Post job cleanup" in compact
+    assert "os-detail-line-0" not in compact
+    assert "git-fetch-0" not in compact
+    assert "cleanup-0" not in compact
+    assert "FAILED tests/test_api.py::test_auth" in compact
+    assert "AssertionError: assert 401 == 200" in compact
+    assert "##[error]Process completed with exit code 1." in compact
+    assert "2026-09-27T12:01:00.123Z" not in compact
+    raw_tokens = count_tokens(_SAMPLE_GHA_CI_LOG).openai
+    out_tokens = count_tokens(compact).openai
+    assert raw_tokens > 0 and out_tokens < raw_tokens * 0.15
+
+
+def test_filter_ci_logs_folds_gitlab_sections():
+    compact = filter_ci_logs(_SAMPLE_GITLAB_CI_LOG)
+    assert "folded by usagetrim" in compact
+    assert "get_sources" in compact
+    assert "cleanup_file_variables" in compact
+    assert "fetching object 0" not in compact
+    assert "FAILED tests/test_api.py::test_auth" in compact
+    assert "AssertionError: assert 401 == 200" in compact
+
+
+def test_filter_ci_logs_circleci_banners():
+    compact = filter_ci_logs(_SAMPLE_CIRCLE_CI_LOG)
+    assert "folded by usagetrim" in compact
+    assert "Spin up Environment" in compact or "Checkout code" in compact
+    assert "starting container layer 0" not in compact
+    assert "FAILED tests/test_api.py::test_auth" in compact
+
+
+def test_filter_ci_logs_idempotent_on_short_and_folded():
+    short = "hello\nworld\n"
+    assert filter_ci_logs(short) == short
+    once = filter_ci_logs(_SAMPLE_GHA_CI_LOG)
+    assert filter_ci_logs(once) == once
+
+
+def test_auto_specialize_routes_glab_and_content_ci_logs():
+    via_glab = auto_specialize_command_output("glab ci trace 42", _SAMPLE_GHA_CI_LOG)
+    assert via_glab is not None
+    assert "FAILED tests/test_api.py::test_auth" in via_glab
+    assert "folded by usagetrim" in via_glab
+
+    via_circle = auto_specialize_command_output("circleci step logs", _SAMPLE_CIRCLE_CI_LOG)
+    assert via_circle is not None
+    assert "FAILED tests/test_api.py::test_auth" in via_circle
+
+    # Content detection when markers are present (e.g. cat of a downloaded log).
+    via_content = auto_specialize_command_output("cat /tmp/job.log", _SAMPLE_GITLAB_CI_LOG)
+    assert via_content is not None
+    assert "folded by usagetrim" in via_content
