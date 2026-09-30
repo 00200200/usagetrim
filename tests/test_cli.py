@@ -101,9 +101,9 @@ def test_demo_measures_recovery_and_preserves_user_cache(tmp_path, monkeypatch):
         "reduction_pct": 98.8,
     }
     assert data["specialized"]["kubectl_describe"] == {
-        "raw_tokens": 8049,
-        "output_tokens": 601,
-        "reduction_pct": 92.5,
+        "raw_tokens": 8127,
+        "output_tokens": 595,
+        "reduction_pct": 92.7,
     }
     assert data["specialized"]["terraform_plan"] == {
         "raw_tokens": 6409,
