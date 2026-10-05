@@ -2828,6 +2828,16 @@ def auto_specialize_command_output(command: str, raw_output: str) -> str | None:
         if res != raw_output:
             return res
 
+    # Check for PostgreSQL / MySQL EXPLAIN execution plans
+    if (
+        "explain" in cmd_lower
+        or _EXPLAIN_PG_SUMMARY_RE.search(raw_output)
+        or _EXPLAIN_MYSQL_HEADER_RE.search(raw_output)
+    ):
+        explain_res = filter_explain_plan(raw_output)
+        if explain_res != raw_output:
+            return explain_res
+
     # Check for large or verbose JSON output
     json_result = filter_json_output(raw_output, command=command)
     if json_result is not None:
@@ -3074,6 +3084,28 @@ _HELM_NOISE_RE = re.compile(
 )
 _HELM_FOLD_NOTICE_RE = re.compile(r"chart/repo lines collapsed", re.IGNORECASE)
 _HELM_MIN_NOISE_FOLD = 3
+
+# EXPLAIN / EXPLAIN ANALYZE execution plan compaction (PostgreSQL & MySQL)
+_EXPLAIN_PG_HOTSPOT_RE = re.compile(
+    r"(?i)\b(?:Seq Scan|Bitmap Heap Scan|Sort|Nested Loop|Hash Join|Gather Merge)\b"
+)
+_EXPLAIN_PG_NODE_RE = re.compile(
+    r"^\s*(?:->\s+)?(Seq Scan|Index Scan|Index Only Scan|Bitmap Heap Scan|Bitmap Index Scan|Hash Join|Merge Join|Nested Loop|Aggregate|GroupAggregate|HashAggregate|Sort|Limit|Gather|Gather Merge|Materialize|Subquery Scan|Values Scan|CTE Scan|Function Scan|WindowAgg|Unique)\b"
+)
+_EXPLAIN_PG_BUFFER_RE = re.compile(
+    r"^\s*Buffers:\s+(?:shared|temp|local)\s+(?:hit|read|dirtied|written)=\d+"
+)
+_EXPLAIN_PG_TIMING_RE = re.compile(
+    r"\(cost=[\d.]+\.\.[\d.]+\s+rows=\d+\s+width=\d+\)(?:\s+\(actual\s+time=[\d.]+\.\.[\d.]+\s+rows=\d+\s+loops=\d+\))?"
+)
+_EXPLAIN_PG_SUMMARY_RE = re.compile(
+    r"^\s*(?:Planning Time|Execution Time|Planning|Execution):\s+[\d.]+\s*ms",
+    re.IGNORECASE,
+)
+_EXPLAIN_MYSQL_HEADER_RE = re.compile(
+    r"^\s*\|\s*id\s*\|\s*select_type\s*\|\s*table\s*\|",
+    re.IGNORECASE,
+)
 
 
 def filter_kubectl(raw_output: str, command: str = "") -> str:
@@ -3844,6 +3876,178 @@ def author_terraform_plan_fixture() -> str:
             "",
             "Note: You didn't use the -out option to save this plan, so Terraform can't",
             'guarantee to take exactly these actions if you run "terraform apply" now.',
+        ]
+    )
+    return "\n".join(lines)
+
+
+def filter_explain_plan(raw_output: str) -> str:
+    """Compact PostgreSQL and MySQL EXPLAIN / EXPLAIN ANALYZE execution plans.
+
+    Surfaces key hotspots (sequential scans on large tables, costly sorts, high loops)
+    while folding routine buffer reads/hits, trivial index lookups, and nested filter rows.
+    Reduces token footprint significantly while preserving all actionable optimization context.
+    """
+    if not raw_output.strip():
+        return raw_output
+
+    lines = raw_output.splitlines()
+
+    # PostgreSQL text plan detection
+    is_pg_plan = any(
+        _EXPLAIN_PG_TIMING_RE.search(line) or _EXPLAIN_PG_SUMMARY_RE.search(line) for line in lines
+    )
+    # MySQL tabular plan detection
+    is_mysql_plan = any(_EXPLAIN_MYSQL_HEADER_RE.search(line) for line in lines)
+
+    if not is_pg_plan and not is_mysql_plan:
+        return raw_output
+
+    if is_pg_plan:
+        return _filter_pg_explain_plan(lines, raw_output)
+
+    return _filter_mysql_explain_plan(lines, raw_output)
+
+
+def _filter_pg_explain_plan(lines: list[str], raw_output: str) -> str:
+    result: list[str] = []
+    collapsed_buffers = 0
+    consecutive_trivial_nodes = 0
+
+    def flush_buffers():
+        nonlocal collapsed_buffers
+        if collapsed_buffers > 0:
+            result.append(f"        [... {collapsed_buffers} buffer stats folded ...]")
+            collapsed_buffers = 0
+
+    def flush_trivial_nodes():
+        nonlocal consecutive_trivial_nodes
+        if consecutive_trivial_nodes > 0:
+            result.append(
+                f"    [... {consecutive_trivial_nodes} trivial index scans (<0.1ms, 1 row) folded by usagetrim ...]"
+            )
+            consecutive_trivial_nodes = 0
+
+    in_trivial_node = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Preserve execution/planning summary
+        if _EXPLAIN_PG_SUMMARY_RE.search(stripped):
+            flush_buffers()
+            flush_trivial_nodes()
+            result.append(line)
+            in_trivial_node = False
+            continue
+
+        # Check for node line
+        node_match = _EXPLAIN_PG_NODE_RE.search(line)
+        if node_match:
+            flush_buffers()
+
+            # Check if hotspot
+            is_hotspot = False
+            node_type = node_match.group(1)
+            if "Seq Scan" in node_type or "Sort" in node_type or "Hash Join" in node_type:
+                is_hotspot = True
+
+            # Check cost / time
+            is_trivial = False
+            time_match = re.search(r"actual\s+time=([\d.]+)\.\.([\d.]+)\s+rows=(\d+)", line)
+            if time_match:
+                cost_time = float(time_match.group(2))
+                rows = int(time_match.group(3))
+                if cost_time > 50.0 or rows > 5000:
+                    is_hotspot = True
+                elif cost_time < 0.1 and rows <= 1 and not is_hotspot:
+                    is_trivial = True
+
+            if is_trivial:
+                consecutive_trivial_nodes += 1
+                in_trivial_node = True
+                continue
+            else:
+                flush_trivial_nodes()
+                in_trivial_node = False
+
+            if is_hotspot and "[HOTSPOT]" not in line:
+                result.append(f"{line}  <-- [HOTSPOT]")
+            else:
+                result.append(line)
+            continue
+
+        # Ignore non-node lines (Buffers, Index Cond, etc.) belonging to a collapsed trivial node
+        if in_trivial_node:
+            continue
+
+        # Check for buffer stats lines outside trivial nodes
+        if _EXPLAIN_PG_BUFFER_RE.search(line):
+            collapsed_buffers += 1
+            continue
+
+        flush_buffers()
+        flush_trivial_nodes()
+        result.append(line)
+
+    flush_buffers()
+    flush_trivial_nodes()
+
+    ret = "\n".join(result)
+    if raw_output.endswith("\n") and not ret.endswith("\n"):
+        ret += "\n"
+    if len(ret) >= len(raw_output):
+        return raw_output
+    return ret
+
+
+def _filter_mysql_explain_plan(lines: list[str], raw_output: str) -> str:
+    result: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Check for ALL (full table scan) in MySQL tabular explain
+        parts = [p.strip() for p in stripped.split("|")]
+        if len(parts) >= 5:
+            # type column is typically index 4 in: | id | select_type | table | partitions | type | ...
+            # or index 3 if no partitions
+            is_all_scan = any(p == "ALL" for p in parts)
+            if is_all_scan and "[HOTSPOT]" not in line:
+                result.append(f"{line}  <-- [HOTSPOT: Full Table Scan]")
+                continue
+        result.append(line)
+
+    ret = "\n".join(result)
+    if raw_output.endswith("\n") and not ret.endswith("\n"):
+        ret += "\n"
+    return ret
+
+
+def author_pg_explain_analyze_fixture() -> str:
+    """Authored PostgreSQL EXPLAIN (ANALYZE, BUFFERS) multi-join plan fixture."""
+    lines = [
+        "Hash Join  (cost=1254.20..18450.80 rows=250000 width=128) (actual time=14.210..385.420 rows=245000 loops=1)",
+        "  Hash Cond: (orders.customer_id = customers.id)",
+        "  Buffers: shared hit=18402 read=421 dirtied=12",
+        "  ->  Seq Scan on orders  (cost=0.00..12500.00 rows=250000 width=64) (actual time=0.045..182.100 rows=245000 loops=1)",
+        "        Filter: (status = 'COMPLETED'::text)",
+        "        Rows Removed by Filter: 50000",
+        "        Buffers: shared hit=12000 read=350",
+    ]
+    # Add repetitive buffer and trivial index scans
+    for i in range(25):
+        lines.extend(
+            [
+                f"  ->  Index Scan using customers_pkey_{i} on customers_{i}  (cost=0.15..8.17 rows=1 width=64) (actual time=0.010..0.012 rows=1 loops=1)",
+                f"        Index Cond: (id = orders.customer_id_{i})",
+                f"        Buffers: shared hit={400 + i} read=0",
+            ]
+        )
+    lines.extend(
+        [
+            "Planning Time: 1.842 ms",
+            "Execution Time: 395.210 ms",
         ]
     )
     return "\n".join(lines)
