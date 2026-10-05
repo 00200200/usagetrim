@@ -10,6 +10,7 @@ from usagetrim.core.specialized import (
     author_kubectl_describe_fixture,
     author_kubectl_get_fixture,
     author_kubectl_logs_fixture,
+    author_pg_explain_analyze_fixture,
     author_terraform_plan_fixture,
     auto_specialize_command_output,
     filter_cargo_build,
@@ -17,6 +18,7 @@ from usagetrim.core.specialized import (
     filter_ci_logs,
     filter_docker_build,
     filter_eslint,
+    filter_explain_plan,
     filter_git_diff,
     filter_git_log,
     filter_git_status,
@@ -2172,3 +2174,53 @@ def test_auto_specialize_routes_glab_and_content_ci_logs():
     via_content = auto_specialize_command_output("cat /tmp/job.log", _SAMPLE_GITLAB_CI_LOG)
     assert via_content is not None
     assert "folded by usagetrim" in via_content
+
+
+def test_filter_explain_plan_postgresql_hotspots_and_buffers():
+    sample_plan = author_pg_explain_analyze_fixture()
+    compact = filter_explain_plan(sample_plan)
+
+    # Hotspots marked
+    assert "[HOTSPOT]" in compact
+    assert "Seq Scan on orders" in compact
+    assert "Hash Join" in compact
+    assert "buffer stats folded" in compact
+
+    # Preserves execution time and plan summary
+    assert "Execution Time:" in compact
+    assert "Planning Time:" in compact
+
+    # Significant token reduction (>65%)
+    raw_tokens = count_tokens(sample_plan).openai
+    out_tokens = count_tokens(compact).openai
+    assert out_tokens < raw_tokens * 0.35, f"Expected >65% reduction, got {out_tokens}/{raw_tokens}"
+
+
+def test_filter_explain_plan_mysql_full_table_scan():
+    sample_mysql = """+----+-------------+-------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+| id | select_type | table | partitions | type | possible_keys | key  | key_len | ref  | rows   | filtered | Extra       |
++----+-------------+-------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+|  1 | SIMPLE      | users | NULL       | ALL  | NULL          | NULL | NULL    | NULL | 100000 |   100.00 | Using where |
++----+-------------+-------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+1 row in set, 1 warning (0.00 sec)"""
+    compact = filter_explain_plan(sample_mysql)
+    assert "[HOTSPOT: Full Table Scan]" in compact
+    assert "users" in compact
+
+
+def test_filter_explain_plan_idempotent_on_short_or_non_explain():
+    short = "SELECT * FROM users WHERE id = 1;\n"
+    assert filter_explain_plan(short) == short
+
+    sample_plan = author_pg_explain_analyze_fixture()
+    once = filter_explain_plan(sample_plan)
+    assert filter_explain_plan(once) == once
+
+
+def test_auto_specialize_routes_explain_query():
+    sample_plan = author_pg_explain_analyze_fixture()
+    via_cmd = auto_specialize_command_output(
+        "psql -c 'EXPLAIN ANALYZE SELECT * FROM orders'", sample_plan
+    )
+    assert via_cmd is not None
+    assert "[HOTSPOT]" in via_cmd
