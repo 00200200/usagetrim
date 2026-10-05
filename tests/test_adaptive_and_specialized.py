@@ -31,6 +31,7 @@ from usagetrim.core.specialized import (
     filter_pyright,
     filter_ripgrep_output,
     filter_ruff,
+    filter_sql_logs,
     filter_terraform,
     filter_terraform_plan,
     filter_tsc,
@@ -2172,3 +2173,185 @@ def test_auto_specialize_routes_glab_and_content_ci_logs():
     via_content = auto_specialize_command_output("cat /tmp/job.log", _SAMPLE_GITLAB_CI_LOG)
     assert via_content is not None
     assert "folded by usagetrim" in via_content
+
+
+# ---------------------------------------------------------------------------
+# SQL / ORM query log compaction (Prisma, Django, SQLAlchemy, Drizzle)
+# ---------------------------------------------------------------------------
+
+
+def _django_n_plus_one(n: int = 50) -> str:
+    lines = [
+        (
+            f'[django.db.backends] (0.001) SELECT "users"."id", "users"."name" '
+            f'FROM "users" WHERE "users"."id" = {i}; args=({i},)'
+        )
+        for i in range(1, n + 1)
+    ]
+    lines.append(
+        "django.db.utils.IntegrityError: duplicate key value violates unique "
+        'constraint "users_email_key"'
+    )
+    return "\n".join(lines)
+
+
+def _sqlalchemy_tx_and_queries(n: int = 12) -> str:
+    lines = [
+        "INFO sqlalchemy.engine.Engine BEGIN (implicit)",
+        "INFO sqlalchemy.engine.Engine Connection <Connection> checked out from pool",
+    ]
+    for i in range(1, n + 1):
+        lines.append(
+            f"INFO sqlalchemy.engine.Engine SELECT users.id FROM users WHERE users.id = {i}"
+        )
+        lines.append(f"INFO sqlalchemy.engine.Engine [generated in 0.0001s] ({i},)")
+    lines.extend(
+        [
+            "INFO sqlalchemy.engine.Engine COMMIT",
+            "INFO sqlalchemy.engine.Engine BEGIN (implicit)",
+            "INFO sqlalchemy.engine.Engine ROLLBACK",
+            "FAILED tests/test_models.py::test_create - AssertionError: assert 0 == 1",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _prisma_query_spam(n: int = 20) -> str:
+    lines = [
+        f"prisma:query SELECT `main`.`User`.`id` FROM `main`.`User` WHERE `main`.`User`.`id` = {i}"
+        for i in range(1, n + 1)
+    ]
+    lines.append("PrismaClientKnownRequestError: Unique constraint failed on the fields: (`email`)")
+    return "\n".join(lines)
+
+
+_SAMPLE_DRIZZLE_QUERIES = "\n".join(
+    [
+        'Query: select "id", "email" from "users" where "id" = 1',
+        'Query: select "id", "email" from "users" where "id" = 2',
+        'Query: select "id", "email" from "users" where "id" = 3',
+        'Query: select "id", "email" from "users" where "id" = 4',
+        'Query: select "id", "email" from "users" where "id" = 5',
+        "Error: Failed query: insert into users",
+    ]
+)
+
+
+_SAMPLE_DDL_AND_MIGRATION = "\n".join(
+    [
+        "Operations to perform:",
+        "  Apply all migrations: users",
+        "Running migrations:",
+        "  Applying users.0002_add_email...",
+        'CREATE TABLE "users_email" ("id" integer NOT NULL PRIMARY KEY)',
+        'ALTER TABLE "users" ADD COLUMN "email" varchar(254)',
+        (
+            '[django.db.backends] (0.002) SELECT "users"."id" FROM "users" '
+            'WHERE "users"."id" = 1; args=(1,)'
+        ),
+        (
+            '[django.db.backends] (0.002) SELECT "users"."id" FROM "users" '
+            'WHERE "users"."id" = 2; args=(2,)'
+        ),
+        (
+            '[django.db.backends] (0.002) SELECT "users"."id" FROM "users" '
+            'WHERE "users"."id" = 3; args=(3,)'
+        ),
+        (
+            '[django.db.backends] (0.002) SELECT "users"."id" FROM "users" '
+            'WHERE "users"."id" = 4; args=(4,)'
+        ),
+    ]
+)
+
+
+def test_filter_sql_logs_collapses_django_n_plus_one():
+    raw = _django_n_plus_one(50)
+    compact = filter_sql_logs(raw)
+
+    assert '[django.db.backends] (0.001) SELECT "users"."id"' in compact
+    assert "collapsed by usagetrim" in compact
+    assert "repeated queries matching" in compact
+    assert "IntegrityError: duplicate key value violates unique constraint" in compact
+    assert compact.count('WHERE "users"."id" = ') == 1
+    before = count_tokens(raw).openai
+    after = count_tokens(compact).openai
+    assert after < before * 0.15
+
+
+def test_filter_sql_logs_folds_sqlalchemy_tx_and_pool():
+    raw = _sqlalchemy_tx_and_queries(12)
+    compact = filter_sql_logs(raw)
+
+    assert "collapsed by usagetrim" in compact
+    assert "BEGIN/COMMIT/ROLLBACK/pool checkout lines collapsed" in compact
+    assert "FAILED tests/test_models.py::test_create" in compact
+    assert "AssertionError: assert 0 == 1" in compact
+    assert "checked out from pool" not in compact
+
+
+def test_filter_sql_logs_prisma_and_drizzle_prefixes():
+    prisma = filter_sql_logs(_prisma_query_spam(20))
+    assert "prisma:query SELECT" in prisma
+    assert "collapsed by usagetrim" in prisma
+    assert "PrismaClientKnownRequestError" in prisma
+    assert prisma.count("prisma:query SELECT") == 1
+
+    drizzle = filter_sql_logs(_SAMPLE_DRIZZLE_QUERIES)
+    assert "Query: select" in drizzle
+    assert "collapsed by usagetrim" in drizzle
+    assert "Error: Failed query: insert into users" in drizzle
+
+
+def test_filter_sql_logs_keeps_ddl_and_migrations():
+    compact = filter_sql_logs(_SAMPLE_DDL_AND_MIGRATION)
+
+    assert 'CREATE TABLE "users_email"' in compact
+    assert 'ALTER TABLE "users" ADD COLUMN "email"' in compact
+    assert "Applying users.0002_add_email..." in compact
+    assert "collapsed by usagetrim" in compact
+
+
+def test_filter_sql_logs_leaves_clean_non_sql_untouched():
+    clean = "test_auth passed\n2 passed in 0.01s\n"
+    assert filter_sql_logs(clean) == clean
+    short = "hello\n"
+    assert filter_sql_logs(short) == short
+    two_queries = "\n".join(
+        [
+            "SELECT id FROM users WHERE id = 1",
+            "SELECT id FROM users WHERE id = 2",
+        ]
+    )
+    # Below the ≥3 collapse threshold and no tx run → identical.
+    assert filter_sql_logs(two_queries) == two_queries
+
+
+def test_filter_sql_logs_idempotent_on_compacted():
+    once = filter_sql_logs(_django_n_plus_one(30))
+    assert filter_sql_logs(once) == once
+
+
+def test_auto_specialize_routes_sql_orm_commands_and_density():
+    raw = _django_n_plus_one(40)
+
+    for command in (
+        "pytest -q",
+        "uv run pytest tests/",
+        "python manage.py test",
+        "npx prisma db seed",
+        "alembic upgrade head",
+    ):
+        routed = auto_specialize_command_output(command, raw)
+        assert routed is not None, command
+        assert "collapsed by usagetrim" in routed
+        assert "IntegrityError" in routed
+
+    # Content-density fallback (e.g. cat of a captured ORM log).
+    via_density = auto_specialize_command_output("cat /tmp/orm.log", _prisma_query_spam(15))
+    assert via_density is not None
+    assert "prisma:query" in via_density
+    assert "collapsed by usagetrim" in via_density
+
+    # Non-SQL pytest output stays unspecialized (existing contract).
+    assert auto_specialize_command_output("pytest -v", "some output") is None
