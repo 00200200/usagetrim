@@ -2118,45 +2118,165 @@ def filter_curl_http(raw_output: str) -> str:
     return body_text + "\n" if raw_output.endswith("\n") else body_text
 
 
+# ---------------------------------------------------------------------------
+# SQL / ORM query logs — Prisma, Django, SQLAlchemy, Drizzle / TypeORM
+# ---------------------------------------------------------------------------
+
+_SQL_COLLAPSE_NOTICE_RE = re.compile(r"collapsed by usagetrim", re.IGNORECASE)
+
+# ORM prefixes and DML verbs. DDL is intentionally excluded so migrations stay verbatim.
 _SQL_QUERY_PATTERN = re.compile(
-    r"(?:prisma:query|\b(?:SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b)",
+    r"(?:"
+    r"prisma:query|"
+    r"\b(?:sqlalchemy\.engine(?:\.Engine)?|django\.db\.backends)\b|"
+    r"\bQuery:\s*"
+    r"|\b(?:SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b"
+    r")",
     re.IGNORECASE,
 )
+_SQL_TX_POOL_PATTERN = re.compile(
+    r"(?:"
+    r"^\s*(?:BEGIN|COMMIT|ROLLBACK)\b|"
+    r"\bBEGIN\s*\(implicit\)|"
+    r"\b(?:ROLLBACK|COMMIT)\s*;?\s*$|"
+    r"\bchecked\s+out\s+from\s+pool\b|"
+    r"\b(?:check(?:ed)?\s*in|checkout)\b.*\bpool\b|"
+    r"\bpool\b.*\b(?:checkout|checkin|checked\s+out|invalidate)\b|"
+    r"\bconnection\s+(?:checked\s+out|returned\s+to\s+pool)\b"
+    r")",
+    re.IGNORECASE,
+)
+_SQL_PARAMS_PATTERN = re.compile(
+    r"(?:"
+    r"\[(?:generated|cached)\b|"
+    r"^\s*args\s*=|"
+    r"^\s*\(\s*(?:\?|\$\d+|:\w+|NULL|\d+|None|'[^']*'|\"[^\"]*\")"
+    r")",
+    re.IGNORECASE,
+)
+_SQL_DDL_PATTERN = re.compile(
+    r"(?:"
+    r"\b(?:CREATE|ALTER|DROP|TRUNCATE)\s+(?:TABLE|INDEX|VIEW|SCHEMA|DATABASE|TYPE)\b|"
+    r"\bApplying migration\b|"
+    r"\bmigration\b"
+    r")",
+    re.IGNORECASE,
+)
+# Keep failures/exceptions. Plain ROLLBACK is handled as transaction noise above.
 _SQL_ERROR_PATTERN = re.compile(
-    r"(?:error|exception|failed|fatal|rollback|violat|denied|deadlock|timeout|traceback)",
+    r"(?:"
+    r"\b(?:error|exception|failed|fatal|violat|denied|deadlock|timeout|traceback)\b|"
+    r"IntegrityError|OperationalError|PrismaClient|"
+    r"\bFAILED\b"
+    r")",
+    re.IGNORECASE,
+)
+_SQL_ORM_PREFIX_RE = re.compile(
+    r"(?:"
+    r"prisma:query|"
+    r"sqlalchemy\.engine(?:\.Engine)?|"
+    r"django\.db\.backends|"
+    r"\bQuery:\s*"
+    r")",
     re.IGNORECASE,
 )
 
 
 def _normalize_sql_skeleton(line: str) -> str:
-    """Extract a structural template of a SQL line by replacing literals and parameter bindings."""
+    """Extract a structural template of a SQL line by replacing literals and bindings."""
     cleaned = re.sub(
-        r"^\[?[0-9\-:,\. ]+\]?\s*(?:INFO|DEBUG|NOTICE)?\s*(?:(?:prisma:query|sqlalchemy\.engine(?:\.Engine)?|django\.db\.backends|query:?)\s*)?",
+        r"^\[?[0-9\-:,\. TZz]+\]?\s*"
+        r"(?:INFO|DEBUG|NOTICE|WARNING)?\s*"
+        r"(?:(?:prisma:query|sqlalchemy\.engine(?:\.Engine)?|django\.db\.backends|Query:)\s*)?",
         "",
         line,
         flags=re.IGNORECASE,
     ).strip()
+    # Django timing prefix: (0.001)
+    cleaned = re.sub(r"^\(\d+(?:\.\d+)?\)\s*", "", cleaned)
     cleaned = re.sub(r"'[^']*'", "'?'", cleaned)
     cleaned = re.sub(r'"[^"]*"', '"?"', cleaned)
+    cleaned = re.sub(
+        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+        "?",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     cleaned = re.sub(r"\b\d+\b", "?", cleaned)
     cleaned = re.sub(r"\$[0-9]+", "?", cleaned)
     cleaned = re.sub(r":\w+", "?", cleaned)
     cleaned = re.sub(r"%\([^)]+\)s", "?", cleaned)
+    cleaned = re.sub(r";\s*args=\(.*\)$", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
 
 
+def _sql_is_tx_or_pool_noise(line: str) -> bool:
+    """True for BEGIN/COMMIT/ROLLBACK and connection-pool checkout chatter."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    # Never treat error-bearing lines as foldable noise.
+    if _SQL_ERROR_PATTERN.search(stripped) and not re.search(
+        r"^\s*ROLLBACK\b", stripped, re.IGNORECASE
+    ):
+        return False
+    if re.match(r"^\s*(?:BEGIN|COMMIT|ROLLBACK)\b", stripped, re.IGNORECASE):
+        return True
+    if _SQL_TX_POOL_PATTERN.search(stripped):
+        return True
+    # SQLAlchemy logs transaction keywords after the engine prefix.
+    if _SQL_ORM_PREFIX_RE.search(stripped) and re.search(
+        r"\b(?:BEGIN|COMMIT|ROLLBACK)\b", stripped, re.IGNORECASE
+    ):
+        return True
+    return False
+
+
+def _sql_is_query_line(line: str) -> bool:
+    """True for ORM-prefixed or DML query lines (not DDL / tx / params-only)."""
+    if _SQL_DDL_PATTERN.search(line):
+        return False
+    if _sql_is_tx_or_pool_noise(line):
+        return False
+    if _SQL_PARAMS_PATTERN.search(line.strip()) and not re.search(
+        r"\b(?:SELECT|INSERT|UPDATE|DELETE)\b", line, re.IGNORECASE
+    ):
+        return False
+    return bool(_SQL_QUERY_PATTERN.search(line))
+
+
 def filter_sql_logs(raw_text: str) -> str:
-    """Fold repetitive SQL / ORM queries (Prisma, Django, SQLAlchemy, Drizzle) into compact counts."""
+    """Fold repetitive SQL / ORM queries into one example + count.
+
+    Collapses N+1 SELECT/INSERT/UPDATE/DELETE runs that share a normalized
+    skeleton (literals → ``?``), folds BEGIN/COMMIT/ROLLBACK and connection-pool
+    checkout noise into short summaries, and preserves errors, exceptions,
+    ``FAILED`` lines, DDL/migrations, and non-SQL test output. Recognizes
+    ``prisma:query``, SQLAlchemy engine logs, Django ``django.db.backends``, and
+    Drizzle/TypeORM-ish ``Query:`` prefixes. Pure, order-preserving for kept
+    content, and idempotent on short or already-compacted input.
+    """
     if not raw_text.strip():
         return raw_text
 
+    # Already compacted → leave alone (idempotent).
+    if _SQL_COLLAPSE_NOTICE_RE.search(raw_text):
+        return raw_text
+
     lines = raw_text.splitlines()
+    query_hits = sum(1 for line in lines if _sql_is_query_line(line))
+    tx_hits = sum(1 for line in lines if _sql_is_tx_or_pool_noise(line))
+    # Short / non-SQL input stays byte-identical.
+    if query_hits < 3 and tx_hits < 2:
+        return raw_text
+
     result: list[str] = []
     pending_group: list[str] = []
     current_skeleton = ""
+    pending_tx: list[str] = []
 
-    def flush_pending():
+    def flush_queries() -> None:
         nonlocal pending_group, current_skeleton
         if not pending_group:
             return
@@ -2167,46 +2287,137 @@ def filter_sql_logs(raw_text: str) -> str:
             skel_display = current_skeleton[:80] + ("..." if len(current_skeleton) > 80 else "")
             collapsed_count = len(pending_group) - 1
             result.append(
-                f"  [... {collapsed_count} repeated queries matching '{skel_display}' collapsed by usagetrim ...]"
+                f"  [... {collapsed_count} repeated queries matching "
+                f"'{skel_display}' collapsed by usagetrim ...]"
             )
         pending_group = []
         current_skeleton = ""
 
+    def flush_tx_pool() -> None:
+        nonlocal pending_tx
+        if not pending_tx:
+            return
+        if len(pending_tx) == 1:
+            result.append(pending_tx[0])
+        else:
+            result.append(
+                f"[UsageTrim: {len(pending_tx)} BEGIN/COMMIT/ROLLBACK/pool "
+                f"checkout lines collapsed]"
+            )
+        pending_tx = []
+
+    def flush_all() -> None:
+        flush_queries()
+        flush_tx_pool()
+
     for line in lines:
         stripped = line.strip()
         if not stripped:
-            flush_pending()
+            flush_all()
             result.append(line)
             continue
 
-        if _SQL_ERROR_PATTERN.search(line):
-            flush_pending()
+        if _SQL_ERROR_PATTERN.search(line) and not re.match(
+            r"^\s*ROLLBACK\b", stripped, re.IGNORECASE
+        ):
+            flush_all()
             result.append(line)
             continue
 
-        if _SQL_QUERY_PATTERN.search(line):
+        if _SQL_DDL_PATTERN.search(line):
+            flush_all()
+            result.append(line)
+            continue
+
+        if _sql_is_tx_or_pool_noise(line):
+            flush_queries()
+            pending_tx.append(line)
+            continue
+
+        # Parameter-binding follow-on lines ride with the current query group.
+        if pending_group and _SQL_PARAMS_PATTERN.search(stripped) and not _sql_is_query_line(line):
+            pending_group.append(line)
+            continue
+
+        if _sql_is_query_line(line):
+            flush_tx_pool()
             skel = _normalize_sql_skeleton(line)
             if skel == current_skeleton and current_skeleton:
                 pending_group.append(line)
-                continue
             else:
-                flush_pending()
+                flush_queries()
                 current_skeleton = skel
                 pending_group.append(line)
-                continue
-        else:
-            flush_pending()
-            result.append(line)
+            continue
 
-    flush_pending()
+        flush_all()
+        result.append(line)
+
+    flush_all()
 
     ret = "\n".join(result)
-    return ret + "\n" if raw_text.endswith("\n") else ret
+    if raw_text.endswith("\n") and not ret.endswith("\n"):
+        ret += "\n"
+    if len(ret) >= len(raw_text):
+        return raw_text
+    return ret
 
 
 def _is_sql_dense_output(raw_output: str) -> bool:
-    matches = sum(1 for line in raw_output.splitlines()[:60] if _SQL_QUERY_PATTERN.search(line))
+    """True when the first chunk of output is dominated by ORM / SQL query lines."""
+    matches = sum(1 for line in raw_output.splitlines()[:80] if _sql_is_query_line(line))
     return matches >= 4
+
+
+def _is_sql_orm_command(command: str) -> bool:
+    """True for pytest / manage.py / prisma / alembic / drizzle-style DB commands."""
+    cmd_lower = command.lower().strip()
+    try:
+        words = shlex.split(command.strip())
+    except ValueError:
+        words = command.strip().split()
+    if not words:
+        return False
+
+    binary = PurePath(words[0]).name.lower()
+    joined = " ".join(words).lower()
+
+    if binary in {"pytest", "pytest.exe", "py.test"}:
+        return True
+    if binary in {"python", "python3", "python.exe"} and len(words) >= 2:
+        rest = " ".join(words[1:]).lower()
+        if rest.startswith("-m pytest") or "manage.py" in rest or rest.startswith("-m prisma"):
+            return True
+    if binary in {"uv", "uv.exe"} and any(w in {"pytest", "prisma"} for w in words[1:3]):
+        return True
+    if binary in {"prisma", "prisma.exe", "alembic", "alembic.exe"}:
+        return True
+    if binary in {"npx", "pnpm", "yarn", "bun"} and any(
+        w in {"prisma", "drizzle-kit"} for w in words[1:4]
+    ):
+        return True
+    if binary in {"drizzle-kit", "drizzle-kit.exe"}:
+        return True
+    if any(
+        cmd_lower.startswith(prefix)
+        for prefix in (
+            "prisma",
+            "npx prisma",
+            "pnpm prisma",
+            "yarn prisma",
+            "alembic",
+            "drizzle-kit",
+            "npx drizzle-kit",
+            "python manage.py",
+            "python3 manage.py",
+            "pytest",
+            "py.test",
+        )
+    ):
+        return True
+    if any(token in joined for token in ("db:migrate", "db:seed", "makemigrations", "manage.py")):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -2607,19 +2818,7 @@ def auto_specialize_command_output(command: str, raw_output: str) -> str | None:
         if res != raw_output:
             return res
 
-    if any(
-        cmd_lower.startswith(p)
-        for p in (
-            "prisma",
-            "npx prisma",
-            "pnpm prisma",
-            "alembic",
-            "drizzle-kit",
-            "npx drizzle-kit",
-            "python manage.py",
-            "python3 manage.py",
-        )
-    ) or any(db_sub in cmd_lower for db_sub in ("db:migrate", "db:seed", "makemigrations")):
+    if _is_sql_orm_command(command.strip()):
         res = filter_sql_logs(raw_output)
         if res != raw_output:
             return res
