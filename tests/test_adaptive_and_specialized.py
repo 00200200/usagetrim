@@ -10,6 +10,7 @@ from usagetrim.core.specialized import (
     author_kubectl_describe_fixture,
     author_kubectl_get_fixture,
     author_kubectl_logs_fixture,
+    author_nextjs_build_and_hydration_fixture,
     author_pg_explain_analyze_fixture,
     author_terraform_plan_fixture,
     auto_specialize_command_output,
@@ -28,6 +29,7 @@ from usagetrim.core.specialized import (
     filter_json_output,
     filter_kubectl,
     filter_mypy,
+    filter_nextjs,
     filter_npm_install,
     filter_pip_install,
     filter_pyright,
@@ -2176,6 +2178,7 @@ def test_auto_specialize_routes_glab_and_content_ci_logs():
     assert via_content is not None
     assert "folded by usagetrim" in via_content
 
+
 # ---------------------------------------------------------------------------
 # SQL / ORM query log compaction (Prisma, Django, SQLAlchemy, Drizzle)
 # ---------------------------------------------------------------------------
@@ -2406,3 +2409,40 @@ def test_auto_specialize_routes_explain_query():
     )
     assert via_cmd is not None
     assert "[HOTSPOT]" in via_cmd
+
+
+def test_filter_nextjs_folds_routes_and_turbopack():
+    raw = author_nextjs_build_and_hydration_fixture()
+    compact = filter_nextjs(raw)
+
+    # Verifies collapsed messages
+    assert "route & chunk compilation lines collapsed" in compact
+    assert "TurboPack module compilation lines collapsed" in compact
+
+    # Preserves hydration error and stack trace
+    assert "Hydration failed because the initial UI does not match" in compact
+    assert "Expected server HTML to contain a matching <span> in <div>" in compact
+    assert "at UserBadge (components/UserBadge.tsx:18:5)" in compact
+    assert "at Header (components/Header.tsx:42:10)" in compact
+
+    # Significant token reduction
+    raw_tokens = count_tokens(raw).openai
+    compact_tokens = count_tokens(compact).openai
+    assert compact_tokens < raw_tokens * 0.55
+
+
+def test_filter_nextjs_idempotent_on_clean_or_short():
+    short = "next dev - port 3000\n"
+    assert filter_nextjs(short) == short
+
+    raw = author_nextjs_build_and_hydration_fixture()
+    once = filter_nextjs(raw)
+    assert filter_nextjs(once) == once
+
+
+def test_auto_specialize_routes_nextjs():
+    raw = author_nextjs_build_and_hydration_fixture()
+    via_cmd = auto_specialize_command_output("npm run next build", raw)
+    assert via_cmd is not None
+    assert "Hydration failed" in via_cmd
+    assert "route & chunk compilation lines collapsed" in via_cmd

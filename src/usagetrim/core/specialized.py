@@ -2828,6 +2828,12 @@ def auto_specialize_command_output(command: str, raw_output: str) -> str | None:
         if res != raw_output:
             return res
 
+    # Check for Next.js / TurboPack build or dev output
+    if _is_nextjs_command(cmd_lower) or _is_nextjs_output(raw_output):
+        nextjs_res = filter_nextjs(raw_output)
+        if nextjs_res != raw_output:
+            return nextjs_res
+
     # Check for PostgreSQL / MySQL EXPLAIN execution plans
     if (
         "explain" in cmd_lower
@@ -4048,6 +4054,191 @@ def author_pg_explain_analyze_fixture() -> str:
         [
             "Planning Time: 1.842 ms",
             "Execution Time: 395.210 ms",
+        ]
+    )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Next.js & TurboPack SSR compilation log & hydration error compactor
+# ---------------------------------------------------------------------------
+
+_NEXTJS_CHUNK_LINE_RE = re.compile(
+    r"^\s*(?:[├└│┌\+\s]+)?(?:[○●λƒ\/]|\bchunks\/|\bother shared chunks)\s*",
+    re.I,
+)
+_NEXTJS_BUILD_PHASE_RE = re.compile(
+    r"^\s*(?:▲\s*Next\.js\s*[\d\.]+|Creating an optimized production build|Compiled successfully|Collecting page data|Generating static pages|Finalizing page optimization)",
+    re.I,
+)
+_NEXTJS_ROUTE_ROW_RE = re.compile(
+    r"^\s*(?:[├└│┌\s]+)?(?:[○●λƒ]|\/)\s*(?:\/|\S+).*?(?:\d+(?:\.\d+)?\s*(?:kB|B|MB))",
+    re.I,
+)
+_TURBOPACK_COMPILING_RE = re.compile(
+    r"^\s*(?:\[Turbopack\]|turbopack|○\s*Compiling|✓\s*Compiled|webpack\.cache).*?(?:in\s+\d+(?:\.\d+)?m?s|\(\d+\s+modules\))",
+    re.I,
+)
+
+
+def _is_nextjs_command(cmd_lower: str) -> bool:
+    prefixes = (
+        "next build",
+        "next dev",
+        "next start",
+        "npx next",
+        "pnpm next",
+        "yarn next",
+        "bunx next",
+        "bun next",
+    )
+    return any(cmd_lower == p or cmd_lower.startswith(p + " ") for p in prefixes)
+
+
+def _is_nextjs_output(raw_output: str) -> bool:
+    return bool(
+        "▲ Next.js" in raw_output
+        or "Route (app)" in raw_output
+        or "Route (pages)" in raw_output
+        or "Turbopack" in raw_output
+        or "Hydration failed because" in raw_output
+        or "Text content does not match server-rendered HTML" in raw_output
+    )
+
+
+def filter_nextjs(raw_output: str) -> str:
+    """Compact Next.js & TurboPack compilation logs while preserving hydration/SSR traces.
+
+    Folds repetitive static chunk generation tables, module compilation timings,
+    and asset manifests while preserving React component stack traces, hydration
+    mismatch diffs, server component errors, and build failure diagnostics.
+    """
+    if not raw_output.strip():
+        return raw_output
+
+    lines = raw_output.splitlines()
+    result: list[str] = []
+    collapsed_chunks = 0
+    collapsed_turbopack = 0
+
+    def flush_chunks():
+        nonlocal collapsed_chunks
+        if collapsed_chunks > 0:
+            result.append(
+                f"[UsageTrim: {collapsed_chunks} Next.js route & chunk compilation lines collapsed]"
+            )
+            collapsed_chunks = 0
+
+    def flush_turbopack():
+        nonlocal collapsed_turbopack
+        if collapsed_turbopack > 0:
+            result.append(
+                f"[UsageTrim: {collapsed_turbopack} TurboPack module compilation lines collapsed]"
+            )
+            collapsed_turbopack = 0
+
+    in_chunk_table = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Check for chunk table start or lines
+        if "Route (app)" in stripped or "Route (pages)" in stripped:
+            flush_turbopack()
+            in_chunk_table = True
+            result.append(line)
+            continue
+
+        if in_chunk_table:
+            if (
+                _NEXTJS_CHUNK_LINE_RE.match(line)
+                or _NEXTJS_ROUTE_ROW_RE.match(line)
+                or stripped.startswith("+ First Load JS shared by all")
+            ):
+                collapsed_chunks += 1
+                continue
+            elif (
+                stripped.startswith("○  (Static)")
+                or stripped.startswith("●  (SSG)")
+                or stripped.startswith("λ  (Server)")
+            ):
+                flush_chunks()
+                in_chunk_table = False
+                result.append(line)
+                continue
+            elif not stripped:
+                flush_chunks()
+                in_chunk_table = False
+                result.append(line)
+                continue
+
+        # Check for Turbopack compilation spam
+        if _TURBOPACK_COMPILING_RE.match(line):
+            flush_chunks()
+            collapsed_turbopack += 1
+            continue
+
+        flush_turbopack()
+        flush_chunks()
+        result.append(line)
+
+    flush_turbopack()
+    flush_chunks()
+
+    ret = "\n".join(result)
+    if raw_output.endswith("\n") and not ret.endswith("\n"):
+        ret += "\n"
+    if len(ret) >= len(raw_output):
+        return raw_output
+    return ret
+
+
+def author_nextjs_build_and_hydration_fixture() -> str:
+    """Authored Next.js 14/15 build output with routes, TurboPack spam, and a React hydration error."""
+    lines = [
+        "   ▲ Next.js 14.2.5",
+        "   - Environments: .env.production",
+        "",
+        "   Creating an optimized production build ...",
+        " ✓ Compiled successfully",
+        " ✓ Linting and checking validity of types",
+        " ✓ Collecting page data",
+        " ✓ Generating static pages (25/25)",
+        " ✓ Collecting build traces",
+        " ✓ Finalizing page optimization",
+        "",
+        "Route (app)                              Size     First Load JS",
+        "┌ ○ /                                    5.4 kB         87.2 kB",
+        "├ ○ /_not-found                          882 B          82.6 kB",
+        "├ ○ /about                               1.2 kB         83.0 kB",
+        "├ ○ /pricing                             3.4 kB         85.2 kB",
+    ]
+    # Add 40 repetitive route lines
+    for i in range(1, 41):
+        lines.append(f"├ ● /blog/post-{i:03d}                       2.1 kB         83.9 kB")
+    lines.extend(
+        [
+            "└ λ /api/checkout                        0 B            0 B",
+            "+ First Load JS shared by all            81.8 kB",
+            "  ├ chunks/234-9d8a1f.js                 52.4 kB",
+            "  ├ chunks/main-app-7c1b2.js             27.1 kB",
+            "  └ other shared chunks (total)          2.3 kB",
+            "",
+            "○  (Static)  prerendered as static content",
+            "●  (SSG)     prerendered as static HTML (uses getStaticProps)",
+            "λ  (Server)  server-rendered on demand",
+            "",
+            "[Turbopack] Compiling /page in 42ms (412 modules)",
+            "[Turbopack] Compiling /layout in 12ms (120 modules)",
+            "[Turbopack] Compiling /api/auth in 8ms (54 modules)",
+            "[Turbopack] Compiling /components/Navbar in 15ms (85 modules)",
+            "",
+            "Error: Hydration failed because the initial UI does not match what was rendered on the server.",
+            "Warning: Expected server HTML to contain a matching <span> in <div>.",
+            "  at span",
+            "  at UserBadge (components/UserBadge.tsx:18:5)",
+            "  at Header (components/Header.tsx:42:10)",
+            "  at Layout (app/layout.tsx:12:1)",
         ]
     )
     return "\n".join(lines)
