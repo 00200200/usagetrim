@@ -307,6 +307,75 @@ def pack_command(
     )
 
 
+@app.command("slice")
+def slice_command(
+    files: Annotated[
+        list[Path] | None, typer.Argument(help="Optional explicit files to slice")
+    ] = None,
+    git_range: Annotated[
+        str | None,
+        typer.Option("--git-range", "-g", help="Git revision range, e.g. main...HEAD"),
+    ] = None,
+    root: Annotated[
+        Path | None, typer.Option("--root", "-r", help="Project root directory")
+    ] = None,
+    budget: Annotated[
+        int,
+        typer.Option("--budget", "-b", min=100, max=200000, help="Target token budget ceiling"),
+    ] = 8000,
+    format_type: Annotated[
+        str, typer.Option("--format", help="Output format: markdown or xml")
+    ] = "markdown",
+    copy: Annotated[
+        bool, typer.Option("--copy", "-c", help="Copy sliced bundle to clipboard")
+    ] = False,
+    output: Annotated[
+        Path | None, typer.Option("--output", "-o", help="Write bundle to output file")
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit slice summary as JSON")] = False,
+):
+    """Slice repository context for PR review: packs changed files + 1st-degree dependencies."""
+    from usagetrim.core.clip import set_clipboard
+    from usagetrim.core.pack import slice_repository_context
+
+    project_root = (root or Path.cwd()).resolve()
+    file_strs = [str(p) for p in files] if files else None
+
+    result = slice_repository_context(
+        git_range=git_range,
+        files=file_strs,
+        root=project_root,
+        budget=budget,
+        format_type=format_type,
+    )
+
+    if json_output:
+        _emit(json.dumps(result.to_dict(), indent=2))
+        return
+
+    if output is not None:
+        try:
+            output.write_text(result.bundle_text, encoding="utf-8")
+            err_console.print(f"[green]Sliced bundle written to {output}[/green]")
+        except OSError as exc:
+            raise typer.BadParameter(f"Failed to write output file: {exc}") from exc
+    else:
+        _emit(result.bundle_text)
+
+    if copy:
+        if set_clipboard(result.bundle_text):
+            err_console.print(
+                f"[green]Sliced bundle ({result.packed_tokens} tokens) copied to clipboard![/green]"
+            )
+        else:
+            err_console.print("[yellow]Failed to copy to clipboard.[/yellow]")
+
+    err_console.print(
+        f"[dim]Sliced {result.file_count} files: {result.original_tokens} -> "
+        f"{result.packed_tokens} tokens ({result.reduction_pct}% saved)[/dim]"
+    )
+
+
 @app.command("prepare")
 def prepare_command(
     file: Annotated[Path | None, typer.Option("--file", "-f", help="Read a supplied draft")] = None,

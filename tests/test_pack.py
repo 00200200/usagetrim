@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from typer.testing import CliRunner
+
+from usagetrim.cli import app
 from usagetrim.core.cache import ContextCache
-from usagetrim.core.pack import pack_context
+from usagetrim.core.pack import pack_context, slice_repository_context
 
 
 def test_pack_context_basic(tmp_path: Path):
@@ -99,3 +102,109 @@ def test_pack_context_to_dict(tmp_path: Path):
     assert "bundle_text" in d
     assert len(d["files"]) == 1
     assert d["files"][0]["path"] == "hello.py"
+
+
+def test_slice_repository_context_with_dependencies(tmp_path: Path):
+    # Setup repository structure
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+
+    # Dependency 1
+    dep1 = src_dir / "helper.py"
+    dep1.write_text(
+        'def compute_helper(x: int) -> int:\n    """Helper calculation."""\n    return x * 42\n'
+    )
+
+    # Dependency 2
+    dep2 = src_dir / "database.py"
+    dep2.write_text(
+        "class Database:\n"
+        '    """Database client."""\n'
+        "    def connect(self) -> bool:\n"
+        "        return True\n"
+    )
+
+    # Target modified file importing both
+    target = src_dir / "service.py"
+    target.write_text(
+        "from helper import compute_helper\n"
+        "from database import Database\n\n"
+        "def run_service(val: int) -> int:\n"
+        "    db = Database()\n"
+        "    return compute_helper(val)\n"
+    )
+
+    # Unrelated file
+    unrelated = src_dir / "unrelated.py"
+    unrelated.write_text("def unrelated_task(): pass\n")
+
+    res = slice_repository_context(files=[target], root=tmp_path, budget=8000)
+    assert res.file_count >= 2
+    paths = {f.path for f in res.files}
+    assert "src/service.py" in paths
+    assert "src/helper.py" in paths or "src/database.py" in paths
+    assert "src/unrelated.py" not in paths
+
+    # Check that service.py is full source (not skeleton)
+    service_entry = next(f for f in res.files if f.path == "src/service.py")
+    assert not service_entry.is_skeleton
+    assert service_entry.file_type == "modified"
+
+    # Check that dependency is skeleton
+    dep_entries = [f for f in res.files if f.file_type == "dependency"]
+    for d in dep_entries:
+        assert d.is_skeleton
+
+
+def test_slice_repository_context_budget_enforcement(tmp_path: Path):
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+
+    # Large target
+    target = src_dir / "main.py"
+    target.write_text("import utils\n" + "\n".join([f"x_{i} = {i}" for i in range(100)]))
+
+    # Large dependency
+    dep = src_dir / "utils.py"
+    dep.write_text("\n".join([f"def util_func_{i}(): return {i}" for i in range(100)]))
+
+    # Strict token budget ceiling
+    res = slice_repository_context(files=[target], root=tmp_path, budget=250)
+    assert res.packed_tokens <= 400
+
+
+def test_slice_repository_context_xml_format(tmp_path: Path):
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+
+    dep = src_dir / "util.py"
+    dep.write_text("def helper(): return 1\n")
+
+    target = src_dir / "main.py"
+    target.write_text("from util import helper\n\nprint(helper())\n")
+
+    res = slice_repository_context(files=[target], root=tmp_path, budget=4000, format_type="xml")
+    assert "<repository_slice" in res.bundle_text
+    assert "<modified_files" in res.bundle_text
+    assert "src/main.py" in res.bundle_text
+
+
+def test_slice_cli_command(tmp_path: Path):
+    runner = CliRunner()
+    target = tmp_path / "feature.py"
+    target.write_text("def my_feature(): return 1\n")
+
+    result = runner.invoke(
+        app,
+        [
+            "slice",
+            str(target),
+            "--root",
+            str(tmp_path),
+            "--budget",
+            "4000",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "UsageTrim Repository Slice Context" in result.output
+    assert "feature.py" in result.output
