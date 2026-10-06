@@ -13,6 +13,7 @@ from usagetrim.core.specialized import (
     author_nextjs_build_and_hydration_fixture,
     author_pg_explain_analyze_fixture,
     author_terraform_plan_fixture,
+    author_xcodebuild_log_fixture,
     auto_specialize_command_output,
     filter_cargo_build,
     filter_cargo_test,
@@ -40,6 +41,7 @@ from usagetrim.core.specialized import (
     filter_terraform_plan,
     filter_tsc,
     filter_uv_project,
+    filter_xcodebuild,
 )
 from usagetrim.metrics.tokenizer import count_tokens
 
@@ -2446,3 +2448,61 @@ def test_auto_specialize_routes_nextjs():
     assert via_cmd is not None
     assert "Hydration failed" in via_cmd
     assert "route & chunk compilation lines collapsed" in via_cmd
+
+
+def test_filter_xcodebuild_folds_compilation_and_preserves_errors():
+    raw = author_xcodebuild_log_fixture(has_error=True)
+    compacted = filter_xcodebuild(raw)
+    assert "[UsageTrim:" in compacted
+    assert "step(s)" in compacted
+    assert "ContentView.swift:24:15: error: cannot find 'InvalidToken' in scope" in compacted
+    assert "Text(InvalidToken)" in compacted
+    assert "^~~~~~~~~~~~" in compacted
+    assert (
+        "ContentView.swift:35:9: warning: initialization of immutable value 'unused'" in compacted
+    )
+    assert "** BUILD FAILED **" in compacted
+    assert "The following build commands failed:" in compacted
+    assert "(1 failure)" in compacted
+    assert "-frontend -c -primary-file" not in compacted
+    assert "export SDKROOT=" not in compacted
+
+
+def test_filter_xcodebuild_reduces_successful_build_by_over_95_percent():
+    raw = author_xcodebuild_log_fixture(has_error=False)
+    compacted = filter_xcodebuild(raw)
+    raw_tokens = count_tokens(raw).avg
+    compacted_tokens = count_tokens(compacted).avg
+    reduction = 1.0 - (compacted_tokens / raw_tokens)
+    assert reduction >= 0.95
+    assert "** BUILD SUCCEEDED **" in compacted
+    assert "[UsageTrim:" in compacted
+
+
+def test_filter_xcodebuild_idempotent_on_clean_or_short():
+    short = "xcodebuild -version\nXcode 15.4\nBuild version 15F31d\n"
+    assert filter_xcodebuild(short) == short
+
+    raw = author_xcodebuild_log_fixture(has_error=True)
+    once = filter_xcodebuild(raw)
+    assert filter_xcodebuild(once) == once
+
+
+def test_auto_specialize_routes_xcodebuild():
+    raw = author_xcodebuild_log_fixture(has_error=True)
+    via_cmd = auto_specialize_command_output("xcodebuild -scheme MyApp -configuration Debug", raw)
+    assert via_cmd is not None
+    assert "error: cannot find 'InvalidToken' in scope" in via_cmd
+    assert "** BUILD FAILED **" in via_cmd
+
+    raw_succ = author_xcodebuild_log_fixture(has_error=False)
+    via_output_detection = auto_specialize_command_output("custom-build-runner", raw_succ)
+    assert via_output_detection is not None
+    assert "** BUILD SUCCEEDED **" in via_output_detection
+
+
+def test_import_from_filters_package():
+    from usagetrim.filters import filter_xcodebuild as fx1
+    from usagetrim.filters.xcodebuild import filter_xcodebuild as fx2
+
+    assert fx1 is fx2
