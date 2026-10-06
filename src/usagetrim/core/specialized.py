@@ -2834,6 +2834,12 @@ def auto_specialize_command_output(command: str, raw_output: str) -> str | None:
         if nextjs_res != raw_output:
             return nextjs_res
 
+    # Check for Xcode / Swift build output
+    if _is_xcodebuild_command(cmd_lower) or _is_xcodebuild_output(raw_output):
+        xcode_res = filter_xcodebuild(raw_output)
+        if xcode_res != raw_output:
+            return xcode_res
+
     # Check for PostgreSQL / MySQL EXPLAIN execution plans
     if (
         "explain" in cmd_lower
@@ -4241,4 +4247,234 @@ def author_nextjs_build_and_hydration_fixture() -> str:
             "  at Layout (app/layout.tsx:12:1)",
         ]
     )
+    return "\n".join(lines)
+
+
+_XCODEBUILD_STEP_CMD_RE = re.compile(
+    r"^(?:=== BUILD TARGET|=== BUILD AGGREGATE TARGET|"
+    r"CompileSwiftSources|CompileSwift|SwiftCompile|SwiftDriver|SwiftEmitModule|"
+    r"CompileAssetCatalog|CompileAssetCatalogVariant|CompileC|ProcessPCH|"
+    r"CpResource|CopyStringsFile|CopyPlistFile|CodeSign|Validate|Touch|"
+    r"ProcessInfoPlistFile|GenerateDSYMFile|Ld|Libtool|PhaseScriptExecution|"
+    r"CreateUniversalBinary|WriteAuxiliaryFile|RegisterWithLaunchServices|"
+    r"Check dependencies|Create build description|Build description signature:|Build description path:)"
+)
+
+_SWIFT_DIAGNOSTIC_RE = re.compile(
+    r"^(?:(?:/[^\s:]+|[A-Za-z]:[^\s:]+|[^\s:]+\.swift):\d+:\d+:\s*(?:error|warning|note|remark):|"
+    r"error:\s+|fatal error:\s+|warning:\s+)",
+    re.IGNORECASE,
+)
+
+_XCODEBUILD_FAILURE_SUMMARY_RE = re.compile(
+    r"^(?:The following build commands failed:|\(\d+\s+failure[s]?\))\b"
+)
+
+_XCODEBUILD_PROVISIONING_NOISE_RE = re.compile(
+    r"^\s*Provisioning profile (?:\"[^\"]+\" )?(?:doesn't include|verification succeeded|is expiring)",
+    re.IGNORECASE,
+)
+
+
+def _is_xcodebuild_command(cmd_lower: str) -> bool:
+    prefixes = (
+        "xcodebuild",
+        "swift build",
+        "swift test",
+        "swift run",
+    )
+    return any(
+        cmd_lower == p or cmd_lower.startswith(p + " ") or f" {p}" in cmd_lower for p in prefixes
+    )
+
+
+def _is_xcodebuild_output(raw_output: str) -> bool:
+    return bool(
+        "** BUILD SUCCEEDED **" in raw_output
+        or "** BUILD FAILED **" in raw_output
+        or "** TEST SUCCEEDED **" in raw_output
+        or "** TEST FAILED **" in raw_output
+        or "=== BUILD TARGET " in raw_output
+        or "CompileSwiftSources " in raw_output
+        or "The following build commands failed:" in raw_output
+    )
+
+
+def filter_xcodebuild(raw_output: str) -> str:
+    """Compact Xcode & Swift compiler output while preserving diagnostic messages with line/column context.
+
+    Folds routine compilation step echoes, compiler flag expansions, asset catalog compilation,
+    code signing chatter, and provisioning validations while preserving Swift/Clang syntax errors,
+    compiler warnings, failure cards, and build status banners.
+    """
+    if not raw_output.strip():
+        return raw_output
+
+    lines = raw_output.splitlines()
+    result: list[str] = []
+    collapsed_steps = 0
+    collapsed_lines = 0
+    in_routine_step = False
+    in_diagnostic = False
+
+    def flush_steps():
+        nonlocal collapsed_steps, collapsed_lines
+        if collapsed_steps > 0:
+            result.append(
+                f"[UsageTrim: {collapsed_steps} routine xcodebuild step(s) ({collapsed_lines} lines) collapsed]"
+            )
+            collapsed_steps = 0
+            collapsed_lines = 0
+
+    for line in lines:
+        stripped = line.strip()
+
+        # 1. Check for build terminal banners / summaries
+        if stripped in (
+            "** BUILD SUCCEEDED **",
+            "** BUILD FAILED **",
+            "** TEST SUCCEEDED **",
+            "** TEST FAILED **",
+        ) or stripped.startswith(("** BUILD SUCCEEDED **", "** BUILD FAILED **")):
+            flush_steps()
+            in_routine_step = False
+            in_diagnostic = False
+            result.append(line)
+            continue
+
+        if _XCODEBUILD_FAILURE_SUMMARY_RE.match(stripped):
+            flush_steps()
+            in_routine_step = False
+            in_diagnostic = False
+            result.append(line)
+            continue
+
+        # 2. Check for diagnostics (errors, warnings, notes)
+        if _SWIFT_DIAGNOSTIC_RE.match(stripped):
+            flush_steps()
+            in_routine_step = False
+            in_diagnostic = True
+            result.append(line)
+            continue
+
+        # If inside a diagnostic block, keep indented source lines and caret pointers
+        if in_diagnostic:
+            if line.startswith((" ", "\t")) or not stripped:
+                result.append(line)
+                continue
+            else:
+                in_diagnostic = False
+
+        # 3. Check for routine provisioning profile noise
+        if _XCODEBUILD_PROVISIONING_NOISE_RE.match(stripped):
+            collapsed_lines += 1
+            continue
+
+        # 4. Check for routine command headers
+        if _XCODEBUILD_STEP_CMD_RE.match(stripped):
+            in_routine_step = True
+            collapsed_steps += 1
+            collapsed_lines += 1
+            continue
+
+        # 5. If inside a routine command, indented lines (flags, cd, export) are folded
+        if in_routine_step:
+            if line.startswith((" ", "\t")) or not stripped:
+                collapsed_lines += 1
+                continue
+            else:
+                in_routine_step = False
+
+        # Fallback: keep line
+        flush_steps()
+        result.append(line)
+
+    flush_steps()
+
+    ret = "\n".join(result)
+    if raw_output.endswith("\n") and not ret.endswith("\n"):
+        ret += "\n"
+    if len(ret) >= len(raw_output):
+        return raw_output
+    return ret
+
+
+def author_xcodebuild_log_fixture(has_error: bool = True) -> str:
+    """Author realistic multi-target xcodebuild output with command line flags, provisioning, and errors."""
+    lines = [
+        "=== BUILD TARGET MyApp OF PROJECT MyApp WITH CONFIGURATION Debug ===",
+        "",
+        "Check dependencies",
+        "Create build description",
+        "Build description signature: 64df59183709210",
+        "Build description path: /Users/developer/Library/Developer/Xcode/DerivedData/MyApp/Build/Intermediates.noindex/XCBuildData/64df59.xcbuilddata",
+        "",
+        'Provisioning profile "iOS Team Provisioning Profile: com.example.MyApp" verification succeeded',
+        'Provisioning profile "iOS Team Provisioning Profile: com.example.MyApp" doesn\'t include the aps-environment entitlement.',
+        "",
+        "ProcessInfoPlistFile /Users/developer/MyApp/build/MyApp.app/Info.plist /Users/developer/MyApp/Info.plist (in target 'MyApp' from project 'MyApp')",
+        "    cd /Users/developer/MyApp",
+        "    builtin-infoPlistUtility /Users/developer/MyApp/Info.plist -producttype com.apple.product-type.application -expandbuildsettings -format binary",
+        "",
+        "CompileAssetCatalog /Users/developer/MyApp/build/MyApp.app /Users/developer/MyApp/Assets.xcassets (in target 'MyApp' from project 'MyApp')",
+        "    cd /Users/developer/MyApp",
+        "    /Applications/Xcode.app/Contents/Developer/usr/bin/actool --output-format human-readable-text --notices --warnings --export-dependency-info /Users/developer/MyApp/build/assetcatalog_dependencies --output-partial-info-plist /Users/developer/MyApp/build/assetcatalog_generated_info.plist --app-icon AppIcon --accent-color AccentColor --compress-pngs --enable-on-demand-resources YES --filter-for-device-model iPhone16,1 --target-device iphone --minimum-deployment-target 17.0 --platform iphoneos",
+        "",
+        "CpResource /Users/developer/MyApp/build/MyApp.app/Localizable.strings /Users/developer/MyApp/Resources/Localizable.strings (in target 'MyApp' from project 'MyApp')",
+        "    cd /Users/developer/MyApp",
+        "    builtin-copy -exclude .DS_Store -strip-debug-symbols -strip-tool /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/strip -resolve-src-symlinks /Users/developer/MyApp/Resources/Localizable.strings /Users/developer/MyApp/build/MyApp.app",
+        "",
+        "CompileSwiftSources normal arm64 com.apple.xcode.tools.swift.compiler (in target 'MyApp' from project 'MyApp')",
+        "    cd /Users/developer/MyApp",
+        "    export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer",
+        "    export SDKROOT=/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS17.0.sdk",
+        "    /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc -incremental -module-name MyApp -O -whole-module-optimization -DDEBUG -target arm64-apple-ios17.0 -sdk /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS17.0.sdk -I /Users/developer/MyApp/build/Products/Debug-iphoneos -F /Users/developer/MyApp/build/Products/Debug-iphoneos -c -num-threads 8 -output-file-map /Users/developer/MyApp/build/output-file-map.json",
+    ]
+
+    # Generate 50 routine compilation steps
+    for i in range(1, 51):
+        lines.extend(
+            [
+                f"CompileSwift normal arm64 /Users/developer/MyApp/Sources/Module{i:02d}.swift (in target 'MyApp' from project 'MyApp')",
+                "    cd /Users/developer/MyApp",
+                f"    /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc -frontend -c -primary-file /Users/developer/MyApp/Sources/Module{i:02d}.swift -target arm64-apple-ios17.0 -Xfrontend -enable-bare-slash-regex -Xfrontend -color-diagnostics",
+            ]
+        )
+
+    if has_error:
+        lines.extend(
+            [
+                "",
+                "/Users/developer/MyApp/Sources/ContentView.swift:24:15: error: cannot find 'InvalidToken' in scope",
+                "        Text(InvalidToken)",
+                "             ^~~~~~~~~~~~",
+                "/Users/developer/MyApp/Sources/ContentView.swift:35:9: warning: initialization of immutable value 'unused' was never used; consider replacing with assignment to '_' or removing it",
+                "    let unused = 42",
+                "    ~~~~^~~~~~",
+                "",
+                "CodeSign /Users/developer/MyApp/build/MyApp.app (in target 'MyApp' from project 'MyApp')",
+                "    cd /Users/developer/MyApp",
+                "    export CODESIGN_ALLOCATE=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/codesign_allocate",
+                "    /usr/bin/codesign --force --sign - --timestamp=none /Users/developer/MyApp/build/MyApp.app",
+                "",
+                "** BUILD FAILED **",
+                "",
+                "The following build commands failed:",
+                "	SwiftCompile normal arm64 Compiling\\ ContentView.swift /Users/developer/MyApp/Sources/ContentView.swift (in target 'MyApp' from project 'MyApp')",
+                "(1 failure)",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "CodeSign /Users/developer/MyApp/build/MyApp.app (in target 'MyApp' from project 'MyApp')",
+                "    cd /Users/developer/MyApp",
+                "    export CODESIGN_ALLOCATE=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/codesign_allocate",
+                "    /usr/bin/codesign --force --sign - --timestamp=none /Users/developer/MyApp/build/MyApp.app",
+                "",
+                "** BUILD SUCCEEDED ** [3.412 sec]",
+            ]
+        )
+
     return "\n".join(lines)
