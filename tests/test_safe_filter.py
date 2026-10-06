@@ -304,3 +304,13 @@ def test_output_is_deterministic():
     assert safe_compact_output(original, command="pytest") == safe_compact_output(
         original, command="pytest"
     )
+
+
+def test_recovery_notice_contract():
+    original = _passes()
+    ref_id = ContextCache().store(original)
+    expected_notice = f"[UsageTrim: full output after redaction: usagetrim retrieve {ref_id}]\n"
+    assert safe_filter.recovery_notice(ref_id) == expected_notice
+    assert safe_compact_output(original, command="pytest") == (
+        "[UsageTrim: 80 passing tests, 80 progress records]\n" + expected_notice
+    )
