@@ -4,7 +4,7 @@ import sqlite3
 import pytest
 
 from usagetrim.core import safe_filter
-from usagetrim.core.cache import ContextCache
+from usagetrim.core.cache import ContextCache, decompress_payload
 from usagetrim.core.redactor import redact_secrets
 from usagetrim.core.safe_filter import safe_compact_output
 from usagetrim.metrics.tokenizer import count_tokens
@@ -268,7 +268,8 @@ def test_secrets_are_redacted_in_filtered_output_and_persistent_cache():
     assert "[REDACTED_OPENAI_KEY]" in result
     assert _cached(result) == redact_secrets(original)
     with sqlite3.connect(ContextCache().db_path) as connection:
-        assert secret not in connection.execute("SELECT content FROM output_cache").fetchone()[0]
+        raw_row = connection.execute("SELECT content FROM output_cache").fetchone()[0]
+        assert secret not in decompress_payload(raw_row)
 
 
 def test_secrets_are_redacted_on_short_passthrough():

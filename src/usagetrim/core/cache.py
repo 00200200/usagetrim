@@ -4,13 +4,60 @@ import hashlib
 import os
 import sqlite3
 import time
+import zlib
 from pathlib import Path
 from typing import Any
+
+try:
+    import zstandard as zstd
+except ImportError:
+    zstd = None
 
 from usagetrim.core.redactor import redact_secrets
 
 DEFAULT_CACHE_DIR = Path.home() / ".usagetrim"
 DEFAULT_CACHE_DB = DEFAULT_CACHE_DIR / "cache.db"
+COMPRESSION_THRESHOLD = 512
+
+
+def compress_payload(data: str) -> bytes | str:
+    """Compress payload if it exceeds the 512-byte threshold, using zstd or zlib."""
+    raw = data.encode("utf-8")
+    if len(raw) <= COMPRESSION_THRESHOLD:
+        return data
+
+    if zstd is not None:
+        cctx = zstd.ZstdCompressor(level=3)
+        return b"ZSTD" + cctx.compress(raw)
+    return b"ZLIB" + zlib.compress(raw, level=6)
+
+
+def decompress_payload(stored: str | bytes) -> str:
+    """Transparently decompress stored payload if compressed with zstd or zlib."""
+    if isinstance(stored, str):
+        return stored
+    if isinstance(stored, bytes):
+        if stored.startswith(b"ZSTD"):
+            global zstd
+            if zstd is None:
+                try:
+                    import zstandard as zstd
+                except ImportError:
+                    pass
+            if zstd is not None:
+                dctx = zstd.ZstdDecompressor()
+                return dctx.decompress(stored[4:]).decode("utf-8")
+            raise RuntimeError("zstandard package is required to decompress ZSTD cache payload")
+        if stored.startswith(b"ZLIB"):
+            return zlib.decompress(stored[4:]).decode("utf-8")
+        if stored.startswith(b"\x28\xb5\x2f\xfd"):  # raw zstd frame
+            if zstd is not None:
+                dctx = zstd.ZstdDecompressor()
+                return dctx.decompress(stored).decode("utf-8")
+        if stored.startswith(b"\x78"):  # raw zlib
+            return zlib.decompress(stored).decode("utf-8")
+        return stored.decode("utf-8", errors="replace")
+    return str(stored)
 
 
 class ContextCache:
@@ -55,13 +102,15 @@ class ContextCache:
         )
         ref_id = f"tc_{ref_hash[:16]}"
 
+        stored_payload = compress_payload(content)
+
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO output_cache (ref_id, content_hash, source, content, created_at)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (ref_id, content_hash, source, content, time.time()),
+                (ref_id, content_hash, source, stored_payload, time.time()),
             )
             conn.commit()
         return ref_id
@@ -78,7 +127,7 @@ class ContextCache:
             return f"Error: ref ID '{ref_id}' not found in usagetrim cache."
 
         # Also protect entries written by older versions before cache redaction.
-        content, source = redact_secrets(row[0]), row[1]
+        content, source = redact_secrets(decompress_payload(row[0])), row[1]
         if not lines_range:
             return content
 
@@ -118,7 +167,7 @@ class ContextCache:
             ).fetchone()
         if row is None:
             return f"Error: ref ID '{ref_id}' not found in usagetrim cache."
-        original = redact_secrets(row[0])
+        original = redact_secrets(decompress_payload(row[0]))
         checksum = hashlib.sha256(original.encode()).hexdigest()
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
@@ -207,4 +256,9 @@ class ContextCache:
         with sqlite3.connect(self.db_path) as conn:
             count = conn.execute("SELECT COUNT(*) FROM output_cache").fetchone()[0]
         size_kb = self.db_path.stat().st_size / 1024 if self.db_path.exists() else 0
-        return {"count": count, "size_kb": size_kb, "path": str(self.db_path)}
+        return {
+            "count": count,
+            "size_kb": size_kb,
+            "path": str(self.db_path),
+            "compression": "zstd" if zstd is not None else "zlib",
+        }
