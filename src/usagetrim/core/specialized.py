@@ -2856,6 +2856,12 @@ def auto_specialize_command_output(command: str, raw_output: str) -> str | None:
         if explain_res != raw_output:
             return explain_res
 
+    # Check for CMake & GCC/Clang compilation output
+    if _is_compiler_command(cmd_lower) or _is_compiler_output(raw_output):
+        compiler_res = filter_compiler_output(raw_output)
+        if compiler_res != raw_output:
+            return compiler_res
+
     # Check for large or verbose JSON output
     json_result = filter_json_output(raw_output, command=command)
     if json_result is not None:
@@ -4813,6 +4819,291 @@ def author_android_logcat_fixture(
     for i in range(15):
         lines.append(
             f"04-12 10:14:30.{i * 20 % 1000:03d}  1000  1000 D InputDispatcher: Window fully refreshed window_id=0x{i:02x}"
+        )
+
+    return "\n".join(lines)
+
+
+# ==============================================================================
+# CMake & GCC/Clang Compilation Output Compactor
+# ==============================================================================
+
+_CMAKE_PROGRESS_RE = re.compile(r"^\[\s*(\d+)%\s*\]\s+(.*)$")
+_NINJA_PROGRESS_RE = re.compile(r"^\[\s*(\d+)\s*/\s*(\d+)\s*\]\s+(.*)$")
+_COMPILER_DIAGNOSTIC_RE = re.compile(
+    r"^(\S+):(\d+):(?:\d+:)?\s*(error|fatal error|warning|note):\s*(.*)$"
+)
+_COMPILER_TEMPLATE_CASCADE_RE = re.compile(
+    r"^\s*(?:in instantiation of|In instantiation of|required from|In file included from|expanded from macro|during instantiation of)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_compiler_command(cmd_lower: str) -> bool:
+    tokens = cmd_lower.split()
+    if not tokens:
+        return False
+    base = PurePath(tokens[0]).name
+    if base in {
+        "cmake",
+        "make",
+        "gmake",
+        "ninja",
+        "gcc",
+        "g++",
+        "clang",
+        "clang++",
+        "cc",
+        "c++",
+    }:
+        return True
+    return any(prefix in cmd_lower for prefix in ("cmake --build", "make -j", "ninja -j"))
+
+
+def _is_compiler_output(raw_output: str) -> bool:
+    return bool(
+        _CMAKE_PROGRESS_RE.search(raw_output)
+        or _NINJA_PROGRESS_RE.search(raw_output)
+        or _COMPILER_DIAGNOSTIC_RE.search(raw_output)
+    )
+
+
+def filter_compiler_output(raw_output: str, max_template_depth: int = 5) -> str:
+    """Compact CMake, Ninja, and GCC/Clang compiler output into dense diagnostic-focused text.
+
+    - Collapses consecutive build progress lines ([ 12%] ... [ 89%]) into a summary line.
+    - Deduplicates identical compiler warnings emitted across multiple translation units.
+    - Truncates deep C++ template instantiation cascades (>5 deep) to the root call site
+      and immediate failure context.
+    - Preserves all fatal errors, root error lines, and source code snippet lines verbatim.
+    """
+    if not raw_output.strip():
+        return raw_output
+
+    lines = raw_output.splitlines()
+    result: list[str] = []
+
+    pending_progress: list[tuple[str, str, str]] = []  # (kind, val, line)
+    warning_counts: dict[str, int] = {}
+    seen_warnings: set[str] = set()
+
+    def flush_progress():
+        nonlocal pending_progress
+        if not pending_progress:
+            return
+        count = len(pending_progress)
+        if count == 1:
+            result.append(pending_progress[0][2])
+        else:
+            first_kind, first_val, _ = pending_progress[0]
+            _, last_val, _ = pending_progress[-1]
+            if first_kind == "cmake":
+                result.append(
+                    f"[UsageTrim: {count} compilation progress steps (from [{first_val}%] to [{last_val}%]) collapsed]"
+                )
+            elif first_kind == "ninja":
+                result.append(
+                    f"[UsageTrim: {count} build steps (from [{first_val}] to [{last_val}]) collapsed]"
+                )
+            else:
+                result.append(f"[UsageTrim: {count} build progress steps collapsed]")
+        pending_progress = []
+
+    i = 0
+    total = len(lines)
+    while i < total:
+        line = lines[i]
+        stripped = line.strip()
+
+        # 1. CMake progress lines
+        cmake_m = _CMAKE_PROGRESS_RE.match(stripped)
+        if cmake_m:
+            pending_progress.append(("cmake", cmake_m.group(1), line))
+            i += 1
+            continue
+
+        # 2. Ninja progress lines
+        ninja_m = _NINJA_PROGRESS_RE.match(stripped)
+        if ninja_m:
+            step_str = f"{ninja_m.group(1)}/{ninja_m.group(2)}"
+            pending_progress.append(("ninja", step_str, line))
+            i += 1
+            continue
+
+        # Not a progress line -> flush accumulated progress
+        flush_progress()
+
+        # 3. Check for template instantiation / inclusion cascade stack
+        if _COMPILER_TEMPLATE_CASCADE_RE.match(stripped):
+            cascade_lines = [line]
+            i += 1
+            while i < total and _COMPILER_TEMPLATE_CASCADE_RE.match(lines[i].strip()):
+                cascade_lines.append(lines[i])
+                i += 1
+
+            # Check if immediately followed by a compiler diagnostic
+            if i < total:
+                diag_m = _COMPILER_DIAGNOSTIC_RE.match(lines[i].strip())
+                if diag_m:
+                    diag_file, diag_line_no, diag_sev, diag_msg = (
+                        diag_m.group(1),
+                        diag_m.group(2),
+                        diag_m.group(3).lower(),
+                        diag_m.group(4),
+                    )
+                    diag_base = PurePath(diag_file).name
+                    if "warning" in diag_sev:
+                        warn_key = f"{diag_base}:{diag_line_no}:{diag_msg}"
+                        if warn_key in seen_warnings:
+                            warning_counts[warn_key] = warning_counts.get(warn_key, 1) + 1
+                            i += 1
+                            while i < total:
+                                next_line = lines[i]
+                                next_stripped = next_line.strip()
+                                if (
+                                    next_line.startswith((" ", "\t"))
+                                    or "^" in next_line
+                                    or (
+                                        next_stripped
+                                        and next_stripped[0].isdigit()
+                                        and "|" in next_stripped
+                                    )
+                                ):
+                                    i += 1
+                                else:
+                                    break
+                            continue
+
+            if len(cascade_lines) > max_template_depth:
+                kept = cascade_lines[:2]
+                omitted = len(cascade_lines) - 4
+                kept.append(
+                    f"   [... {omitted} template instantiation frames collapsed by usagetrim ...]"
+                )
+                kept.extend(cascade_lines[-2:])
+                result.extend(kept)
+            else:
+                result.extend(cascade_lines)
+            continue
+
+        # 4. Check for compiler diagnostics (error, warning, note)
+        diag_m = _COMPILER_DIAGNOSTIC_RE.match(stripped)
+        if diag_m:
+            filepath, line_no, severity, msg = (
+                diag_m.group(1),
+                diag_m.group(2),
+                diag_m.group(3).lower(),
+                diag_m.group(4),
+            )
+            file_base = PurePath(filepath).name
+
+            diag_lines = [line]
+            i += 1
+            while i < total:
+                next_line = lines[i]
+                next_stripped = next_line.strip()
+                if (
+                    next_line.startswith((" ", "\t"))
+                    or "^" in next_line
+                    or (next_stripped and next_stripped[0].isdigit() and "|" in next_stripped)
+                ):
+                    diag_lines.append(next_line)
+                    i += 1
+                else:
+                    break
+
+            if "warning" in severity:
+                warn_key = f"{file_base}:{line_no}:{msg}"
+                if warn_key in seen_warnings:
+                    warning_counts[warn_key] = warning_counts.get(warn_key, 1) + 1
+                    continue
+                else:
+                    seen_warnings.add(warn_key)
+                    warning_counts[warn_key] = 1
+                    result.extend(diag_lines)
+            else:
+                result.extend(diag_lines)
+            continue
+
+        # 5. Build failure banners / other output
+        result.append(line)
+        i += 1
+
+    flush_progress()
+
+    dups = {k: c for k, c in warning_counts.items() if c > 1}
+    if dups:
+        for warn_key, count in dups.items():
+            result.append(
+                f"[UsageTrim: warning '{warn_key}' repeated in {count - 1} other translation unit(s) - deduplicated]"
+            )
+
+    return "\n".join(result)
+
+
+filter_compiler = filter_compiler_output
+
+
+def author_compiler_build_fixture(
+    progress_count: int = 25,
+    duplicate_warning_count: int = 10,
+    has_template_error: bool = True,
+    has_fatal_error: bool = True,
+) -> str:
+    """Generate realistic verbose C++ build log for tests and benchmarks."""
+    lines: list[str] = []
+
+    # 1. Progress percentages
+    for step in range(1, progress_count + 1):
+        pct = int(step * 100 / (progress_count + 5))
+        obj_name = f"CMakeFiles/core.dir/src/module_{step:02d}.cpp.o"
+        lines.append(f"[{pct:3d}%] Building CXX object {obj_name}")
+
+    # 2. Duplicate warnings across translation units
+    for rep in range(duplicate_warning_count):
+        unit = f"src/worker_{rep:02d}.cpp"
+        lines.append(f"In file included from {unit}:3:")
+        lines.append(
+            "include/config.h:18:14: warning: comparison of integer expressions of different signedness: 'int' and 'size_t' [-Wsign-compare]"
+        )
+        lines.append("   18 |     if (idx < limit) {")
+        lines.append("      |         ~~~~^~~~~~~")
+
+    # 3. Deep C++ template instantiation error
+    if has_template_error:
+        lines.extend(
+            [
+                "In file included from src/engine.cpp:5:",
+                "In file included from include/engine.h:12:",
+                "In instantiation of 'void Dispatcher<Handler>::process(const Event&) [with Handler = CustomWorker]':",
+                "required from 'void run_event_loop(Context&) [with Context = AppContext]'",
+                "in instantiation of template class 'std::vector<NonCopyableTask>' requested here",
+                "in instantiation of member function 'std::vector<NonCopyableTask>::push_back' requested here",
+                "required from 'void Queue::enqueue(const Task&)'",
+                "required from 'void WorkerPool::submit(Task)'",
+                "in instantiation of function template specialization 'std::make_shared<TaskRunner>'",
+                "required from here",
+                "include/dispatcher.h:142:9: error: no matching function for call to 'CustomWorker::handle(const Event&)'",
+                "  142 |         handler.handle(evt);",
+                "      |         ^~~~~~~~~~~~~~",
+                "include/worker.h:55:10: note: candidate function not viable: 'this' argument has type 'const CustomWorker', but method is not marked const",
+                "   55 |     void handle(const Event& evt);",
+                "      |          ^",
+            ]
+        )
+
+    # 4. Fatal compiler error and make recipe failure
+    if has_fatal_error:
+        lines.extend(
+            [
+                "src/parser.cpp:88:1: fatal error: opening dependency file CMakeFiles/core.dir/src/parser.cpp.d: No such file or directory",
+                '   88 | #include "generated_ast.h"',
+                "      | ^~~~~~~~~~~~~~~~~~~~~~~~~~",
+                "compilation terminated.",
+                "make[2]: *** [CMakeFiles/core.dir/build.make:145: CMakeFiles/core.dir/src/parser.cpp.o] Error 1",
+                "make[1]: *** [CMakeFiles/Makefile2:90: CMakeFiles/core.dir/all] Error 2",
+                "make: *** [Makefile:120: all] Error 2",
+            ]
         )
 
     return "\n".join(lines)

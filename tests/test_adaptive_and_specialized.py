@@ -6,6 +6,7 @@ import pytest
 from usagetrim.core.adaptive import compress_to_budget
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.specialized import (
+    author_compiler_build_fixture,
     author_helm_install_fixture,
     author_kubectl_describe_fixture,
     author_kubectl_get_fixture,
@@ -18,6 +19,7 @@ from usagetrim.core.specialized import (
     filter_cargo_build,
     filter_cargo_test,
     filter_ci_logs,
+    filter_compiler_output,
     filter_docker_build,
     filter_eslint,
     filter_explain_plan,
@@ -2506,3 +2508,116 @@ def test_import_from_filters_package():
     from usagetrim.filters.xcodebuild import filter_xcodebuild as fx2
 
     assert fx1 is fx2
+
+
+# ==============================================================================
+# Compiler Compactor Tests
+# ==============================================================================
+
+
+def test_filter_compiler_collapses_progress_lines():
+    raw = "\n".join(
+        [
+            "[  5%] Building CXX object CMakeFiles/app.dir/main.cpp.o",
+            "[ 10%] Building CXX object CMakeFiles/app.dir/foo.cpp.o",
+            "[ 15%] Building CXX object CMakeFiles/app.dir/bar.cpp.o",
+            "[ 20%] Building CXX object CMakeFiles/app.dir/baz.cpp.o",
+            "src/baz.cpp:12:1: error: expected ';' after expression",
+        ]
+    )
+    compacted = filter_compiler_output(raw)
+    assert "[UsageTrim: 4 compilation progress steps (from [5%] to [20%]) collapsed]" in compacted
+    assert "src/baz.cpp:12:1: error: expected ';' after expression" in compacted
+
+
+def test_filter_compiler_deduplicates_repetitive_warnings():
+    raw = "\n".join(
+        [
+            "In file included from src/a.cpp:1:",
+            "include/common.h:10:5: warning: 'int old_api()' is deprecated [-Wdeprecated-declarations]",
+            "   10 | int old_api();",
+            "      |     ^~~~~~~",
+            "In file included from src/b.cpp:1:",
+            "include/common.h:10:5: warning: 'int old_api()' is deprecated [-Wdeprecated-declarations]",
+            "   10 | int old_api();",
+            "      |     ^~~~~~~",
+            "In file included from src/c.cpp:1:",
+            "include/common.h:10:5: warning: 'int old_api()' is deprecated [-Wdeprecated-declarations]",
+            "   10 | int old_api();",
+            "      |     ^~~~~~~",
+        ]
+    )
+    compacted = filter_compiler_output(raw)
+    assert compacted.count("warning: 'int old_api()' is deprecated") == 1
+    assert "repeated in 2 other translation unit(s) - deduplicated" in compacted
+
+
+def test_filter_compiler_truncates_deep_template_cascades():
+    cascade = [f"In instantiation of 'struct TemplateLevel_{i}<T>':" for i in range(12)]
+    cascade.append("src/main.cpp:88:5: error: no member named 'value' in 'struct Base'")
+    cascade.append("   88 |     return Base::value;")
+    cascade.append("      |            ~~~~~~^")
+    raw = "\n".join(cascade)
+
+    compacted = filter_compiler_output(raw)
+    assert "In instantiation of 'struct TemplateLevel_0<T>':" in compacted
+    assert "In instantiation of 'struct TemplateLevel_1<T>':" in compacted
+    assert "template instantiation frames collapsed by usagetrim" in compacted
+    assert "In instantiation of 'struct TemplateLevel_10<T>':" in compacted
+    assert "In instantiation of 'struct TemplateLevel_11<T>':" in compacted
+    assert "src/main.cpp:88:5: error: no member named 'value' in 'struct Base'" in compacted
+    assert "return Base::value;" in compacted
+
+
+def test_filter_compiler_preserves_fatal_error_and_snippet_verbatim():
+    raw = "\n".join(
+        [
+            "src/core.cpp:45:10: fatal error: 'missing_header.h' file not found",
+            "   45 | #include <missing_header.h>",
+            "      |          ^~~~~~~~~~~~~~~~~~",
+            "1 error generated.",
+            "make: *** [Makefile:82: all] Error 1",
+        ]
+    )
+    compacted = filter_compiler_output(raw)
+    assert "fatal error: 'missing_header.h' file not found" in compacted
+    assert "#include <missing_header.h>" in compacted
+    assert "^~~~~~~~~~~~~~~~~~" in compacted
+    assert "make: *** [Makefile:82: all] Error 1" in compacted
+
+
+def test_filter_compiler_token_reduction_exceeds_80_percent():
+    raw = author_compiler_build_fixture(
+        progress_count=35,
+        duplicate_warning_count=15,
+        has_template_error=True,
+        has_fatal_error=True,
+    )
+    compacted = filter_compiler_output(raw)
+    raw_tokens = count_tokens(raw).avg
+    compacted_tokens = count_tokens(compacted).avg
+    reduction = 1.0 - (compacted_tokens / raw_tokens)
+    assert reduction >= 0.80
+    assert "[UsageTrim:" in compacted
+    assert "fatal error:" in compacted
+    assert "make: *** [Makefile:120: all] Error 2" in compacted
+
+
+def test_auto_specialize_routes_compiler():
+    fixture = author_compiler_build_fixture()
+    assert auto_specialize_command_output("cmake --build build", fixture) is not None
+    assert auto_specialize_command_output("make -j8", fixture) is not None
+    assert auto_specialize_command_output("ninja", fixture) is not None
+    assert auto_specialize_command_output("g++ -c main.cpp", fixture) is not None
+    assert auto_specialize_command_output("clang++ -O3 -c algo.cpp", fixture) is not None
+
+
+def test_compiler_filters_import_and_aliases():
+    from usagetrim.filters import filter_compiler as fc1
+    from usagetrim.filters import filter_compiler_output as fco1
+    from usagetrim.filters.compiler import filter_compiler as fc2
+    from usagetrim.filters.compiler import filter_compiler_output as fco2
+
+    assert fc1 is fc2
+    assert fco1 is fco2
+    assert fc1 is fco1
