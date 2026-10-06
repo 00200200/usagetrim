@@ -2840,6 +2840,12 @@ def auto_specialize_command_output(command: str, raw_output: str) -> str | None:
         if xcode_res != raw_output:
             return xcode_res
 
+    # Check for Android adb logcat & runtime crash output
+    if _is_android_command(cmd_lower) or _is_android_output(raw_output):
+        android_res = filter_android_logcat(raw_output)
+        if android_res != raw_output:
+            return android_res
+
     # Check for PostgreSQL / MySQL EXPLAIN execution plans
     if (
         "explain" in cmd_lower
@@ -4475,6 +4481,338 @@ def author_xcodebuild_log_fixture(has_error: bool = True) -> str:
                 "",
                 "** BUILD SUCCEEDED ** [3.412 sec]",
             ]
+        )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Android Gradle & adb logcat verbose filter and crash extractor
+# ---------------------------------------------------------------------------
+
+_LOGCAT_THREADTIME_RE = re.compile(
+    r"^(?:\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})\s+(\d+)\s+(\d+)\s+([VDIWEFA])\s+([^:]+?)\s*:\s*(.*)$"
+)
+_LOGCAT_BRIEF_RE = re.compile(r"^([VDIWEFA])/([^(\s]+?)\s*\(\s*(\d+)\s*\):\s*(.*)$")
+_LOGCAT_BUFFER_BEGIN_RE = re.compile(r"^---------\s+beginning of\s+\w+")
+_LOGCAT_ENTRY_START_RE = re.compile(
+    r"^(?:\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3}|[VDIWEFA]/|---------)"
+)
+_TOMBSTONE_BANNER_RE = re.compile(r"^.*?\*{3}\s+\*{3}\s+\*{3}\s+\*{3}.*?$")
+_ANDROID_GRADLE_TASK_RE = re.compile(
+    r"^>\s+Task\s+:(?:[a-zA-Z0-9_-]+:)?(?:preBuild|preDebugBuild|compileDebugAidl|mergeDebugResources|processDebugManifest|stripDebugDebugSymbols|generateDebugBuildConfig|mergeDebugJavaResource)\s+(?:UP-TO-DATE|NO-SOURCE|SKIPPED|SUCCESS)\b"
+)
+_R8_PROGUARD_NOISE_RE = re.compile(
+    r"^(?:R8 is a new|Note: The configuration keeps|Reading library jar|Searching for referenced classes|Writing dex classes)\b",
+    re.IGNORECASE,
+)
+_ANDROID_OS_NOISE_TAGS = {
+    "system_server",
+    "surfaceflinger",
+    "audio_hw",
+    "audioflinger",
+    "nuplayer",
+    "bufferqueue",
+    "batteryexternalstatsworker",
+    "wifihal",
+    "wpa_supplicant",
+    "activitytaskmanager",
+    "windowmanager",
+    "inputdispatcher",
+    "zygote",
+    "zygote64",
+    "chatty",
+    "healthd",
+    "hwcomposer",
+    "gralloc",
+    "powermanagerservice",
+    "gnsslocationprovider",
+    "bluetooth",
+    "connectivityservice",
+    "vold",
+    "netd",
+    "storaged",
+    "statsd",
+    "thermal-engine",
+    "openglrenderer",
+    "choreographer",
+    "viewrootimpl",
+    "inputmethodmanager",
+    "compatibilitychangereporter",
+    "libprocessgroup",
+    "kernel",
+    "hwservicemanager",
+    "servicemanager",
+    "sensor",
+    "sensors",
+    "camerahalserver",
+    "cameraprovider",
+    "audioservice",
+    "mediaserver",
+    "mediaextractor",
+    "telephonyregistry",
+    "carrierconfigloader",
+    "keyguardupdate",
+}
+
+
+def _is_android_command(cmd_lower: str) -> bool:
+    prefixes = (
+        "adb logcat",
+        "logcat",
+        "./gradlew assemble",
+        "gradlew assemble",
+        ":app:compile",
+        ":app:assemble",
+    )
+    return any(
+        cmd_lower == p or cmd_lower.startswith(p + " ") or f" {p}" in cmd_lower for p in prefixes
+    )
+
+
+def _is_android_output(raw_output: str) -> bool:
+    return bool(
+        "AndroidRuntime: FATAL EXCEPTION" in raw_output
+        or "ActivityManager: ANR in" in raw_output
+        or ("DEBUG   : *** *** *** ***" in raw_output and "signal " in raw_output)
+        or (
+            "--------- beginning of " in raw_output
+            and any(
+                tag in raw_output for tag in ("system_server", "SurfaceFlinger", "AndroidRuntime")
+            )
+        )
+    )
+
+
+def filter_android_logcat(raw_output: str, package: str | None = None) -> str:
+    """Compact adb logcat and Android Gradle logs while preserving runtime crashes and diagnostics.
+
+    Strips background OS noise (system_server, SurfaceFlinger, audio_hw, etc.), folds
+    routine Proguard/R8 optimization notices and UP-TO-DATE Gradle task headers, while
+    preserving 100% of FATAL EXCEPTION stack traces, ANR reports, and native tombstone
+    SIGSEGV crashes with register maps and backtrace frames.
+    """
+    if not raw_output.strip():
+        return raw_output
+
+    lines = raw_output.splitlines()
+    result: list[str] = []
+    collapsed_noise = 0
+    in_crash_block = False
+    in_tombstone_block = False
+    in_anr_block = False
+
+    def flush_noise():
+        nonlocal collapsed_noise
+        if collapsed_noise > 0:
+            result.append(f"[UsageTrim: {collapsed_noise} background OS noise line(s) collapsed]")
+            collapsed_noise = 0
+
+    for line in lines:
+        stripped = line.strip()
+
+        # 1. Beginning of logcat buffer markers
+        if _LOGCAT_BUFFER_BEGIN_RE.match(stripped):
+            flush_noise()
+            result.append(line)
+            continue
+
+        # 2. Check for native crash / tombstone start
+        if _TOMBSTONE_BANNER_RE.match(stripped):
+            flush_noise()
+            in_tombstone_block = True
+            result.append(line)
+            continue
+
+        if in_tombstone_block:
+            if _LOGCAT_ENTRY_START_RE.match(line) and not (
+                "DEBUG" in line or "signal " in line or "#" in line or "backtrace" in line
+            ):
+                in_tombstone_block = False
+            else:
+                result.append(line)
+                continue
+
+        # 3. Check for FATAL EXCEPTION / AndroidRuntime crash start
+        if "FATAL EXCEPTION" in stripped or (
+            ("AndroidRuntime" in stripped or "AndroidAppProcess" in stripped)
+            and ("Exception" in stripped or "Error" in stripped or "crash" in stripped.lower())
+        ):
+            flush_noise()
+            in_crash_block = True
+            result.append(line)
+            continue
+
+        if in_crash_block:
+            if (
+                line.startswith((" ", "\t"))
+                or "AndroidRuntime" in stripped
+                or "Process:" in stripped
+                or "PID:" in stripped
+                or "Caused by:" in stripped
+                or stripped.startswith("at ")
+                or "... " in stripped
+            ):
+                result.append(line)
+                continue
+            else:
+                in_crash_block = False
+
+        # 4. Check for ANR start
+        if "ANR in " in stripped or "ActivityManager: ANR in" in stripped:
+            flush_noise()
+            in_anr_block = True
+            result.append(line)
+            continue
+
+        if in_anr_block:
+            if (
+                "PID:" in stripped
+                or "Reason:" in stripped
+                or "Load:" in stripped
+                or "CPU usage" in stripped
+                or line.startswith((" ", "\t"))
+            ):
+                result.append(line)
+                continue
+            else:
+                in_anr_block = False
+
+        # 5. Check for Gradle / R8 optimization noise
+        if _ANDROID_GRADLE_TASK_RE.match(stripped) or _R8_PROGUARD_NOISE_RE.match(stripped):
+            collapsed_noise += 1
+            continue
+
+        # 6. Parse logcat entry (Threadtime or Brief)
+        threadtime_match = _LOGCAT_THREADTIME_RE.match(stripped)
+        brief_match = _LOGCAT_BRIEF_RE.match(stripped) if not threadtime_match else None
+
+        if threadtime_match or brief_match:
+            if threadtime_match:
+                _pid, _tid, level, tag, msg = threadtime_match.groups()
+            else:
+                level, tag, _pid, msg = brief_match.groups()
+
+            tag_clean = tag.strip().lower()
+
+            # Always preserve Fatal (F/A) and Error (E) entries
+            if level in ("E", "F", "A"):
+                flush_noise()
+                result.append(line)
+                continue
+
+            # If target package specified:
+            if package:
+                if package.lower() in msg.lower() or package.lower() in tag_clean:
+                    flush_noise()
+                    result.append(line)
+                else:
+                    collapsed_noise += 1
+                continue
+
+            # If it's a known background OS noise tag with V, D, or I level:
+            if tag_clean in _ANDROID_OS_NOISE_TAGS and level in ("V", "D", "I"):
+                collapsed_noise += 1
+                continue
+
+            # App-level debug or info lines
+            flush_noise()
+            result.append(line)
+            continue
+
+        # Non-logcat or general text line
+        if not stripped:
+            if collapsed_noise == 0:
+                result.append(line)
+            continue
+
+        flush_noise()
+        result.append(line)
+
+    flush_noise()
+    compacted = "\n".join(result)
+    if raw_output.endswith("\n") and not compacted.endswith("\n"):
+        compacted += "\n"
+    return compacted
+
+
+filter_android = filter_android_logcat
+
+
+def author_android_logcat_fixture(
+    has_crash: bool = True,
+    has_tombstone: bool = False,
+    has_anr: bool = False,
+    noise_count: int = 40,
+) -> str:
+    """Generate a realistic adb logcat fixture with background OS noise and optional crashes."""
+    lines: list[str] = [
+        "--------- beginning of main",
+        "--------- beginning of system",
+    ]
+
+    for i in range(noise_count):
+        tag = (
+            "SurfaceFlinger"
+            if i % 4 == 0
+            else "AudioFlinger"
+            if i % 4 == 1
+            else "WifiHAL"
+            if i % 4 == 2
+            else "BatteryExternalStatsWorker"
+        )
+        level = "D" if i % 2 == 0 else "V"
+        lines.append(
+            f"04-12 10:14:{20 + i // 60:02d}.{i * 15 % 1000:03d}  1000  1050 {level} {tag}: "
+            f"Routine background subsystem event #{i} client_id=0x{i:04x}"
+        )
+
+    if has_crash:
+        lines.extend(
+            [
+                "04-12 10:14:22.500 12345 12345 E AndroidRuntime: FATAL EXCEPTION: main",
+                "04-12 10:14:22.500 12345 12345 E AndroidRuntime: Process: com.example.myapp, PID: 12345",
+                "04-12 10:14:22.500 12345 12345 E AndroidRuntime: java.lang.NullPointerException: Attempt to invoke virtual method 'void android.view.View.setVisibility(int)' on a null object reference",
+                "\tat com.example.myapp.MainActivity.onCreate(MainActivity.kt:42)",
+                "\tat android.app.Activity.performCreate(Activity.java:8051)",
+                "\tat android.app.Instrumentation.callActivityOnCreate(Instrumentation.java:1329)",
+                "\tat android.app.ActivityThread.performLaunchActivity(ActivityThread.java:3608)",
+                "04-12 10:14:22.502 12345 12345 E AndroidRuntime: Caused by: java.lang.IllegalStateException: View binding cannot be null",
+                "\tat com.example.myapp.MainActivity.setupViews(MainActivity.kt:88)",
+                "\t... 16 more",
+            ]
+        )
+
+    if has_anr:
+        lines.extend(
+            [
+                "04-12 10:14:25.100  1000  1150 E ActivityManager: ANR in com.example.myapp (com.example.myapp/.MainActivity)",
+                "04-12 10:14:25.100  1000  1150 E ActivityManager: PID: 12345",
+                "04-12 10:14:25.100  1000  1150 E ActivityManager: Reason: Input dispatching timed out (Application does not have a focused window)",
+                "04-12 10:14:25.100  1000  1150 E ActivityManager: Load: 0.62 / 0.45 / 0.21",
+            ]
+        )
+
+    if has_tombstone:
+        lines.extend(
+            [
+                "04-12 10:14:26.000 12345 12345 F DEBUG   : *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***",
+                "04-12 10:14:26.000 12345 12345 F DEBUG   : Build fingerprint: 'google/raven/raven:14/UP1A.231005.007/10754064:user/release-keys'",
+                "04-12 10:14:26.000 12345 12345 F DEBUG   : Revision: '0'",
+                "04-12 10:14:26.000 12345 12345 F DEBUG   : ABI: 'arm64'",
+                "04-12 10:14:26.000 12345 12345 F DEBUG   : Timestamp: 2026-04-12 10:14:26.000+0000",
+                "04-12 10:14:26.000 12345 12345 F DEBUG   : pid: 12345, tid: 12345, name: com.example.myapp  >>> com.example.myapp <<<",
+                "04-12 10:14:26.000 12345 12345 F DEBUG   : uid: 10123",
+                "04-12 10:14:26.000 12345 12345 F DEBUG   : signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0000000000000000",
+                "04-12 10:14:26.000 12345 12345 F DEBUG   : backtrace:",
+                "04-12 10:14:26.000 12345 12345 F DEBUG   :       #00 pc 0000000000042a10  /data/app/~~com.example.myapp/lib/arm64/libnative.so (Java_com_example_myapp_Native_crash+16)",
+                "04-12 10:14:26.000 12345 12345 F DEBUG   :       #01 pc 0000000000054321  /apex/com.android.art/lib64/libart.so (art_quick_generic_jni_trampoline+144)",
+            ]
+        )
+
+    for i in range(15):
+        lines.append(
+            f"04-12 10:14:30.{i * 20 % 1000:03d}  1000  1000 D InputDispatcher: Window fully refreshed window_id=0x{i:02x}"
         )
 
     return "\n".join(lines)
