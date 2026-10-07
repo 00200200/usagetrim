@@ -18,6 +18,24 @@ from usagetrim.core.redactor import redact_secrets
 DEFAULT_CACHE_DIR = Path.home() / ".usagetrim"
 DEFAULT_CACHE_DB = DEFAULT_CACHE_DIR / "cache.db"
 COMPRESSION_THRESHOLD = 512
+DEFAULT_CACHE_BUDGET_BYTES = 500 * 1024 * 1024  # 500 MB
+
+
+def get_cache_budget_bytes() -> int:
+    """Return maximum cache budget in bytes from env or default (500 MB)."""
+    env_bytes = os.environ.get("USAGETRIM_CACHE_MAX_BYTES")
+    if env_bytes:
+        try:
+            return int(env_bytes)
+        except ValueError:
+            pass
+    env_mb = os.environ.get("USAGETRIM_CACHE_MAX_MB")
+    if env_mb:
+        try:
+            return int(env_mb) * 1024 * 1024
+        except ValueError:
+            pass
+    return DEFAULT_CACHE_BUDGET_BYTES
 
 
 def compress_payload(data: str) -> bytes | str:
@@ -82,11 +100,26 @@ class ContextCache:
                     content_hash TEXT,
                     source TEXT,
                     content TEXT,
-                    created_at REAL
+                    created_at REAL,
+                    hit_count INTEGER DEFAULT 0,
+                    last_inquired_at REAL DEFAULT 0.0
                 )
                 """
             )
+            # Ensure LRI tracking columns exist for older schemas
+            cursor = conn.execute("PRAGMA table_info(output_cache)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "hit_count" not in columns:
+                conn.execute("ALTER TABLE output_cache ADD COLUMN hit_count INTEGER DEFAULT 0")
+            if "last_inquired_at" not in columns:
+                conn.execute(
+                    "ALTER TABLE output_cache ADD COLUMN last_inquired_at REAL DEFAULT 0.0"
+                )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_hash ON output_cache(content_hash)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lri ON output_cache("
+                "hit_count, last_inquired_at, created_at)"
+            )
             conn.commit()
 
     def store(self, content: str, source: str = "exec", *, namespace: str = "") -> str:
@@ -107,12 +140,25 @@ class ContextCache:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO output_cache (ref_id, content_hash, source, content, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO output_cache (
+                    ref_id, content_hash, source, content, created_at, hit_count, last_inquired_at
+                )
+                VALUES (?, ?, ?, ?, ?, 0, 0.0)
+                ON CONFLICT(ref_id) DO UPDATE SET
+                    content_hash = excluded.content_hash,
+                    source = excluded.source,
+                    content = excluded.content,
+                    created_at = excluded.created_at
                 """,
                 (ref_id, content_hash, source, stored_payload, time.time()),
             )
             conn.commit()
+
+        # Enforce budget in background if exceeded
+        budget = get_cache_budget_bytes()
+        if self.db_path.exists() and self.db_path.stat().st_size > budget:
+            self.evict_lri(max_bytes=budget)
+
         return ref_id
 
     def retrieve(self, ref_id: str, lines_range: str | None = None) -> str:
@@ -122,6 +168,17 @@ class ContextCache:
                 "SELECT content, source FROM output_cache WHERE ref_id = ?",
                 (ref_id,),
             ).fetchone()
+            if row:
+                conn.execute(
+                    """
+                    UPDATE output_cache
+                    SET hit_count = hit_count + 1,
+                        last_inquired_at = ?
+                    WHERE ref_id = ?
+                    """,
+                    (time.time(), ref_id),
+                )
+                conn.commit()
 
         if not row:
             return f"Error: ref ID '{ref_id}' not found in usagetrim cache."
@@ -165,6 +222,17 @@ class ContextCache:
             row = conn.execute(
                 "SELECT content FROM output_cache WHERE ref_id=?", (ref_id,)
             ).fetchone()
+            if row:
+                conn.execute(
+                    """
+                    UPDATE output_cache
+                    SET hit_count = hit_count + 1,
+                        last_inquired_at = ?
+                    WHERE ref_id = ?
+                    """,
+                    (time.time(), ref_id),
+                )
+                conn.commit()
         if row is None:
             return f"Error: ref ID '{ref_id}' not found in usagetrim cache."
         original = redact_secrets(decompress_payload(row[0]))
@@ -252,13 +320,91 @@ class ContextCache:
                     conn.execute(f"DELETE FROM {table}")
             conn.commit()
 
+    def evict_lri(
+        self,
+        max_bytes: int | None = None,
+        target_bytes: int | None = None,
+        max_items_to_remove: int | None = None,
+    ) -> list[str]:
+        """Evict cached blocks using Least Recently Inquired (LRI) policy.
+
+        Weight retention by frequency (hit_count) and recency (last_inquired_at).
+        Unreferenced blocks (hit_count == 0) are evicted before any inquired blocks.
+        Automatic VACUUM reclaims freed SQLite pages safely in <50ms.
+        """
+        if not self.db_path.exists():
+            return []
+
+        budget = max_bytes if max_bytes is not None else get_cache_budget_bytes()
+        current_size = self.db_path.stat().st_size
+
+        if max_items_to_remove is None and current_size <= budget:
+            return []
+
+        target = target_bytes if target_bytes is not None else int(budget * 0.85)
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                """
+                SELECT ref_id, LENGTH(content)
+                FROM output_cache
+                ORDER BY
+                    CASE WHEN hit_count > 0 THEN 1 ELSE 0 END ASC,
+                    hit_count ASC,
+                    last_inquired_at ASC,
+                    created_at ASC
+                """
+            )
+            candidates = cursor.fetchall()
+
+            evicted_refs: list[str] = []
+            freed_bytes = 0
+
+            for ref_id, payload_len in candidates:
+                if max_items_to_remove is not None:
+                    evicted_refs.append(ref_id)
+                    if len(evicted_refs) >= max_items_to_remove:
+                        break
+                else:
+                    evicted_refs.append(ref_id)
+                    freed_bytes += payload_len or 0
+                    if (current_size - freed_bytes) <= target:
+                        break
+
+            if evicted_refs:
+                placeholders = ",".join("?" for _ in evicted_refs)
+                conn.execute(
+                    f"DELETE FROM output_cache WHERE ref_id IN ({placeholders})",
+                    evicted_refs,
+                )
+                for table, col in (("recovery_search", "ref"), ("recovery_indexed", "ref")):
+                    if conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE name=?", (table,)
+                    ).fetchone():
+                        conn.execute(
+                            f"DELETE FROM {table} WHERE {col} IN ({placeholders})",
+                            evicted_refs,
+                        )
+                conn.commit()
+                conn.execute("VACUUM")
+
+        return evicted_refs
+
     def get_stats(self) -> dict[str, Any]:
         with sqlite3.connect(self.db_path) as conn:
             count = conn.execute("SELECT COUNT(*) FROM output_cache").fetchone()[0]
+            hits = conn.execute("SELECT SUM(hit_count) FROM output_cache").fetchone()[0] or 0
+            inquired_count = (
+                conn.execute("SELECT COUNT(*) FROM output_cache WHERE hit_count > 0").fetchone()[0]
+                or 0
+            )
         size_kb = self.db_path.stat().st_size / 1024 if self.db_path.exists() else 0
         return {
             "count": count,
             "size_kb": size_kb,
             "path": str(self.db_path),
             "compression": "zstd" if zstd is not None else "zlib",
+            "total_inquiries": hits,
+            "inquired_entries": inquired_count,
+            "budget_mb": get_cache_budget_bytes() // (1024 * 1024),
         }

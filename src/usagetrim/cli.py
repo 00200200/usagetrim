@@ -1068,13 +1068,18 @@ def retrieve(
 
 @app.command()
 def cache(
-    action: Annotated[str, typer.Argument(help="Action: stats, clear")] = "stats",
+    action: Annotated[str, typer.Argument(help="Action: stats, clear, prune")] = "stats",
 ):
     """Manage local SQLite Compress-Cache-Retrieve store."""
     c = ContextCache()
     if action == "clear":
         c.clear()
         console.print("[green]✓ Cleared usagetrim cache store successfully.[/green]")
+    elif action == "prune":
+        evicted = c.evict_lri()
+        console.print(
+            f"[green]✓ Pruned {len(evicted)} entries via LRI cache policy successfully.[/green]"
+        )
     else:
         s = c.get_stats()
         table = Table(title="usagetrim CCR Cache Store")
@@ -1083,6 +1088,10 @@ def cache(
         table.add_row("Database Path", str(s["path"]))
         table.add_row("Cached Entries", f"{s['count']:,}")
         table.add_row("File Size", f"{s['size_kb']:.1f} KB")
+        if "total_inquiries" in s:
+            table.add_row("Total Inquiries", f"{s['total_inquiries']:,}")
+            table.add_row("Inquired Entries", f"{s['inquired_entries']:,}")
+            table.add_row("Cache Budget", f"{s.get('budget_mb', 500)} MB")
         console.print(table)
 
 
