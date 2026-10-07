@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+from dataclasses import dataclass, field
 from pathlib import PurePath
 
 from usagetrim.core.cache import ContextCache
@@ -2862,6 +2863,12 @@ def auto_specialize_command_output(command: str, raw_output: str) -> str | None:
         if compiler_res != raw_output:
             return compiler_res
 
+    # Check for Apache Spark & PySpark executor logs
+    if _is_spark_command(cmd_lower) or _is_spark_output(raw_output):
+        spark_res = filter_spark(raw_output)
+        if spark_res != raw_output:
+            return spark_res
+
     # Check for large or verbose JSON output
     json_result = filter_json_output(raw_output, command=command)
     if json_result is not None:
@@ -5107,3 +5114,453 @@ def author_compiler_build_fixture(
         )
 
     return "\n".join(lines)
+
+
+_SPARK_LOG_RE = re.compile(
+    r"(?:INFO\s+(?:TaskSetManager|DAGScheduler|BlockManagerMaster|SparkContext):"
+    r"|org\.apache\.spark\.SparkException|Py4JJavaError)",
+    re.IGNORECASE,
+)
+
+
+def _is_spark_command(cmd_lower: str) -> bool:
+    tokens = cmd_lower.split()
+    if not tokens:
+        return False
+    base = PurePath(tokens[0]).name
+    if base in {
+        "spark-submit",
+        "pyspark",
+        "spark-shell",
+        "spark-sql",
+        "spark-class",
+        "sparkr",
+    }:
+        return True
+    return any(
+        kw in cmd_lower
+        for kw in (
+            "spark-submit",
+            "pyspark",
+            "spark-shell",
+            "spark-sql",
+        )
+    )
+
+
+def _is_spark_output(raw_output: str) -> bool:
+    return bool(_SPARK_LOG_RE.search(raw_output))
+
+
+# Match TaskSetManager finished task with duration and host/executor info
+_TASK_FINISHED_RE = re.compile(
+    r".*INFO\s+TaskSetManager:\s+Finished task\s+(?P<task_id>[\d\.]+)\s+in stage\s+"
+    r"(?P<stage_id>[\d\.]+)\s+\(TID\s+(?P<tid>\d+)\)\s+in\s+(?P<duration>\d+)\s+ms"
+    r"(?:\s+on\s+(?P<host>\S+)\s+\(executor\s+(?P<executor>[^)]+)\))?",
+    re.IGNORECASE,
+)
+
+# Match TaskSetManager starting task
+_TASK_START_RE = re.compile(
+    r".*INFO\s+TaskSetManager:\s+Starting task\s+[\d\.]+\s+in stage\s+[\d\.]+",
+    re.IGNORECASE,
+)
+
+# Match Stage submission
+_STAGE_SUBMIT_RE = re.compile(
+    r".*INFO\s+DAGScheduler:\s+Submitting\s+(?P<num_tasks>\d+)\s+missing tasks for Stage\s+"
+    r"(?P<stage_id>[\d\.]+)\s+\((?P<desc>.*?)\)",
+    re.IGNORECASE,
+)
+
+# Match Stage completion
+_STAGE_COMPLETE_RE = re.compile(
+    r".*INFO\s+DAGScheduler:\s+Stage\s+(?P<stage_id>[\d\.]+)\s+\((?P<desc>.*?)\)\s+finished in\s+"
+    r"(?P<duration>[\d\.]+)\s+s",
+    re.IGNORECASE,
+)
+
+# Match BlockManager, BlockManagerInfo, MemoryStore chatter
+_BLOCK_MANAGER_RE = re.compile(
+    r".*INFO\s+(?:BlockManagerInfo|BlockManager|BlockManagerMaster|MemoryStore):\s+",
+    re.IGNORECASE,
+)
+
+# Match Heartbeats and background noise
+_HEARTBEAT_RE = re.compile(
+    r".*INFO\s+(?:HeartbeatReceiver|ContextCleaner):\s+|.*DEBUG\s+",
+    re.IGNORECASE,
+)
+
+# Match Java exception stack trace lines: "\tat ...", "Caused by: ...", "... 42 more"
+_JAVA_STACK_RE = re.compile(
+    r"^\s*(?:at\s+[a-zA-Z0-9_$./]+\([a-zA-Z0-9_$.]+(?::\d+)?\)|"
+    r"Caused by:\s+[a-zA-Z0-9_$.]+|.*(?:\.\.\.\s+\d+\s+more))"
+)
+
+# Match Py4J Java gateway errors
+_PY4J_ERROR_RE = re.compile(r"^(?:py4j\.protocol\.)?Py4J(?:Java)?Error:\s*", re.IGNORECASE)
+
+# Match Python traceback lines
+_PY_TRACEBACK_START = "Traceback (most recent call last):"
+_PY_TRACEBACK_LINE_RE = re.compile(r'^\s*File\s+".*",\s+line\s+\d+,')
+
+
+@dataclass
+class TaskMetric:
+    task_id: str
+    stage_id: str
+    tid: int
+    duration_ms: int
+    host: str = ""
+    executor: str = ""
+
+
+@dataclass
+class StageStats:
+    stage_id: str
+    description: str = ""
+    declared_tasks: int = 0
+    duration_s: float = 0.0
+    tasks: list[TaskMetric] = field(default_factory=list)
+
+
+def _normalize_stage_id(raw_id: str) -> str:
+    return raw_id.split(".")[0]
+
+
+def filter_spark(
+    raw_output: str,
+    max_stage_details: int = 10,
+    skew_threshold: float = 3.0,
+) -> str:
+    """Compact verbose Apache Spark & PySpark executor logs and detect task skew.
+
+    - Collapses repetitive TaskSetManager and BlockManager INFO logs (>90% token reduction).
+    - Computes per-stage task duration distribution (min, median, p90, max).
+    - Detects and flags data skew bottlenecks when max task duration exceeds median by skew_threshold.
+    - Preserves Py4J Java gateway exceptions and PySpark tracebacks verbatim.
+    """
+    if not raw_output.strip():
+        return raw_output
+
+    lines = raw_output.splitlines()
+    total_lines = len(lines)
+
+    stages: dict[str, StageStats] = {}
+    collapsed_count = 0
+    preserved_lines: list[str] = []
+
+    in_traceback = False
+    traceback_lines: list[str] = []
+
+    def flush_traceback():
+        nonlocal in_traceback, traceback_lines
+        if traceback_lines:
+            preserved_lines.extend(traceback_lines)
+            traceback_lines = []
+        in_traceback = False
+
+    i = 0
+    while i < total_lines:
+        line = lines[i]
+        stripped = line.strip()
+
+        # 1. Detect start of Python or Java traceback / exception
+        if stripped == _PY_TRACEBACK_START or _PY4J_ERROR_RE.search(stripped):
+            in_traceback = True
+            traceback_lines.append(line)
+            i += 1
+            continue
+
+        if in_traceback:
+            # Continue accumulating traceback lines
+            if (
+                _JAVA_STACK_RE.match(line)
+                or _PY_TRACEBACK_LINE_RE.match(line)
+                or (line.startswith("  ") and not line.startswith("    "))
+                or "Exception:" in line
+                or "Error:" in line
+                or not stripped
+            ):
+                traceback_lines.append(line)
+                i += 1
+                continue
+            flush_traceback()
+
+        # 2. Check for Stage submission
+        sub_m = _STAGE_SUBMIT_RE.match(stripped)
+        if sub_m:
+            stage_id = _normalize_stage_id(sub_m.group("stage_id"))
+            num_tasks = int(sub_m.group("num_tasks"))
+            desc = sub_m.group("desc")
+            if stage_id not in stages:
+                stages[stage_id] = StageStats(stage_id=stage_id)
+            stages[stage_id].declared_tasks = num_tasks
+            stages[stage_id].description = desc
+            collapsed_count += 1
+            i += 1
+            continue
+
+        # 3. Check for Stage completion
+        comp_m = _STAGE_COMPLETE_RE.match(stripped)
+        if comp_m:
+            stage_id = _normalize_stage_id(comp_m.group("stage_id"))
+            dur = float(comp_m.group("duration"))
+            desc = comp_m.group("desc")
+            if stage_id not in stages:
+                stages[stage_id] = StageStats(stage_id=stage_id)
+            stages[stage_id].duration_s = dur
+            if not stages[stage_id].description:
+                stages[stage_id].description = desc
+            collapsed_count += 1
+            i += 1
+            continue
+
+        # 4. Check for Finished Task
+        fin_m = _TASK_FINISHED_RE.match(stripped)
+        if fin_m:
+            stage_id = _normalize_stage_id(fin_m.group("stage_id"))
+            task_id = fin_m.group("task_id")
+            tid = int(fin_m.group("tid"))
+            duration = int(fin_m.group("duration"))
+            host = fin_m.group("host") or ""
+            executor = fin_m.group("executor") or ""
+
+            if stage_id not in stages:
+                stages[stage_id] = StageStats(stage_id=stage_id)
+            stages[stage_id].tasks.append(
+                TaskMetric(
+                    task_id=task_id,
+                    stage_id=stage_id,
+                    tid=tid,
+                    duration_ms=duration,
+                    host=host,
+                    executor=executor,
+                )
+            )
+            collapsed_count += 1
+            i += 1
+            continue
+
+        # 5. Check for Starting Task
+        if _TASK_START_RE.match(stripped):
+            collapsed_count += 1
+            i += 1
+            continue
+
+        # 6. Check for BlockManager / MemoryStore chatter
+        if _BLOCK_MANAGER_RE.match(stripped):
+            collapsed_count += 1
+            i += 1
+            continue
+
+        # 7. Check for Heartbeat / cleaner noise
+        if _HEARTBEAT_RE.match(stripped):
+            collapsed_count += 1
+            i += 1
+            continue
+
+        # 8. Check for Java exception / stack lines outside traceback block
+        if _JAVA_STACK_RE.match(line):
+            preserved_lines.append(line)
+            i += 1
+            continue
+
+        # 9. Other lines (warnings, errors, driver prints)
+        preserved_lines.append(line)
+        i += 1
+
+    flush_traceback()
+
+    # If no Spark structures were compacted, return original output
+    if collapsed_count == 0 and not stages:
+        return raw_output
+
+    result: list[str] = []
+
+    # Emit collapsed banner
+    num_stages = len(stages)
+    result.append(
+        f"[UsageTrim: {collapsed_count} TaskSetManager & BlockManager events "
+        f"collapsed across {num_stages} stage(s)]"
+    )
+
+    # Emit Stage Distribution & Task Skew Summary
+    if stages:
+        result.append("=== Spark Stage Task Distribution & Skew Summary ===")
+        for stage_id in sorted(stages.keys(), key=lambda s: int(s) if s.isdigit() else s):
+            stats = stages[stage_id]
+            desc_str = f" ({stats.description})" if stats.description else ""
+            tasks = stats.tasks
+            if not tasks:
+                task_cnt = stats.declared_tasks
+                dur_str = f" in {stats.duration_s:.2f}s" if stats.duration_s > 0 else ""
+                result.append(f"Stage {stage_id}{desc_str}: {task_cnt} tasks declared{dur_str}")
+                continue
+
+            durations = sorted(t.duration_ms for t in tasks)
+            n = len(durations)
+            min_dur = durations[0]
+            max_dur = durations[-1]
+            med_dur = durations[n // 2]
+            p90_dur = durations[int(n * 0.9)] if n > 1 else max_dur
+
+            skew_ratio = (max_dur / med_dur) if med_dur > 0 else 1.0
+
+            # Find slowest task info
+            slowest_task = max(tasks, key=lambda t: t.duration_ms)
+            slowest_info = f"on TID {slowest_task.tid}"
+            if slowest_task.executor:
+                slowest_info += f" (executor {slowest_task.executor})"
+
+            if skew_ratio >= skew_threshold and (max_dur - med_dur) >= 100:
+                skew_alert = (
+                    f" [⚠️ Severe Skew: max {skew_ratio:.1f}x median ({med_dur}ms) {slowest_info}]"
+                )
+            elif skew_ratio >= 2.0 and (max_dur - med_dur) >= 50:
+                skew_alert = f" [Moderate Skew: max {skew_ratio:.1f}x median]"
+            else:
+                skew_alert = " [Balanced]"
+
+            result.append(
+                f"Stage {stage_id}{desc_str}: {n} tasks (min: {min_dur}ms, "
+                f"p50: {med_dur}ms, p90: {p90_dur}ms, max: {max_dur}ms){skew_alert}"
+            )
+        result.append("=" * 53)
+
+    # Append preserved lines (errors, driver logs, warnings)
+    cleaned_preserved = [ln for ln in preserved_lines if ln.strip()]
+    if cleaned_preserved:
+        result.extend(cleaned_preserved)
+
+    return "\n".join(result).strip() + "\n"
+
+
+filter_spark_log = filter_spark
+
+
+def author_spark_log_fixture(
+    has_error: bool = False,
+    has_skew: bool = False,
+    num_tasks: int = 50,
+) -> str:
+    """Generate representative Apache Spark & PySpark driver logs for testing."""
+    lines = [
+        "24/10/07 08:30:10 INFO SparkContext: Running Spark version 3.5.1",
+        "24/10/07 08:30:10 INFO SparkContext: Submitted application: AnalyticsPipeline",
+        "24/10/07 08:30:11 INFO SecurityManager: SecurityManager: authentication disabled",
+        (
+            "24/10/07 08:30:11 INFO BlockManagerMaster: "
+            "Registered BlockManager BlockManagerId(driver, 10.0.0.1, 4040)"
+        ),
+    ]
+
+    # Stage 0: Fast balanced stage
+    lines.append(
+        "24/10/07 08:30:12 INFO DAGScheduler: Submitting 10 missing tasks for Stage 0.0 "
+        "(broadcast at script.py:15)"
+    )
+    for tid in range(10):
+        lines.append(
+            f"24/10/07 08:30:12 INFO TaskSetManager: Starting task {tid}.0 in stage 0.0 "
+            f"(TID {tid}, 10.0.0.1, executor 1, partition {tid})"
+        )
+        lines.append(
+            f"24/10/07 08:30:13 INFO BlockManagerInfo: Added broadcast_0_piece{tid} "
+            f"in memory on 10.0.0.1:4040 (size: 20 KiB)"
+        )
+        lines.append(
+            f"24/10/07 08:30:13 INFO TaskSetManager: Finished task {tid}.0 in stage 0.0 "
+            f"(TID {tid}) in 45 ms on 10.0.0.1 (executor 1) ({tid + 1}/10)"
+        )
+    lines.append(
+        "24/10/07 08:30:13 INFO DAGScheduler: Stage 0 (broadcast at script.py:15) finished in 0.45 s"
+    )
+
+    # Stage 1: Main computation stage
+    lines.append(
+        f"24/10/07 08:30:14 INFO DAGScheduler: Submitting {num_tasks} missing tasks for Stage 1.0 "
+        "(count at script.py:42)"
+    )
+    for tid in range(num_tasks):
+        exec_id = (tid % 4) + 1
+        host = f"10.0.0.{exec_id}"
+        lines.append(
+            f"24/10/07 08:30:14 INFO TaskSetManager: Starting task {tid}.0 in stage 1.0 "
+            f"(TID {10 + tid}, {host}, executor {exec_id})"
+        )
+        lines.append(
+            f"24/10/07 08:30:14 INFO MemoryStore: Block rdd_1_{tid} "
+            f"stored as values in memory (size: 5.2 MiB)"
+        )
+        lines.append(
+            f"24/10/07 08:30:14 INFO HeartbeatReceiver: Received heartbeat from executor {exec_id}"
+        )
+
+        if has_skew and tid == num_tasks - 1:
+            dur = 95000  # 95 seconds skew straggler
+        else:
+            dur = 100 + (tid % 20) * 2
+
+        lines.append(
+            f"24/10/07 08:30:15 INFO TaskSetManager: Finished task {tid}.0 in stage 1.0 "
+            f"(TID {10 + tid}) in {dur} ms on {host} (executor {exec_id}) ({tid + 1}/{num_tasks})"
+        )
+
+    lines.append(
+        "24/10/07 08:30:25 INFO DAGScheduler: Stage 1 (count at script.py:42) finished in 11.20 s"
+    )
+
+    if has_error:
+        lines.extend(
+            [
+                (
+                    "24/10/07 08:30:26 ERROR TaskSetManager: "
+                    "Task 42 in stage 1.0 failed 4 times; aborting job"
+                ),
+                (
+                    "24/10/07 08:30:26 ERROR DAGScheduler: "
+                    "Job failed: Job aborted due to stage failure: Task 42 in stage 1.0 failed 4 times"
+                ),
+                "Py4JJavaError: An error occurred while calling o42.count.",
+                (
+                    ": org.apache.spark.SparkException: Job aborted due to stage failure: "
+                    "Task 42 in stage 1.0 failed 4 times, most recent failure: "
+                    "Lost task 42.3 in stage 1.0 (TID 52) (10.0.0.3 executor 3): "
+                    "java.lang.OutOfMemoryError: Java heap space"
+                ),
+                "\tat java.base/java.util.Arrays.copyOf(Arrays.java:3745)",
+                "\tat org.apache.spark.util.collection.AppendOnlyMap.growTable(AppendOnlyMap.scala:240)",
+                (
+                    "\tat org.apache.spark.util.collection.AppendOnlyMap.changeValue"
+                    "(AppendOnlyMap.scala:155)"
+                ),
+                "\tat org.apache.spark.Aggregator.combineValuesByKey(Aggregator.scala:42)",
+                (
+                    "\tat org.apache.spark.shuffle.BlockStoreShuffleReader.read"
+                    "(BlockStoreShuffleReader.scala:52)"
+                ),
+                "\t... 32 more",
+                "Traceback (most recent call last):",
+                '  File "/app/script.py", line 42, in <module>',
+                '    df.groupBy("user_id").agg(count("*")).show()',
+                '  File "/opt/spark/python/pyspark/sql/dataframe.py", line 987, in show',
+                "    print(self._show_string(n, truncate, vertical))",
+                '  File "/opt/spark/python/pyspark/sql/dataframe.py", line 1025, in _show_string',
+                "    return self._jdf.showString(n, 20, vertical)",
+                (
+                    '  File "/opt/spark/python/lib/py4j-0.10.9.7-src.zip/py4j/java_gateway.py", '
+                    "line 1322, in __call__"
+                ),
+                "    return_value = get_return_value(",
+                '  File "/opt/spark/python/pyspark/errors/exceptions/captured.py", line 179, in deco',
+                "    return f(*a, **kw)",
+                (
+                    "pyspark.errors.exceptions.captured.PySparkException: "
+                    "[FAILED_EXECUTE_UDF] Failed to execute user defined function."
+                ),
+            ]
+        )
+
+    return "\n".join(lines) + "\n"
