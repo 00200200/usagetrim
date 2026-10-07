@@ -22,7 +22,12 @@ from rich.table import Table
 
 from usagetrim.core.adaptive import compress_to_budget
 from usagetrim.core.benchmark import benchmark_suite
-from usagetrim.core.benchmark_baseline import baseline_from_json, compare_baseline
+from usagetrim.core.benchmark_baseline import (
+    baseline_from_json,
+    baseline_to_json,
+    compare_baseline,
+    create_baseline,
+)
 from usagetrim.core.benchmark_corpus import load_benchmark_cases
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.cleaner import CleanerOptions, compact_terminal_output
@@ -2666,6 +2671,9 @@ def bench(
     baseline: Annotated[
         Path | None, typer.Option("--baseline", help="Compare against a baseline JSON file")
     ] = None,
+    save: Annotated[
+        Path | None, typer.Option("--save", help="Save a passing baseline to a new JSON file")
+    ] = None,
 ):
     """Benchmark the offline developer corpus in a repository checkout."""
     try:
@@ -2692,15 +2700,28 @@ def bench(
         and suite.exact_recovery
         and (comparison is None or not comparison.has_regressions)
     )
+    saved_baseline = None
+    if save is not None and passed:
+        try:
+            baseline_text = baseline_to_json(create_baseline(suite))
+            with save.open("x", encoding="utf-8", newline="\n") as baseline_file:
+                baseline_file.write(baseline_text)
+        except (OSError, ValueError) as exc:
+            err_console.print(f"Baseline save error: {exc}", markup=False)
+            raise typer.Exit(code=2) from exc
+        saved_baseline = str(save)
     if json_output:
         comparison_data = (
             {**asdict(comparison), "has_regressions": comparison.has_regressions}
             if comparison is not None
             else None
         )
+        report = {"suite": asdict(suite), "comparison": comparison_data, "passed": passed}
+        if save is not None:
+            report["saved_baseline"] = saved_baseline
         _emit(
             json.dumps(
-                {"suite": asdict(suite), "comparison": comparison_data, "passed": passed},
+                report,
                 sort_keys=True,
                 indent=2,
                 allow_nan=False,
@@ -2734,6 +2755,8 @@ def bench(
                 )
             console.print(comparison_table)
         console.print("PASS" if passed else "FAIL")
+        if saved_baseline is not None:
+            console.print(f"Baseline saved to {saved_baseline}", markup=False)
     if not passed:
         raise typer.Exit(code=1)
 

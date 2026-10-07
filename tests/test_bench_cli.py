@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 
 from usagetrim import cli
 from usagetrim.core.benchmark import BenchmarkResult, BenchmarkSuiteResult
+from usagetrim.core.benchmark_baseline import baseline_from_json, baseline_to_json, create_baseline
 
 runner = CliRunner()
 
@@ -103,3 +104,77 @@ def test_bench_and_benchmark_coexist():
         command.name or command.callback.__name__ for command in cli.app.registered_commands
     }
     assert {"bench", "benchmark", "demo"} <= commands
+
+
+def test_bench_saves_exact_baseline_format_and_round_trips(tmp_path, measured_suite):
+    path = tmp_path / "saved.json"
+    result = runner.invoke(cli.app, ["bench", "--save", str(path)])
+
+    assert result.exit_code == 0
+    expected = create_baseline(measured_suite)
+    assert path.read_bytes() == baseline_to_json(expected).encode("utf-8")
+    assert baseline_from_json(path.read_text(encoding="utf-8")) == expected
+    assert "Baseline saved to" in result.stdout
+
+
+def test_bench_save_does_not_overwrite_existing_file(tmp_path, measured_suite):
+    path = tmp_path / "existing.json"
+    original = b"existing content\n"
+    path.write_bytes(original)
+    result = runner.invoke(cli.app, ["bench", "--save", str(path)])
+
+    assert result.exit_code == 2
+    assert "Baseline save error:" in result.stderr
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("field", ["signals_preserved", "exact_recovery"])
+def test_bench_does_not_save_failed_checks(tmp_path, monkeypatch, measured_suite, field):
+    path = tmp_path / "failed.json"
+    failed_case = replace(measured_suite.results[0], **{field: False})
+    failed_suite = replace(measured_suite, results=(failed_case,), **{field: False})
+    monkeypatch.setattr(cli, "benchmark_suite", lambda cases: failed_suite)
+    result = runner.invoke(cli.app, ["bench", "--json", "--save", str(path)])
+
+    assert result.exit_code == 1
+    assert not path.exists()
+    assert json.loads(result.stdout)["saved_baseline"] is None
+
+
+def test_bench_save_filesystem_error(tmp_path, measured_suite):
+    path = tmp_path / "missing-directory" / "saved.json"
+    result = runner.invoke(cli.app, ["bench", "--save", str(path)])
+
+    assert result.exit_code == 2
+    assert "Baseline save error:" in result.stderr
+    assert "Traceback" not in result.output
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(("before", "exit_code"), [(80.0, 0), (80.1, 1)])
+def test_bench_baseline_and_save_require_full_pass(tmp_path, measured_suite, before, exit_code):
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(baseline_to_json({"case": before}), encoding="utf-8")
+    saved = tmp_path / "saved.json"
+    result = runner.invoke(
+        cli.app, ["bench", "--json", "--baseline", str(baseline), "--save", str(saved)]
+    )
+
+    assert result.exit_code == exit_code
+    data = json.loads(result.stdout)
+    assert data["comparison"]["has_regressions"] is (exit_code == 1)
+    assert saved.exists() is (exit_code == 0)
+    assert data["saved_baseline"] == (str(saved) if exit_code == 0 else None)
+    assert baseline_from_json(baseline.read_text(encoding="utf-8")) == {"case": before}
+
+
+def test_bench_save_json_remains_machine_readable_without_comparison(tmp_path, measured_suite):
+    path = tmp_path / "saved.json"
+    result = runner.invoke(cli.app, ["bench", "--json", "--save", str(path)])
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert data["saved_baseline"] == str(path)
+    assert data["comparison"] is None
+    assert data["passed"]
+    assert result.stdout == json.dumps(data, sort_keys=True, indent=2, allow_nan=False) + "\n"
