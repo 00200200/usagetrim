@@ -2869,6 +2869,12 @@ def auto_specialize_command_output(command: str, raw_output: str) -> str | None:
         if spark_res != raw_output:
             return spark_res
 
+    # Check for Gradle & Maven build logs
+    if _is_maven_gradle_command(cmd_lower) or _is_maven_gradle_output(raw_output):
+        jvm_res = filter_maven_gradle(raw_output)
+        if jvm_res != raw_output:
+            return jvm_res
+
     # Check for large or verbose JSON output
     json_result = filter_json_output(raw_output, command=command)
     if json_result is not None:
@@ -5562,5 +5568,338 @@ def author_spark_log_fixture(
                 ),
             ]
         )
+
+    return "\n".join(lines) + "\n"
+
+
+# ==============================================================================
+# Gradle & Maven Build Log Compactor for JVM Projects (Issue #79)
+# ==============================================================================
+
+_JVM_DOWNLOAD_RE = re.compile(
+    r"^(?:\[INFO\]\s+)?(?:Downloading|Downloaded|Download)\s+(?:from\s+\S+:\s+)?https?://\S+",
+    re.IGNORECASE,
+)
+_JVM_PROGRESS_RE = re.compile(
+    r"^(?:Progress\s*\(\d+\):|Transferring:\s+|>\s+(?:Download|Downloading)\s+|>\s+\d+%\s+EXECUTING)",
+    re.IGNORECASE,
+)
+_GRADLE_TASK_LINE_RE = re.compile(
+    r"^>\s+Task\s+(:[\w.:-]+)(?:\s+(UP-TO-DATE|NO-SOURCE|FROM-CACHE|SKIPPED|FAILED))?",
+)
+_MAVEN_PLUGIN_LINE_RE = re.compile(
+    r"^\[INFO\]\s+---\s+([\w.:-]+)\s+\(([^)]+)\)\s+@\s+([\w.-]+)\s+---"
+)
+_MAVEN_HEADER_SEP_RE = re.compile(r"^\[INFO\]\s+-{10,}\s*$")
+_MAVEN_NOISE_RE = re.compile(
+    r"^\[INFO\]\s+(?:Using\s+'[^']+'\s+encoding.*|Copying\s+\d+\s+resource.*|"
+    r"Changes detected\s+-\s+recompiling.*|Compiling\s+\d+\s+source\s+files?.*|"
+    r"Nothing to compile\s+-\s+all classes.*|Scanning for projects\.\.\.|"
+    r"Using auto detected provider:.*|\s*T\s+E\s+S\s+T\s+S\s*)$",
+    re.IGNORECASE,
+)
+_JVM_ERROR_OR_TRACE_RE = re.compile(
+    r"(?:\[ERROR\]|\[WARNING\]|\bFAILED\b|\bFAILURE\b|\bCOMPILATION ERROR\b|"
+    r"^\s*at\s+[\w.$]+|^\s*\.\.\.\s+\d+\s+more|^\s*Caused by:|"
+    r"^\s*e:\s+.*|^\s*w:\s+.*|^\s*error:\s+.*|^\s*\[error\]\s+.*|"
+    r"^\s*Tests run:\s+\d+.*Failures:\s+[1-9]|"
+    r"^\s*Tests run:\s+\d+.*Errors:\s+[1-9]|"
+    r"^\s*>\s+There were failing tests|"
+    r"^\s*\* What went wrong:)",
+)
+
+
+def _is_maven_gradle_command(cmd_lower: str) -> bool:
+    tokens = cmd_lower.split()
+    if not tokens:
+        return False
+    base = PurePath(tokens[0]).name.rstrip(".sh").rstrip(".bat").rstrip(".cmd")
+    if base in {"mvn", "mvnw", "gradle", "gradlew"}:
+        return True
+    return any(
+        kw in cmd_lower
+        for kw in (
+            "mvn ",
+            "mvnw ",
+            "gradle ",
+            "gradlew ",
+            "./gradlew",
+            "./mvnw",
+        )
+    )
+
+
+def _is_maven_gradle_output(raw_output: str) -> bool:
+    if not raw_output.strip():
+        return False
+    markers = (
+        "[INFO] --- maven-",
+        "[INFO] Scanning for projects...",
+        "[ERROR] COMPILATION ERROR",
+        "> Task :",
+        "BUILD SUCCESSFUL in ",
+        "BUILD FAILED in ",
+        "FAILURE: Build failed with an exception.",
+        "Downloading from central:",
+        "Downloaded from central:",
+    )
+    return any(m in raw_output for m in markers)
+
+
+def filter_maven_gradle(raw_output: str) -> str:
+    """Compact Gradle and Maven build logs for JVM projects.
+
+    - Folds artifact downloads and progress lines into compact summaries.
+    - Collapses routine/up-to-date plugin and task execution milestones into 1-line checkpoints.
+    - Preserves 100% verbatim:
+      * Compiler errors & warnings ([ERROR] /path/to/File.java:[line,col] error: ...).
+      * JUnit / TestNG test assertions, failure summaries, and Java stack traces.
+      * Build summary results (BUILD SUCCESS, BUILD FAILURE, timings).
+    """
+    if not raw_output.strip():
+        return raw_output
+
+    lines = raw_output.splitlines()
+    result: list[str] = []
+
+    downloads_count = 0
+    cached_tasks: list[str] = []
+
+    def flush_downloads():
+        nonlocal downloads_count
+        if downloads_count > 0:
+            result.append(
+                f"[UsageTrim: suppressed {downloads_count} artifact download & progress events]"
+            )
+            downloads_count = 0
+
+    def flush_cached_tasks():
+        nonlocal cached_tasks
+        if cached_tasks:
+            if len(cached_tasks) > 2:
+                sample = ", ".join(cached_tasks[:3])
+                result.append(
+                    f"[UsageTrim: {len(cached_tasks)} Gradle tasks up-to-date/cached ({sample}, ...)]"
+                )
+            else:
+                for t in cached_tasks:
+                    result.append(f"> Task {t} UP-TO-DATE")
+            cached_tasks = []
+
+    in_error_section = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Check for downloads and progress
+        if _JVM_DOWNLOAD_RE.match(stripped) or _JVM_PROGRESS_RE.match(stripped):
+            downloads_count += 1
+            continue
+
+        # Check for error or trace line (always preserve!)
+        if _JVM_ERROR_OR_TRACE_RE.search(line):
+            flush_downloads()
+            flush_cached_tasks()
+            in_error_section = True
+            result.append(line)
+            continue
+
+        # Check for Gradle task line
+        m_gradle = _GRADLE_TASK_LINE_RE.match(stripped)
+        if m_gradle:
+            flush_downloads()
+            task_name = m_gradle.group(1)
+            task_status = m_gradle.group(2) or ""
+
+            if task_status == "FAILED":
+                flush_cached_tasks()
+                result.append(line)
+            elif task_status in {"UP-TO-DATE", "NO-SOURCE", "FROM-CACHE", "SKIPPED"}:
+                cached_tasks.append(task_name)
+            else:
+                flush_cached_tasks()
+                result.append(f"> Task {task_name}")
+            continue
+
+        # Check for Maven plugin banner
+        m_maven = _MAVEN_PLUGIN_LINE_RE.match(stripped)
+        if m_maven:
+            flush_downloads()
+            flush_cached_tasks()
+            plugin_artifact = m_maven.group(1)
+            module = m_maven.group(3)
+            result.append(f"[Step] {plugin_artifact} @ {module}")
+            continue
+
+        # Suppress routine Maven info noise
+        if _MAVEN_NOISE_RE.match(stripped):
+            continue
+
+        # Keep build summary and result lines
+        if (
+            "BUILD SUCCESS" in stripped
+            or "BUILD FAILURE" in stripped
+            or "BUILD FAILED" in stripped
+            or "BUILD SUCCESSFUL" in stripped
+        ):
+            flush_downloads()
+            flush_cached_tasks()
+            result.append(line)
+            continue
+
+        if stripped.startswith("[INFO] Total time:") or stripped.startswith("[INFO] Finished at:"):
+            flush_downloads()
+            flush_cached_tasks()
+            result.append(line)
+            continue
+
+        # Suppress long separator lines unless surrounding build summary
+        if _MAVEN_HEADER_SEP_RE.match(stripped):
+            continue
+
+        # If inside error / traceback / test failure block, preserve stack lines
+        if in_error_section:
+            if stripped.startswith("[INFO]") and not _JVM_ERROR_OR_TRACE_RE.search(stripped):
+                in_error_section = False
+            else:
+                result.append(line)
+                continue
+
+        # Results summary in Maven
+        if stripped.startswith("[INFO] Results:") or stripped.startswith("[INFO] Tests run:"):
+            flush_downloads()
+            flush_cached_tasks()
+            result.append(line)
+            continue
+
+        # Default fallback: if non-empty and not routine noise
+        if stripped:
+            flush_downloads()
+            flush_cached_tasks()
+            result.append(line)
+
+    flush_downloads()
+    flush_cached_tasks()
+
+    return "\n".join(result).strip() + "\n"
+
+
+filter_jvm_build = filter_maven_gradle
+
+
+def author_maven_gradle_fixture(
+    tool: str = "maven",
+    has_error: bool = False,
+    num_downloads: int = 50,
+) -> str:
+    """Generate representative Maven or Gradle build logs for testing."""
+    lines: list[str] = []
+
+    if tool == "maven":
+        lines.extend(
+            [
+                "[INFO] Scanning for projects...",
+                "[INFO] ------------------------------------------------------------------------",
+                "[INFO] Building demo-service 1.0.0-SNAPSHOT",
+                "[INFO] ------------------------------------------------------------------------",
+            ]
+        )
+        for i in range(num_downloads):
+            lines.append(
+                f"[INFO] Downloading from central: https://repo.maven.apache.org/maven2/org/example/lib-{i}/1.0/lib-{i}-1.0.jar"
+            )
+            lines.append(
+                f"[INFO] Downloaded from central: https://repo.maven.apache.org/maven2/org/example/lib-{i}/1.0/lib-{i}-1.0.jar (150 KB at 1.2 MB/s)"
+            )
+
+        lines.extend(
+            [
+                "[INFO] --- maven-resources-plugin:3.3.1:resources (default-resources) @ demo-service ---",
+                "[INFO] Using 'UTF-8' encoding to copy filtered resources.",
+                "[INFO] Copying 3 resources from src/main/resources to target/classes",
+                "[INFO] --- maven-compiler-plugin:3.11.0:compile (default-compile) @ demo-service ---",
+                "[INFO] Changes detected - recompiling the module!",
+                "[INFO] Compiling 24 source files with javac [debug target 17] to target/classes",
+            ]
+        )
+
+        if has_error:
+            lines.extend(
+                [
+                    "[INFO] -------------------------------------------------------------",
+                    "[ERROR] COMPILATION ERROR :",
+                    "[INFO] -------------------------------------------------------------",
+                    "[ERROR] /app/src/main/java/com/example/UserService.java:[42,19] cannot find symbol",
+                    "  symbol:   variable missingRepository",
+                    "  location: class com.example.UserService",
+                    "[ERROR] /app/src/main/java/com/example/UserService.java:[58,5] ';' expected",
+                    "[INFO] 2 errors",
+                    "[INFO] -------------------------------------------------------------",
+                    "[INFO] ------------------------------------------------------------------------",
+                    "[INFO] BUILD FAILURE",
+                    "[INFO] ------------------------------------------------------------------------",
+                    "[INFO] Total time:  4.210 s",
+                    "[INFO] Finished at: 2026-10-07T14:30:00Z",
+                    "[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.11.0:compile (default-compile) on project demo-service: Compilation failure",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "[INFO] --- maven-surefire-plugin:3.2.5:test (default-test) @ demo-service ---",
+                    "[INFO] Using auto detected provider: org.apache.maven.surefire.junitplatform.JUnitPlatformProvider",
+                    "[INFO] Running com.example.UserServiceTest",
+                    "[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.45 s -- in com.example.UserServiceTest",
+                    "[INFO] Results:",
+                    "[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0",
+                    "[INFO] ------------------------------------------------------------------------",
+                    "[INFO] BUILD SUCCESS",
+                    "[INFO] ------------------------------------------------------------------------",
+                    "[INFO] Total time:  6.820 s",
+                    "[INFO] Finished at: 2026-10-07T14:30:00Z",
+                ]
+            )
+    else:  # gradle
+        for i in range(num_downloads):
+            lines.append(
+                f"Download https://plugins.gradle.org/m2/org/example/plugin-{i}/1.0/plugin-{i}-1.0.jar"
+            )
+
+        lines.extend(
+            [
+                "> Task :compileJava UP-TO-DATE",
+                "> Task :processResources NO-SOURCE",
+                "> Task :classes UP-TO-DATE",
+                "> Task :compileTestJava UP-TO-DATE",
+                "> Task :processTestResources NO-SOURCE",
+                "> Task :testClasses UP-TO-DATE",
+                "> Task :test",
+            ]
+        )
+
+        if has_error:
+            lines.extend(
+                [
+                    "com.example.CalculatorTest > testDivisionByZero() FAILED",
+                    "    java.lang.ArithmeticException: / by zero",
+                    "        at com.example.Calculator.divide(Calculator.java:14)",
+                    "        at com.example.CalculatorTest.testDivisionByZero(CalculatorTest.java:28)",
+                    "4 tests completed, 1 failed",
+                    "> Task :test FAILED",
+                    "FAILURE: Build failed with an exception.",
+                    "* What went wrong:",
+                    "Execution failed for task ':test'.",
+                    "> There were failing tests. See the report at: file:///app/build/reports/tests/test/index.html",
+                    "BUILD FAILED in 3s",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "4 tests completed, 0 failed",
+                    "BUILD SUCCESSFUL in 2s",
+                    "7 actionable tasks: 1 executed, 6 up-to-date",
+                ]
+            )
 
     return "\n".join(lines) + "\n"
