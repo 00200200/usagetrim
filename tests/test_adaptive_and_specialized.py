@@ -6,6 +6,7 @@ import pytest
 from usagetrim.core.adaptive import compress_to_budget
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.specialized import (
+    author_ansible_playbook_fixture,
     author_compiler_build_fixture,
     author_helm_install_fixture,
     author_kubectl_describe_fixture,
@@ -13,9 +14,11 @@ from usagetrim.core.specialized import (
     author_kubectl_logs_fixture,
     author_nextjs_build_and_hydration_fixture,
     author_pg_explain_analyze_fixture,
+    author_puppet_run_fixture,
     author_terraform_plan_fixture,
     author_xcodebuild_log_fixture,
     auto_specialize_command_output,
+    filter_ansible_run,
     filter_cargo_build,
     filter_cargo_test,
     filter_ci_logs,
@@ -35,6 +38,7 @@ from usagetrim.core.specialized import (
     filter_nextjs,
     filter_npm_install,
     filter_pip_install,
+    filter_puppet_run,
     filter_pyright,
     filter_ripgrep_output,
     filter_ruff,
@@ -2621,3 +2625,276 @@ def test_compiler_filters_import_and_aliases():
     assert fc1 is fc2
     assert fco1 is fco2
     assert fc1 is fco1
+
+
+def test_filter_ansible_collapses_ok_and_skipping():
+    raw = "\n".join(
+        [
+            "PLAY [webservers] **************************************************************",
+            "",
+            "TASK [Gathering Facts] *********************************************************",
+        ]
+        + [f"ok: [server-{i}]" for i in range(10)]
+        + [
+            "",
+            "TASK [Ensure optional cache is configured] *************************************",
+        ]
+        + [f"ok: [server-{i}]" for i in range(8)]
+        + [f"skipping: [server-{i}]" for i in range(8, 10)]
+        + [
+            "",
+            "TASK [Skip step across all hosts] **********************************************",
+        ]
+        + [f"skipping: [server-{i}]" for i in range(10)]
+        + [
+            "",
+            "TASK [Single node operation] ***************************************************",
+            "ok: [server-0]",
+            "",
+            "PLAY RECAP *********************************************************************",
+            "server-0 : ok=3 changed=0 unreachable=0 failed=0 skipped=1 rescued=0 ignored=0",
+        ]
+    )
+    compacted = filter_ansible_run(raw)
+    assert "TASK [Gathering Facts] - 10 hosts ok" in compacted
+    assert "TASK [Ensure optional cache is configured] - 8 hosts ok, 2 hosts skipped" in compacted
+    assert "TASK [Skip step across all hosts] - 10 hosts skipped" in compacted
+    assert "TASK [Single node operation] - 1 host ok" in compacted
+    assert (
+        "server-0 : ok=3 changed=0 unreachable=0 failed=0 skipped=1 rescued=0 ignored=0"
+        in compacted
+    )
+
+
+def test_filter_ansible_compacts_changed_lines():
+    raw = "\n".join(
+        [
+            "PLAY [webservers] **************************************************************",
+            "",
+            "TASK [Install web application dependencies] ************************************",
+            "changed: [server-1] => (item=nginx)",
+            "changed: [server-2]",
+            'changed: [server-3] => {"ansible_loop_var": "item", "changed": true, "item": "redis"}',
+            "changed: [server-4] => {",
+            '    "ansible_loop_var": "item",',
+            '    "changed": true,',
+            '    "item": "postgresql-client"',
+            "}",
+            "ok: [server-5]",
+            "ok: [server-6]",
+            "skipping: [server-7]",
+            "",
+            "PLAY RECAP *********************************************************************",
+            "server-1 : ok=0 changed=1 unreachable=0 failed=0 skipped=0 rescued=0 ignored=0",
+        ]
+    )
+    compacted = filter_ansible_run(raw)
+    assert "TASK [Install web application dependencies] - 2 hosts ok, 1 host skipped" in compacted
+    assert "changed: [server-1] => (item=nginx)" in compacted
+    assert "changed: [server-2]" in compacted
+    assert "changed: [server-3] => (item=redis)" in compacted
+    assert "changed: [server-4] => (item=postgresql-client)" in compacted
+    assert '"ansible_loop_var": "item"' not in compacted
+
+
+def test_filter_ansible_preserves_fatal_and_tracebacks_verbatim():
+    raw = "\n".join(
+        [
+            "PLAY [webservers] **************************************************************",
+            "",
+            "TASK [Verify health endpoint responds with 200] ********************************",
+            'fatal: [server-1]: FAILED! => {"changed": false, "msg": "HTTP 500 Server Error"}',
+            "Traceback (most recent call last):",
+            '  File "/usr/lib/python3/dist-packages/ansible/modules/uri.py", line 42, in main',
+            '    raise ConnectionError("Healthcheck failed with status 500")',
+            "ConnectionError: Healthcheck failed with status 500",
+            "",
+            "NO MORE HOSTS LEFT *************************************************************",
+            "",
+            "PLAY RECAP *********************************************************************",
+            "server-1 : ok=0 changed=0 unreachable=0 failed=1 skipped=0 rescued=0 ignored=0",
+        ]
+    )
+    compacted = filter_ansible_run(raw)
+    assert (
+        "TASK [Verify health endpoint responds with 200] ********************************"
+        in compacted
+    )
+    assert (
+        'fatal: [server-1]: FAILED! => {"changed": false, "msg": "HTTP 500 Server Error"}'
+        in compacted
+    )
+    assert "Traceback (most recent call last):" in compacted
+    assert (
+        '  File "/usr/lib/python3/dist-packages/ansible/modules/uri.py", line 42, in main'
+        in compacted
+    )
+    assert '    raise ConnectionError("Healthcheck failed with status 500")' in compacted
+    assert "ConnectionError: Healthcheck failed with status 500" in compacted
+
+
+def test_filter_ansible_preserves_play_recap_verbatim():
+    raw = author_ansible_playbook_fixture(num_hosts=4, num_tasks=3, has_failure=True)
+    compacted = filter_ansible_run(raw)
+    recap_start = raw.find(
+        "PLAY RECAP *********************************************************************"
+    )
+    assert recap_start != -1
+    raw_recap = raw[recap_start:]
+    assert raw_recap in compacted
+
+
+def test_filter_ansible_token_reduction_exceeds_80_percent():
+    raw = author_ansible_playbook_fixture(
+        num_hosts=15,
+        num_tasks=35,
+        has_failure=False,
+        has_changed=True,
+        has_skips=True,
+    )
+    compacted = filter_ansible_run(raw)
+    raw_tokens = count_tokens(raw).avg
+    compacted_tokens = count_tokens(compacted).avg
+    reduction = 1.0 - (compacted_tokens / raw_tokens)
+    assert reduction >= 0.80
+    assert "TASK [Gathering Facts] - 15 hosts ok" in compacted
+    assert "PLAY RECAP" in compacted
+
+
+def test_filter_puppet_collapses_routine_notices_into_checkpoints():
+    raw = "\n".join(
+        [
+            "Info: Loading facts",
+            "Info: Applying configuration version '1728318290'",
+            "Notice: /Stage[main]/Base::Packages/Package[curl]/ensure: created",
+            "Notice: /Stage[main]/Base::Packages/Package[git]/ensure: created",
+            "Notice: /Stage[main]/Base::Packages/Package[vim]/ensure: created",
+            "Notice: /Stage[main]/Nginx::Repo/Apt::Source[nginx]/ensure: present",
+            "Notice: /Stage[main]/Nginx::Service/Service[nginx]/ensure: running",
+            "Notice: Applied catalog in 4.32 seconds",
+        ]
+    )
+    compacted = filter_puppet_run(raw)
+    assert "[Checkpoint] Notice: /Stage[main] - 5 resources applied" in compacted
+    assert "Base::Packages" in compacted
+    assert "Notice: Applied catalog in 4.32 seconds" in compacted
+    assert "Package[curl]/ensure: created" not in compacted
+
+
+def test_filter_puppet_preserves_errors_and_warnings_verbatim():
+    raw = "\n".join(
+        [
+            "Info: Loading facts",
+            "Notice: /Stage[main]/Base::Packages/Package[curl]/ensure: created",
+            "Warning: /Stage[main]/Legacy::Config/File[/etc/old.conf]: Deprecated parameter",
+            "Error: /Stage[main]/Nginx::Service/Service[nginx]: Could not start Service[nginx]",
+            "Wrapped exception:",
+            "systemd[1]: Failed to start nginx.service: Unit not found.",
+            "Notice: Applied catalog in 2.10 seconds",
+        ]
+    )
+    compacted = filter_puppet_run(raw)
+    assert "[Checkpoint] Notice: /Stage[main] - 1 resource applied" in compacted
+    assert (
+        "Warning: /Stage[main]/Legacy::Config/File[/etc/old.conf]: Deprecated parameter"
+        in compacted
+    )
+    assert (
+        "Error: /Stage[main]/Nginx::Service/Service[nginx]: Could not start Service[nginx]"
+        in compacted
+    )
+    assert "Wrapped exception:" in compacted
+    assert "systemd[1]: Failed to start nginx.service: Unit not found." in compacted
+    assert "Notice: Applied catalog in 2.10 seconds" in compacted
+
+
+def test_filter_puppet_token_reduction_exceeds_80_percent():
+    raw = author_puppet_run_fixture(num_resources=40, has_warning=True, has_error=True)
+    compacted = filter_puppet_run(raw)
+    raw_tokens = count_tokens(raw).avg
+    compacted_tokens = count_tokens(compacted).avg
+    reduction = 1.0 - (compacted_tokens / raw_tokens)
+    assert reduction >= 0.80
+    assert "[Checkpoint] Notice: /Stage[main]" in compacted
+    assert "Notice: Applied catalog in 4.32 seconds" in compacted
+
+
+def test_auto_specialize_routes_ansible_and_puppet():
+    ansible_fixture = author_ansible_playbook_fixture()
+    puppet_fixture = author_puppet_run_fixture()
+
+    # Route by Ansible commands
+    assert auto_specialize_command_output("ansible all -m ping", ansible_fixture) is not None
+    assert (
+        auto_specialize_command_output("ansible-playbook -i hosts site.yml", ansible_fixture)
+        is not None
+    )
+    assert (
+        auto_specialize_command_output("ansible-galaxy install geerlingguy.nginx", ansible_fixture)
+        is not None
+    )
+    assert (
+        auto_specialize_command_output("/usr/bin/ansible-playbook site.yml", ansible_fixture)
+        is not None
+    )
+
+    # Route by Puppet commands
+    assert auto_specialize_command_output("puppet", puppet_fixture) is not None
+    assert auto_specialize_command_output("puppet apply site.pp", puppet_fixture) is not None
+    assert auto_specialize_command_output("puppet agent -t", puppet_fixture) is not None
+    assert (
+        auto_specialize_command_output("/opt/puppetlabs/bin/puppet agent", puppet_fixture)
+        is not None
+    )
+
+    # Route by output recognition
+    assert auto_specialize_command_output("bash deploy.sh", ansible_fixture) is not None
+    assert auto_specialize_command_output("bash apply.sh", puppet_fixture) is not None
+
+
+def test_ansible_puppet_filters_import_and_aliases():
+    from usagetrim.filters import (
+        author_ansible_playbook_fixture as aaf1,
+    )
+    from usagetrim.filters import (
+        author_puppet_run_fixture as apf1,
+    )
+    from usagetrim.filters import (
+        filter_ansible as fa1,
+    )
+    from usagetrim.filters import (
+        filter_ansible_run as far1,
+    )
+    from usagetrim.filters import (
+        filter_puppet as fp1,
+    )
+    from usagetrim.filters import (
+        filter_puppet_run as fpr1,
+    )
+    from usagetrim.filters.ansible import (
+        author_ansible_playbook_fixture as aaf2,
+    )
+    from usagetrim.filters.ansible import (
+        author_puppet_run_fixture as apf2,
+    )
+    from usagetrim.filters.ansible import (
+        filter_ansible as fa2,
+    )
+    from usagetrim.filters.ansible import (
+        filter_ansible_run as far2,
+    )
+    from usagetrim.filters.ansible import (
+        filter_puppet as fp2,
+    )
+    from usagetrim.filters.ansible import (
+        filter_puppet_run as fpr2,
+    )
+
+    assert fa1 is fa2
+    assert far1 is far2
+    assert fa1 is far1
+    assert fp1 is fp2
+    assert fpr1 is fpr2
+    assert fp1 is fpr1
+    assert aaf1 is aaf2
+    assert apf1 is apf2
