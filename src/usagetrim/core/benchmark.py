@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from tempfile import TemporaryDirectory
 from time import perf_counter
@@ -15,6 +15,15 @@ from usagetrim.metrics.tokenizer import count_tokens
 
 
 @dataclass(frozen=True)
+class BenchmarkCase:
+    case_id: str
+    raw_output: str
+    command: str
+    required_signals: tuple[str, ...] = ()
+    exit_code: int | None = None
+
+
+@dataclass(frozen=True)
 class BenchmarkResult:
     case_id: str
     raw_tokens: int
@@ -23,6 +32,17 @@ class BenchmarkResult:
     latency_ms: float
     signals_preserved: bool
     missing_signals: tuple[str, ...]
+    exact_recovery: bool
+
+
+@dataclass(frozen=True)
+class BenchmarkSuiteResult:
+    results: tuple[BenchmarkResult, ...]
+    raw_tokens: int
+    output_tokens: int
+    reduction_pct: float
+    latency_ms: float
+    signals_preserved: bool
     exact_recovery: bool
 
 
@@ -86,4 +106,35 @@ def benchmark_case(
         signals_preserved=not missing_signals,
         missing_signals=missing_signals,
         exact_recovery=recovered.encode("utf-8") == raw_output.encode("utf-8"),
+    )
+
+
+def benchmark_suite(cases: Iterable[BenchmarkCase]) -> BenchmarkSuiteResult:
+    """Run cases sequentially in input order and aggregate their measurements.
+
+    Reduction is calculated from token totals, not averaged case percentages.
+    Latency is the sum of measured filter times, not the suite's wall-clock time.
+    An empty suite has zero totals and reduction, and both checks pass vacuously.
+    Exceptions from benchmark_case propagate to the caller.
+    """
+    results = tuple(
+        benchmark_case(
+            case.case_id,
+            case.raw_output,
+            case.command,
+            case.required_signals,
+            exit_code=case.exit_code,
+        )
+        for case in cases
+    )
+    raw_tokens = sum(result.raw_tokens for result in results)
+    output_tokens = sum(result.output_tokens for result in results)
+    return BenchmarkSuiteResult(
+        results=results,
+        raw_tokens=raw_tokens,
+        output_tokens=output_tokens,
+        reduction_pct=100 * (raw_tokens - output_tokens) / raw_tokens if raw_tokens else 0.0,
+        latency_ms=sum(result.latency_ms for result in results),
+        signals_preserved=all(result.signals_preserved for result in results),
+        exact_recovery=all(result.exact_recovery for result in results),
     )

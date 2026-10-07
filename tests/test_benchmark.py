@@ -3,7 +3,7 @@ import os
 import pytest
 
 from usagetrim.core import benchmark
-from usagetrim.core.benchmark import benchmark_case
+from usagetrim.core.benchmark import BenchmarkCase, BenchmarkResult, benchmark_case, benchmark_suite
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.safe_filter import recovery_notice, safe_compact_output
 from usagetrim.core.specialized import auto_specialize_command_output
@@ -120,3 +120,57 @@ def test_latency_excludes_harness_notice_and_checks_exact_notice(monkeypatch, us
     assert result.latency_ms == pytest.approx(5.0 if use_safe else 2.0)
     assert result.output_tokens == count_tokens(filtered + recovery_notice(ref_id)).openai
     assert result.exact_recovery and not result.signals_preserved
+
+
+def test_suite_delegates_in_order_and_aggregates_token_totals(monkeypatch):
+    cases = (
+        BenchmarkCase("large", "large output", "cargo test", ("failure",), 1),
+        BenchmarkCase("small", "small output", "custom-tool"),
+    )
+    expected_results = (
+        BenchmarkResult("large", 900, 450, 50.0, 2.0, True, (), True),
+        BenchmarkResult("small", 100, 100, 0.0, 3.0, False, ("missing",), False),
+    )
+    calls = []
+
+    def run_case(case_id, raw_output, command, required_signals, *, exit_code):
+        calls.append((case_id, raw_output, command, required_signals, exit_code))
+        return expected_results[len(calls) - 1]
+
+    monkeypatch.setattr(benchmark, "benchmark_case", run_case)
+    result = benchmark_suite(case for case in cases)
+
+    assert calls == [
+        ("large", "large output", "cargo test", ("failure",), 1),
+        ("small", "small output", "custom-tool", (), None),
+    ]
+    assert result.results == expected_results
+    assert result.raw_tokens == 1000
+    assert result.output_tokens == 550
+    assert result.reduction_pct == 45.0
+    assert result.latency_ms == 5.0
+    assert result.signals_preserved is False
+    assert result.exact_recovery is False
+
+
+def test_empty_suite_has_zero_totals_and_passing_checks():
+    result = benchmark_suite([])
+
+    assert result.results == ()
+    assert result.raw_tokens == result.output_tokens == 0
+    assert result.reduction_pct == result.latency_ms == 0
+    assert result.signals_preserved is True
+    assert result.exact_recovery is True
+
+
+def test_suite_handles_empty_and_passthrough_cases():
+    result = benchmark_suite(
+        [BenchmarkCase("empty", "", "custom-tool"), BenchmarkCase("text", "ok\n", "custom-tool")]
+    )
+
+    assert tuple(item.case_id for item in result.results) == ("empty", "text")
+    assert result.raw_tokens == count_tokens("ok\n").openai
+    assert result.output_tokens == result.raw_tokens
+    assert result.reduction_pct == 0
+    assert result.signals_preserved is True
+    assert result.exact_recovery is True
