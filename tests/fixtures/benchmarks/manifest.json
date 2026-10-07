@@ -1,0 +1,23 @@
+[
+  {
+    "id": "pytest-failure",
+    "file": "pytest-failure.log",
+    "command": "pytest -v",
+    "exit_code": 1,
+    "required_signals": ["AssertionError", "FAILED tests/test_api.py::test_failure"]
+  },
+  {
+    "id": "cargo-success",
+    "file": "cargo-success.log",
+    "command": "cargo test",
+    "exit_code": 0,
+    "required_signals": ["test result: ok. 8 passed; 0 failed"]
+  },
+  {
+    "id": "passthrough",
+    "file": "passthrough.log",
+    "command": "custom-tool",
+    "exit_code": null,
+    "required_signals": ["No changes required."]
+  }
+]

@@ -1,0 +1,10 @@
+running 8 tests
+test api::accepts_request ... ok
+test api::rejects_invalid_request ... ok
+test api::returns_response ... ok
+test api::handles_timeout ... ok
+test api::handles_retry ... ok
+test api::validates_headers ... ok
+test api::validates_body ... ok
+test api::closes_connection ... ok
+test result: ok. 8 passed; 0 failed
