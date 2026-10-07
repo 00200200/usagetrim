@@ -8,6 +8,11 @@ from usagetrim.filters.compiler import (
     filter_compiler,
     filter_compiler_output,
 )
+from usagetrim.filters.maven_gradle import (
+    author_maven_gradle_fixture,
+    filter_jvm_build,
+    filter_maven_gradle,
+)
 from usagetrim.filters.spark import (
     author_spark_log_fixture,
     filter_spark,
@@ -22,6 +27,9 @@ __all__ = [
     "filter_compiler_output",
     "filter_compiler",
     "author_compiler_build_fixture",
+    "filter_maven_gradle",
+    "filter_jvm_build",
+    "author_maven_gradle_fixture",
     "filter_spark",
     "filter_spark_log",
     "author_spark_log_fixture",
