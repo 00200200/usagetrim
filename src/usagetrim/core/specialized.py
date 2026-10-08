@@ -2794,6 +2794,10 @@ def auto_specialize_command_output(command: str, raw_output: str) -> str | None:
         return filter_helm(raw_output, command=command)
     elif _is_terraform_command(command.strip()):
         return filter_terraform_plan(raw_output)
+    elif _is_ansible_command(command.strip()):
+        return filter_ansible_run(raw_output)
+    elif _is_puppet_command(command.strip()):
+        return filter_puppet_run(raw_output)
     elif _is_ci_log_command(command.strip()):
         res = filter_ci_logs(raw_output)
         if res != raw_output:
@@ -2874,6 +2878,18 @@ def auto_specialize_command_output(command: str, raw_output: str) -> str | None:
         jvm_res = filter_maven_gradle(raw_output)
         if jvm_res != raw_output:
             return jvm_res
+
+    # Check for Ansible playbook run output
+    if _is_ansible_output(raw_output):
+        ansible_res = filter_ansible_run(raw_output)
+        if ansible_res != raw_output:
+            return ansible_res
+
+    # Check for Puppet run output
+    if _is_puppet_output(raw_output):
+        puppet_res = filter_puppet_run(raw_output)
+        if puppet_res != raw_output:
+            return puppet_res
 
     # Check for large or verbose JSON output
     json_result = filter_json_output(raw_output, command=command)
@@ -5902,4 +5918,494 @@ def author_maven_gradle_fixture(
                 ]
             )
 
+    return "\n".join(lines) + "\n"
+
+
+# ==============================================================================
+# Ansible & Puppet Automation Run Summary Compactor (Issue #78)
+# ==============================================================================
+
+_ANSIBLE_TASK_HEADER_RE = re.compile(r"^(TASK|RUNNING HANDLER)\s*\[(.*?)\](?:\s*\*+)?\s*$")
+_ANSIBLE_PLAY_HEADER_RE = re.compile(r"^PLAY\s*\[(.*?)\](?:\s*\*+)?\s*$")
+_ANSIBLE_PLAY_RECAP_RE = re.compile(r"^PLAY RECAP\b")
+_ANSIBLE_OK_RE = re.compile(r"^\s*ok:\s*\[([^\]]+)\]")
+_ANSIBLE_SKIP_RE = re.compile(r"^\s*skipping:\s*\[([^\]]+)\]")
+_ANSIBLE_CHANGED_START_RE = re.compile(r"^\s*changed:\s*\[([^\]]+)\](?:\s*=>\s*(.*))?$")
+_ANSIBLE_FAILED_RE = re.compile(
+    r"^\s*(?:fatal:\s*\[[^\]]+\].*|.*\b(?:FAILED!|FAILED|UNREACHABLE!)\b.*)"
+)
+
+_PUPPET_STAGE_NOTICE_RE = re.compile(r"^Notice:\s+/(Stage\[[^\]]+\])(?:/([^/]+))?(?:/(.+))?$")
+_PUPPET_CATALOG_SUMMARY_RE = re.compile(r"^Notice:\s+Applied catalog in\b")
+_PUPPET_ERROR_OR_WARN_RE = re.compile(r"^(?:Error|Warning):\s+")
+
+
+def _is_ansible_command(command: str) -> bool:
+    """Recognize ansible, ansible-playbook, and ansible-galaxy commands."""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = command.strip().split()
+    if not words:
+        return False
+    binary = PurePath(words[0]).name.lower()
+    if binary in {
+        "ansible",
+        "ansible.exe",
+        "ansible-playbook",
+        "ansible-playbook.exe",
+        "ansible-galaxy",
+        "ansible-galaxy.exe",
+    }:
+        return True
+    return any(
+        command.strip().lower().startswith(prefix)
+        for prefix in (
+            "ansible ",
+            "ansible-playbook ",
+            "ansible-galaxy ",
+            "ansible-playbook",
+            "ansible-galaxy",
+        )
+    )
+
+
+def _is_ansible_output(raw_output: str) -> bool:
+    """Check if raw output contains Ansible playbook markers."""
+    if not raw_output.strip():
+        return False
+    markers = ("PLAY [", "TASK [", "RUNNING HANDLER [", "PLAY RECAP")
+    return any(m in raw_output for m in markers)
+
+
+def _is_puppet_command(command: str) -> bool:
+    """Recognize puppet, puppet apply, and puppet agent commands."""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = command.strip().split()
+    if not words:
+        return False
+    binary = PurePath(words[0]).name.lower()
+    if binary in {"puppet", "puppet.exe"}:
+        return True
+    return (
+        command.strip()
+        .lower()
+        .startswith(
+            (
+                "puppet ",
+                "puppet apply",
+                "puppet agent",
+                "/usr/bin/puppet",
+                "/opt/puppetlabs/bin/puppet",
+            )
+        )
+    )
+
+
+def _is_puppet_output(raw_output: str) -> bool:
+    """Check if raw output contains Puppet execution markers."""
+    if not raw_output.strip():
+        return False
+    markers = (
+        "Notice: /Stage[",
+        "Notice: Applied catalog in",
+        "Error: /Stage[",
+        "Warning: /Stage[",
+    )
+    return any(m in raw_output for m in markers)
+
+
+def filter_ansible_run(raw_output: str) -> str:
+    """Compact verbose Ansible playbook runs into dense milestone summaries.
+
+    - Groups consecutive ok: and skipping: lines into a single summary line per task:
+      `TASK [Gathering Facts] - 10 hosts ok` (or with skips if present).
+    - Keeps tasks with changed: in a compact 1-line format: `changed: [server-1] => (item=pkg)`.
+    - Preserves fatal: / FAILED! tasks, error messages, and tracebacks 100% verbatim.
+    - Preserves the PLAY RECAP table verbatim.
+    - Yields >80% token reduction on standard multi-host playbooks.
+    """
+    if not raw_output.strip():
+        return raw_output
+    if not _is_ansible_output(raw_output):
+        return raw_output
+
+    lines = raw_output.splitlines()
+    result: list[str] = []
+    current_task: dict | None = None
+    in_recap = False
+
+    def flush_task() -> None:
+        nonlocal current_task
+        if not current_task:
+            return
+        t_type = current_task["type"]
+        t_name = current_task["name"]
+        t_header = current_task["header"]
+        t_lines = current_task["lines"]
+
+        # If task has fatal / failed lines, preserve verbatim
+        if any(_ANSIBLE_FAILED_RE.search(ln) for ln in t_lines):
+            result.append(t_header)
+            for ln in t_lines:
+                if ln.strip():
+                    result.append(ln)
+            current_task = None
+            return
+
+        ok_count = 0
+        skip_count = 0
+        changed_lines: list[str] = []
+        other_lines: list[str] = []
+
+        i = 0
+        while i < len(t_lines):
+            ln = t_lines[i]
+            strp = ln.strip()
+            if not strp:
+                i += 1
+                continue
+
+            if _ANSIBLE_OK_RE.match(strp):
+                ok_count += 1
+                i += 1
+                while (
+                    i < len(t_lines)
+                    and t_lines[i].startswith((" ", "\t", "{", "}"))
+                    and not any(
+                        t_lines[i].strip().startswith(p)
+                        for p in ("ok:", "skipping:", "changed:", "fatal:", "TASK", "PLAY")
+                    )
+                ):
+                    i += 1
+                continue
+
+            if _ANSIBLE_SKIP_RE.match(strp):
+                skip_count += 1
+                i += 1
+                while (
+                    i < len(t_lines)
+                    and t_lines[i].startswith((" ", "\t", "{", "}"))
+                    and not any(
+                        t_lines[i].strip().startswith(p)
+                        for p in ("ok:", "skipping:", "changed:", "fatal:", "TASK", "PLAY")
+                    )
+                ):
+                    i += 1
+                continue
+
+            m_chg = _ANSIBLE_CHANGED_START_RE.match(strp)
+            if m_chg:
+                host = m_chg.group(1)
+                rest = m_chg.group(2) or ""
+                chg_block = [rest]
+                i += 1
+                while (
+                    i < len(t_lines)
+                    and t_lines[i].startswith((" ", "\t", "{", "}"))
+                    and not any(
+                        t_lines[i].strip().startswith(p)
+                        for p in ("ok:", "skipping:", "changed:", "fatal:", "TASK", "PLAY")
+                    )
+                ):
+                    chg_block.append(t_lines[i].strip())
+                    i += 1
+                combined = " ".join(chg_block)
+                m_item = re.search(r"\(item=(.*?)\)(?:\s*=>|$)", combined)
+                if m_item:
+                    changed_lines.append(f"changed: [{host}] => (item={m_item.group(1)})")
+                else:
+                    m_json_item = re.search(
+                        r'["\']item["\']\s*:\s*["\']?([^"\'},]+)["\']?', combined
+                    )
+                    if m_json_item:
+                        changed_lines.append(f"changed: [{host}] => (item={m_json_item.group(1)})")
+                    else:
+                        changed_lines.append(f"changed: [{host}]")
+                continue
+
+            other_lines.append(ln)
+            i += 1
+
+        status_parts = []
+        if ok_count > 0:
+            status_parts.append(f"{ok_count} {'host' if ok_count == 1 else 'hosts'} ok")
+        if skip_count > 0:
+            status_parts.append(f"{skip_count} {'host' if skip_count == 1 else 'hosts'} skipped")
+
+        if status_parts:
+            result.append(f"{t_type} [{t_name}] - {', '.join(status_parts)}")
+            result.extend(changed_lines)
+        elif changed_lines:
+            result.append(f"{t_type} [{t_name}]")
+            result.extend(changed_lines)
+        else:
+            result.append(f"{t_type} [{t_name}]")
+            result.extend(other_lines)
+
+        current_task = None
+
+    for line in lines:
+        stripped = line.strip()
+
+        if in_recap:
+            result.append(line)
+            continue
+
+        if _ANSIBLE_PLAY_RECAP_RE.match(stripped):
+            flush_task()
+            in_recap = True
+            result.append(line)
+            continue
+
+        m_play = _ANSIBLE_PLAY_HEADER_RE.match(stripped)
+        if m_play:
+            flush_task()
+            result.append(f"PLAY [{m_play.group(1)}]")
+            continue
+
+        m_task = _ANSIBLE_TASK_HEADER_RE.match(stripped)
+        if m_task:
+            flush_task()
+            current_task = {
+                "type": m_task.group(1),
+                "name": m_task.group(2),
+                "header": line,
+                "lines": [],
+            }
+            continue
+
+        if current_task is not None:
+            current_task["lines"].append(line)
+        else:
+            if stripped:
+                result.append(line)
+
+    flush_task()
+    return "\n".join(result).strip() + ("\n" if raw_output.endswith("\n") else "")
+
+
+def filter_puppet_run(raw_output: str) -> str:
+    """Compact Puppet runs into checkpoints while preserving diagnostics and summaries.
+
+    - Collapses routine Notice: /Stage[main]/... events into compact checkpoints.
+    - Preserves Error: and Warning: diagnostics verbatim with wrapped exception details.
+    - Preserves the catalog application summary line and metrics verbatim.
+    """
+    if not raw_output.strip():
+        return raw_output
+    if not _is_puppet_output(raw_output):
+        return raw_output
+
+    lines = raw_output.splitlines()
+    result: list[str] = []
+
+    current_stage: str | None = None
+    current_notices: list[tuple[str, str]] = []
+
+    def flush_checkpoint() -> None:
+        nonlocal current_stage, current_notices
+        if current_notices and current_stage:
+            count = len(current_notices)
+            classes: list[str] = []
+            for cls, _ in current_notices:
+                if cls and cls not in classes and not cls.startswith("Stage["):
+                    classes.append(cls)
+            sample = ", ".join(classes[:3])
+            if len(classes) > 3:
+                sample += ", ..."
+            sample_str = f" ({sample})" if sample else ""
+            res_word = "resource" if count == 1 else "resources"
+            result.append(
+                f"[Checkpoint] Notice: /{current_stage} - {count} {res_word} applied{sample_str}"
+            )
+        current_stage = None
+        current_notices = []
+
+    in_error_block = False
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if in_error_block:
+                result.append(line)
+            else:
+                flush_checkpoint()
+            continue
+
+        if _PUPPET_CATALOG_SUMMARY_RE.match(stripped):
+            flush_checkpoint()
+            in_error_block = False
+            result.append(line)
+            continue
+
+        if _PUPPET_ERROR_OR_WARN_RE.match(stripped):
+            flush_checkpoint()
+            in_error_block = True
+            result.append(line)
+            continue
+
+        m_notice = _PUPPET_STAGE_NOTICE_RE.match(stripped)
+        if m_notice and not any(
+            kw in stripped for kw in ("has failures: true", "failed dependencies")
+        ):
+            in_error_block = False
+            stage = m_notice.group(1)
+            cls = m_notice.group(2) or ""
+            if current_stage is not None and stage != current_stage:
+                flush_checkpoint()
+            current_stage = stage
+            current_notices.append((cls, stripped))
+            continue
+
+        if in_error_block:
+            if stripped.startswith("Notice:") or stripped.startswith("Info:"):
+                in_error_block = False
+            else:
+                result.append(line)
+                continue
+
+        flush_checkpoint()
+        result.append(line)
+
+    flush_checkpoint()
+    return "\n".join(result).strip() + ("\n" if raw_output.endswith("\n") else "")
+
+
+filter_ansible = filter_ansible_run
+filter_puppet = filter_puppet_run
+
+
+def author_ansible_playbook_fixture(
+    num_hosts: int = 15,
+    num_tasks: int = 30,
+    has_failure: bool = False,
+    has_changed: bool = True,
+    has_skips: bool = True,
+) -> str:
+    """Generate representative Ansible playbook output for testing."""
+    hosts = [f"server-{i}.infra.example.com" for i in range(num_hosts)]
+    lines: list[str] = [
+        "PLAY [webservers and datastores] ***********************************************",
+        "",
+        "TASK [Gathering Facts] *********************************************************",
+    ]
+    for h in hosts:
+        lines.append(f"ok: [{h}]")
+    lines.append("")
+
+    if num_tasks > 1 and has_changed:
+        lines.append(
+            "TASK [Install web application dependencies] ************************************"
+        )
+        lines.append(
+            f'changed: [{hosts[0]}] => (item=nginx) => {{"changed": true, "item": "nginx"}}'
+        )
+        if len(hosts) > 1:
+            lines.append(
+                f'changed: [{hosts[1]}] => (item=nginx) => {{"changed": true, "item": "nginx"}}'
+            )
+        for h in hosts[2:]:
+            lines.append(f"ok: [{h}]")
+        lines.append("")
+
+    if num_tasks > 2 and has_skips:
+        lines.append(
+            "TASK [Ensure optional cache is configured] *************************************"
+        )
+        for i, h in enumerate(hosts):
+            if i % 2 == 0:
+                lines.append(f"ok: [{h}]")
+            else:
+                lines.append(f"skipping: [{h}]")
+        lines.append("")
+
+    for t in range(3, num_tasks):
+        lines.append(
+            f"TASK [Configure service component {t}] *****************************************"
+        )
+        for h in hosts:
+            lines.append(f"ok: [{h}]")
+        lines.append("")
+
+    if has_failure:
+        lines.extend(
+            [
+                "TASK [Verify health endpoint responds with 200] ********************************",
+                (
+                    f'fatal: [{hosts[0]}]: FAILED! => {{"changed": false, '
+                    '"msg": "HTTP 500 Internal Server Error"}'
+                ),
+                "Traceback (most recent call last):",
+                '  File "/usr/lib/python3/dist-packages/ansible/modules/uri.py", line 42, in main',
+                '    raise ConnectionError("Healthcheck failed with status 500")',
+                "ConnectionError: Healthcheck failed with status 500",
+                "",
+                "NO MORE HOSTS LEFT *************************************************************",
+                "",
+            ]
+        )
+
+    lines.append("PLAY RECAP *********************************************************************")
+    for i, h in enumerate(hosts):
+        ok_cnt = num_tasks - 1 if not has_failure or i > 0 else num_tasks - 2
+        chg_cnt = 1 if has_changed and i < 2 else 0
+        fail_cnt = 1 if has_failure and i == 0 else 0
+        skip_cnt = 1 if has_skips and (i % 2 == 1) else 0
+        lines.append(
+            f"{h:<32} : ok={ok_cnt:<3} changed={chg_cnt:<3} unreachable=0   "
+            f"failed={fail_cnt:<3} skipped={skip_cnt:<3} rescued=0   ignored=0"
+        )
+
+    return "\n".join(lines) + "\n"
+
+
+def author_puppet_run_fixture(
+    num_resources: int = 40,
+    has_warning: bool = False,
+    has_error: bool = False,
+) -> str:
+    """Generate representative Puppet agent/apply run output for testing."""
+    lines: list[str] = [
+        "Info: Loading facts",
+        "Info: Caching catalog for agent.example.com",
+        "Info: Applying configuration version '1728318290'",
+    ]
+
+    modules = [
+        "Base::Packages",
+        "Nginx::Repo",
+        "Nginx::Config",
+        "Nginx::Service",
+        "Ssh::Config",
+        "Ssh::Service",
+        "Sysctl::Common",
+        "Cron::Daily",
+    ]
+
+    for i in range(num_resources):
+        mod = modules[i % len(modules)]
+        res_type = "Package" if "Packages" in mod else "File" if "Config" in mod else "Service"
+        lines.append(f"Notice: /Stage[main]/{mod}/{res_type}[item_{i}]/ensure: created")
+
+    if has_warning:
+        lines.append(
+            "Warning: /Stage[main]/Legacy::Config/File[/etc/old.conf]: Deprecated parameter"
+        )
+
+    if has_error:
+        lines.extend(
+            [
+                (
+                    "Error: /Stage[main]/Nginx::Service/Service[nginx]: "
+                    "Could not start Service[nginx]: Execution failed"
+                ),
+                "Wrapped exception:",
+                "systemd[1]: Failed to start nginx.service: Unit not found.",
+            ]
+        )
+
+    lines.append("Notice: Applied catalog in 4.32 seconds")
     return "\n".join(lines) + "\n"

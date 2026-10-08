@@ -3,6 +3,14 @@
 from __future__ import annotations
 
 from usagetrim.filters.android import filter_android, filter_android_logcat
+from usagetrim.filters.ansible import (
+    author_ansible_playbook_fixture,
+    author_puppet_run_fixture,
+    filter_ansible,
+    filter_ansible_run,
+    filter_puppet,
+    filter_puppet_run,
+)
 from usagetrim.filters.compiler import (
     author_compiler_build_fixture,
     filter_compiler,
@@ -33,4 +41,10 @@ __all__ = [
     "filter_spark",
     "filter_spark_log",
     "author_spark_log_fixture",
+    "filter_ansible",
+    "filter_ansible_run",
+    "filter_puppet",
+    "filter_puppet_run",
+    "author_ansible_playbook_fixture",
+    "author_puppet_run_fixture",
 ]
