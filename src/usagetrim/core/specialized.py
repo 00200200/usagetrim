@@ -8,7 +8,11 @@ from pathlib import PurePath
 
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.diff_slimmer import slim_git_diff
-from usagetrim.core.json_slimmer import slim_json, slim_json_data
+from usagetrim.core.json_slimmer import (
+    filter_rest_response,
+    slim_json,
+    slim_json_data,
+)
 from usagetrim.core.spill import spill_large_output
 
 # `git log` indents commit messages by exactly four spaces. Patch bodies (-p) and
@@ -2116,6 +2120,9 @@ def filter_curl_http(raw_output: str) -> str:
         result.append(f"< [... {header_count} routine response headers collapsed ...]")
 
     body_text = "\n".join(result)
+    rest_compact = filter_rest_response(body_text)
+    if len(rest_compact) < len(body_text) * 0.9:
+        return rest_compact + "\n" if raw_output.endswith("\n") else rest_compact
     return body_text + "\n" if raw_output.endswith("\n") else body_text
 
 
