@@ -21,6 +21,10 @@ from usagetrim.filters.maven_gradle import (
     filter_jvm_build,
     filter_maven_gradle,
 )
+from usagetrim.filters.rest import (
+    filter_har_log,
+    filter_rest_response,
+)
 from usagetrim.filters.spark import (
     author_spark_log_fixture,
     filter_spark,
@@ -47,4 +51,6 @@ __all__ = [
     "filter_puppet_run",
     "author_ansible_playbook_fixture",
     "author_puppet_run_fixture",
+    "filter_rest_response",
+    "filter_har_log",
 ]
