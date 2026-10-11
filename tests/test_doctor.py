@@ -4,6 +4,9 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
+import time
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +15,7 @@ import pytest
 from usagetrim.core import doctor
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.doctor import (
+    McpClient,
     check_cache_db,
     check_chatgpt_desktop,
     check_claude_desktop_mcp,
@@ -22,6 +26,10 @@ from usagetrim.core.doctor import (
     configure_cursor_mcp,
     configure_shell_alias,
     configure_windsurf_mcp,
+    probe_mcp_handshake,
+    probe_server_entry,
+    repair_client,
+    repair_json_text,
     run_all_diagnostics,
 )
 
@@ -404,3 +412,357 @@ def test_windsurf_disabled_or_malformed_entry_is_not_reported_ready(tmp_path, mo
     target.write_text(json.dumps({"mcpServers": {"usagetrim": entry}}))
     monkeypatch.setattr(doctor, "get_windsurf_mcp_config_path", lambda: target)
     assert check_windsurf_mcp().status == "warning"
+
+
+@pytest.mark.parametrize(
+    "raw, removed_comments",
+    [
+        ('{"mcpServers": {"usagetrim": {"command": "x",}},}', False),
+        ('{"a": [1, 2, ],}', False),
+        ('\ufeff{"a": 1}', False),
+        ('{\n  // comment\n  "a": 1, /* block */\n}', True),
+    ],
+)
+def test_repair_json_text_fixes_unambiguous_damage(raw, removed_comments):
+    repaired = repair_json_text(raw)
+    assert repaired is not None
+    assert isinstance(json.loads(repaired.text), dict)
+    assert repaired.removed_comments is removed_comments
+
+
+def test_repair_json_text_keeps_string_contents():
+    raw = '{"a": "x,}", "b": "// not a comment",}'
+    repaired = repair_json_text(raw)
+    assert json.loads(repaired.text) == {"a": "x,}", "b": "// not a comment"}
+    assert repaired.removed_comments is False
+
+
+@pytest.mark.parametrize("raw", ["{bad json", "[1, 2,]", '{"a": 1 /* open', '{"a" 1}'])
+def test_repair_json_text_refuses_to_guess(raw):
+    assert repair_json_text(raw) is None
+
+
+def _json_client(target):
+    return McpClient("Cursor", lambda: target, "json")
+
+
+def _codex_client(target):
+    return McpClient("Codex", lambda: target, "toml")
+
+
+def test_repair_client_fixes_syntax_and_stale_path_with_backup(tmp_path, local_install):
+    target = tmp_path / "mcp.json"
+    stale_config = (
+        '{"theme": "dark", "mcpServers": {'
+        '"other": {"command": "other"},'
+        '"usagetrim": {"command": "/old/venv/bin/usagetrim",'
+        ' "args": ["mcp", "--profile", "coding"], "env": {"LOCAL": "kept"}},'
+        "},}"
+    )
+    target.write_text(stale_config)
+
+    report = repair_client(_json_client(target), apply=True)
+
+    assert report.error is None
+    assert report.actions[0] == "repaired JSON syntax"
+    assert "stale command" in report.actions[1]
+    repaired = json.loads(target.read_text())
+    assert repaired["theme"] == "dark"
+    assert repaired["mcpServers"]["other"] == {"command": "other"}
+    assert repaired["mcpServers"]["usagetrim"] == {
+        "command": str(local_install),
+        "args": ["mcp", "--profile", "coding"],
+        "env": {"LOCAL": "kept"},
+    }
+    backups = list(tmp_path.glob("mcp.json.pre-usagetrim-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text() == stale_config
+
+    assert repair_client(_json_client(target), apply=True).actions == []
+    assert list(tmp_path.glob("mcp.json.pre-usagetrim-*")) == backups
+
+
+def test_repair_client_dry_run_writes_nothing(tmp_path, local_install):
+    target = tmp_path / "mcp.json"
+    raw = '{"mcpServers": {"usagetrim": {"command": "/old/usagetrim"}},}'
+    target.write_text(raw)
+    report = repair_client(_json_client(target), apply=False)
+    assert report.actions and not report.applied
+    assert target.read_text() == raw
+    assert list(tmp_path.iterdir()) == [target]
+
+
+def test_repair_client_leaves_unrepairable_config_untouched(tmp_path, local_install):
+    target = tmp_path / "mcp.json"
+    target.write_text("{bad json")
+    report = repair_client(_json_client(target), apply=True)
+    assert "cannot be repaired" in report.error
+    assert report.actions == []
+    assert target.read_text() == "{bad json"
+    assert list(tmp_path.iterdir()) == [target]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"mcpServers": {"other": {"command": "other"},},}',
+        '{\n  // keep my notes\n  "mcpServers": {}\n}',
+    ],
+)
+def test_repair_client_leaves_configs_without_usagetrim_alone(tmp_path, local_install, raw):
+    target = tmp_path / "mcp.json"
+    target.write_text(raw)
+    report = repair_client(_json_client(target), apply=True)
+    assert report.actions == [] and report.error is None
+    assert target.read_text() == raw
+
+
+def test_repair_client_announces_removed_comments(tmp_path, local_install):
+    target = tmp_path / "mcp.json"
+    target.write_text(
+        '{\n  // note\n  "mcpServers": {"usagetrim": {"command": "/old/usagetrim"}}\n}'
+    )
+    report = repair_client(_json_client(target), apply=False)
+    assert report.actions[0] == "repaired JSON syntax (comments removed)"
+
+
+@pytest.mark.parametrize(
+    "command, args, stale",
+    [
+        ("~/bin/usagetrim", ["mcp"], False),
+        ("${userHome}/bin/usagetrim", ["mcp"], False),
+        ("uvx", ["usagetrim", "mcp"], True),
+        ("missing-from-path", ["mcp"], True),
+        ("", ["mcp"], True),
+    ],
+)
+def test_stale_command_detection(tmp_path, monkeypatch, command, args, stale):
+    executable = tmp_path / "bin" / "usagetrim"
+    monkeypatch.setattr(
+        doctor.shutil, "which", lambda name: str(executable) if name == "usagetrim" else None
+    )
+    target = tmp_path / "mcp.json"
+    target.write_text(json.dumps({"mcpServers": {"usagetrim": {"command": command, "args": args}}}))
+    report = repair_client(_json_client(target), apply=True)
+    assert bool(report.actions) is stale
+    expected = str(executable) if stale else command
+    assert json.loads(target.read_text())["mcpServers"]["usagetrim"]["command"] == expected
+
+
+def test_repair_client_ignores_missing_config(tmp_path, local_install):
+    report = repair_client(_json_client(tmp_path / "absent.json"), apply=True)
+    assert report.actions == [] and report.error is None and report.server_entry is None
+    assert not (tmp_path / "absent.json").exists()
+
+
+def test_repair_client_keeps_working_and_remote_entries(tmp_path, local_install):
+    local_install.parent.mkdir(parents=True)
+    local_install.write_text("")
+    os.chmod(local_install, 0o755)
+    target = tmp_path / "mcp.json"
+    target.write_text(
+        json.dumps({"mcpServers": {"usagetrim": {"command": str(local_install), "args": ["mcp"]}}})
+    )
+    assert repair_client(_json_client(target), apply=True).actions == []
+    target.write_text('{"mcpServers": {"usagetrim": {"url": "https://example.invalid/mcp"}}}')
+    assert repair_client(_json_client(target), apply=True).actions == []
+
+
+def test_repair_codex_rebuilds_broken_usagetrim_table(tmp_path, local_install):
+    target = tmp_path / "config.toml"
+    raw = (
+        'model = "o3"\n\n'
+        "[mcp_servers.other]\n"
+        'command = "other"\n\n'
+        "[mcp_servers.usagetrim]\n"
+        'command = "/old/venv/bin/usagetrim"\n'
+        'args = ["mcp", "--profile", "desktop"\n'
+    )
+    target.write_text(raw)
+    report = repair_client(_codex_client(target), apply=True)
+    assert report.error is None
+    assert report.actions == ["rebuilt invalid [mcp_servers.usagetrim] table"]
+    parsed = tomllib.loads(target.read_text())
+    assert parsed["model"] == "o3"
+    assert parsed["mcp_servers"]["other"] == {"command": "other"}
+    assert parsed["mcp_servers"]["usagetrim"] == {
+        "command": str(local_install),
+        "args": ["mcp", "--profile", "desktop"],
+    }
+    assert next(tmp_path.glob("config.toml.pre-usagetrim-*")).read_text() == raw
+
+
+def test_repair_codex_replaces_stale_command_and_keeps_env(tmp_path, local_install):
+    target = tmp_path / "config.toml"
+    target.write_text(
+        "[mcp_servers.usagetrim]\n"
+        'command = "/old/venv/bin/usagetrim"\n'
+        'args = ["mcp"]\n\n'
+        "[mcp_servers.usagetrim.env]\n"
+        'TOKEN = "kept"\n'
+    )
+    report = repair_client(_codex_client(target), apply=True)
+    assert "stale command" in report.actions[0]
+    server = tomllib.loads(target.read_text())["mcp_servers"]["usagetrim"]
+    assert server == {"command": str(local_install), "args": ["mcp"], "env": {"TOKEN": "kept"}}
+
+
+def test_repair_codex_keeps_neighbour_tables_comments_and_extra_keys(tmp_path, local_install):
+    target = tmp_path / "config.toml"
+    target.write_text(
+        "[mcp_servers.usagetrim]\n"
+        'command = "/old/venv/bin/usagetrim"\n'
+        "args = ['mcp', '--profile', 'coding']\n"
+        "enabled = false\n"
+        "startup_timeout_sec = 20\n"
+        '"odd.key" = true\n\n'
+        "[mcp_servers.usagetrim.env]\n"
+        'A = "1"\n\n'
+        "# comment describing the dev server\n"
+        "[mcp_servers.usagetrim-dev]\n"
+        'command = "dev"\n'
+    )
+    report = repair_client(_codex_client(target), apply=True)
+    assert report.error is None and "stale command" in report.actions[0]
+    content = target.read_text()
+    assert "# comment describing the dev server\n[mcp_servers.usagetrim-dev]" in content
+    servers = tomllib.loads(content)["mcp_servers"]
+    assert servers["usagetrim-dev"] == {"command": "dev"}
+    assert servers["usagetrim"] == {
+        "command": str(local_install),
+        "args": ["mcp", "--profile", "coding"],
+        "enabled": False,
+        "startup_timeout_sec": 20,
+        "odd.key": True,
+        "env": {"A": "1"},
+    }
+
+
+def test_configure_codex_keeps_neighbour_server_table(tmp_path, local_install):
+    target = tmp_path / "config.toml"
+    target.write_text(
+        '[mcp_servers.usagetrim]\ncommand = "old"\n\n[mcp_servers.usagetrim-dev]\ncommand = "dev"\n'
+    )
+    assert doctor.configure_codex_mcp(target)[0]
+    servers = tomllib.loads(target.read_text())["mcp_servers"]
+    assert servers["usagetrim-dev"] == {"command": "dev"}
+    assert servers["usagetrim"]["command"] == str(local_install)
+
+
+def test_repair_codex_rebuild_keeps_single_quoted_profile(tmp_path, local_install):
+    target = tmp_path / "config.toml"
+    target.write_text(
+        "[mcp_servers.usagetrim]\ncommand = 'old'\nargs = ['mcp', '--profile', 'coding'\n"
+    )
+    report = repair_client(_codex_client(target), apply=True)
+    assert report.error is None
+    server = tomllib.loads(target.read_text())["mcp_servers"]["usagetrim"]
+    assert server["args"] == ["mcp", "--profile", "coding"]
+
+
+@pytest.mark.parametrize(
+    "broken_table",
+    [
+        '[mcp_servers.usagetrim]\ncommand = "old"\nargs = ["mcp"\n\n[mcp_servers.usagetrim.env]\nA = "1"\n',
+        '[mcp_servers.usagetrim]\ncommand = "old"\nenabled = false\nargs = ["mcp"\n',
+    ],
+)
+def test_repair_codex_refuses_rebuild_that_would_lose_settings(
+    tmp_path, local_install, broken_table
+):
+    target = tmp_path / "config.toml"
+    target.write_text(broken_table)
+    report = repair_client(_codex_client(target), apply=True)
+    assert "fix it manually" in report.error
+    assert target.read_text() == broken_table
+    assert list(tmp_path.iterdir()) == [target]
+
+
+def test_repair_codex_refuses_errors_outside_usagetrim_table(tmp_path, local_install):
+    target = tmp_path / "config.toml"
+    raw = 'model = \n[mcp_servers.usagetrim]\ncommand = "/old/usagetrim"\n'
+    target.write_text(raw)
+    report = repair_client(_codex_client(target), apply=True)
+    assert "outside UsageTrim's table" in report.error
+    assert target.read_text() == raw
+    assert list(tmp_path.iterdir()) == [target]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_repair_client_makes_wrapper_executable(tmp_path, local_install):
+    wrapper = tmp_path / "wrapper.sh"
+    wrapper.write_text("#!/bin/sh\n")
+    wrapper.chmod(0o644)
+    target = tmp_path / "mcp.json"
+    target.write_text(json.dumps({"mcpServers": {"usagetrim": {"command": str(wrapper)}}}))
+    report = repair_client(_json_client(target), apply=True)
+    assert report.actions == ["made wrapper.sh executable (0o755)"]
+    assert wrapper.stat().st_mode & 0o777 == 0o755
+    assert not list(tmp_path.glob("*.pre-usagetrim-*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_failed_chmod_leaves_config_content_untouched(tmp_path, local_install, monkeypatch):
+    wrapper = tmp_path / "wrapper.sh"
+    wrapper.write_text("#!/bin/sh\n")
+    wrapper.chmod(0o644)
+    target = tmp_path / "mcp.json"
+    original = f'{{"mcpServers": {{"usagetrim": {{"command": {json.dumps(str(wrapper))}}},}}}}'
+    target.write_text(original)
+
+    def deny_chmod(*args, **kwargs):
+        raise PermissionError("owned by root")
+
+    monkeypatch.setattr(doctor.os, "chmod", deny_chmod)
+    report = repair_client(_json_client(target), apply=True)
+    assert "owned by root" in report.error
+    assert target.read_text() == original
+    assert not list(tmp_path.glob("*.pre-usagetrim-*"))
+
+
+def test_handshake_probe_talks_to_real_server():
+    result = probe_mcp_handshake(sys.executable, ["-m", "usagetrim.cli", "mcp"], timeout=30)
+    assert result.status == "ok", result.message
+
+
+def test_handshake_probe_never_hangs():
+    started = time.monotonic()
+    result = probe_mcp_handshake(sys.executable, ["-c", "import time; time.sleep(30)"], timeout=0.5)
+    assert result.status == "failed"
+    assert "within 0.5s" in result.message
+    assert time.monotonic() - started < 10
+
+
+def test_handshake_probe_kills_wrapper_children_holding_the_pipes():
+    wrapper = (
+        "import subprocess, sys; "
+        "subprocess.run([sys.executable, '-c', 'import time; time.sleep(30)'])"
+    )
+    started = time.monotonic()
+    result = probe_mcp_handshake(sys.executable, ["-c", wrapper], timeout=1)
+    assert result.status == "failed"
+    assert time.monotonic() - started < 10
+
+
+def test_handshake_probe_reports_missing_binary_and_failing_server(tmp_path):
+    missing = probe_mcp_handshake(str(tmp_path / "no-such-usagetrim"), ["mcp"])
+    assert missing.status == "failed" and "cannot start" in missing.message
+    failing = probe_mcp_handshake(
+        sys.executable, ["-c", "import sys; sys.stderr.write('boom'); sys.exit(3)"], timeout=30
+    )
+    assert failing.status == "failed"
+    assert "exit code 3" in failing.message and "boom" in failing.message
+
+
+@pytest.mark.parametrize(
+    "entry, message",
+    [
+        (None, "not registered"),
+        ({"url": "https://example.invalid/mcp"}, "remote transport"),
+        ({"command": "usagetrim", "disabled": True}, "disabled"),
+    ],
+)
+def test_probe_server_entry_skips_entries_it_must_not_start(entry, message, monkeypatch):
+    monkeypatch.setattr(doctor.subprocess, "Popen", lambda *a, **k: pytest.fail("started"))
+    result = probe_server_entry(entry)
+    assert result.status == "skipped" and message in result.message

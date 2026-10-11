@@ -2,6 +2,7 @@ import json
 import os
 import sys
 
+import pytest
 from typer.testing import CliRunner
 
 from usagetrim.cli import app
@@ -249,6 +250,120 @@ def test_cli_doctor():
     res = runner.invoke(app, ["doctor"])
     assert res.exit_code == 0
     assert "usagetrim System & Integration Diagnostics" in res.output
+
+
+@pytest.fixture
+def isolated_home(tmp_path, monkeypatch):
+    """Point every client config at tmp_path and stub out the slow or global parts of --fix."""
+    from pathlib import Path
+
+    from rich.console import Console
+
+    import usagetrim.core.doctor as doc
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("APPDATA", str(home / "AppData"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    monkeypatch.setattr("usagetrim.cli.console", Console(width=250))
+    monkeypatch.setattr("usagetrim.cli._codex_available", lambda: False)
+    monkeypatch.setattr(
+        doc,
+        "_local_mcp_command",
+        lambda profile=None: {"command": "/bin/usagetrim", "args": ["mcp"]},
+    )
+    monkeypatch.setattr(
+        "usagetrim.cli.probe_server_entry",
+        lambda entry: (
+            doc.HandshakeResult("ok", f"probed {entry['command']}")
+            if entry
+            else doc.HandshakeResult("skipped", "usagetrim not registered")
+        ),
+    )
+    return home
+
+
+@pytest.fixture
+def isolated_doctor_fix(tmp_path, monkeypatch, isolated_home):
+    import usagetrim.core.doctor as doc
+
+    target = tmp_path / "mcp.json"
+    target.write_text('{"mcpServers": {"usagetrim": {"command": "/old/venv/bin/usagetrim"}},}')
+    for installer in (
+        "configure_cursor_mcp",
+        "configure_windsurf_mcp",
+        "configure_claude_desktop_mcp",
+        "configure_shell_alias",
+    ):
+        monkeypatch.setattr(f"usagetrim.cli.{installer}", lambda: (False, "skipped in test"))
+    monkeypatch.setattr(
+        "usagetrim.cli.MCP_CLIENTS", (doc.McpClient("Cursor", lambda: target, "json"),)
+    )
+    return target
+
+
+def test_cli_doctor_fix_yes_repairs_and_probes(isolated_doctor_fix):
+    result = runner.invoke(app, ["doctor", "--fix", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "MCP Client Repair & Handshake" in result.output
+    assert "probed /bin/usagetrim" in result.output
+    assert json.loads(isolated_doctor_fix.read_text())["mcpServers"]["usagetrim"]["command"] == (
+        "/bin/usagetrim"
+    )
+    assert list(isolated_doctor_fix.parent.glob("mcp.json.pre-usagetrim-*"))
+
+
+def test_cli_doctor_fix_without_tty_or_yes_changes_nothing(isolated_doctor_fix):
+    original = isolated_doctor_fix.read_text()
+    result = runner.invoke(app, ["doctor", "--fix"])
+    assert result.exit_code == 0, result.output
+    assert "re-run with --yes" in result.output
+    assert "repairs not applied" in result.output
+    assert isolated_doctor_fix.read_text() == original
+    assert not list(isolated_doctor_fix.parent.glob("mcp.json.pre-usagetrim-*"))
+
+
+@pytest.mark.parametrize("answer, applied", [("y\n", True), ("n\n", False), ("", False)])
+def test_cli_doctor_fix_asks_before_repairing(isolated_doctor_fix, monkeypatch, answer, applied):
+    monkeypatch.setattr("usagetrim.cli._stdin_is_interactive", lambda: True)
+    original = isolated_doctor_fix.read_text()
+    result = runner.invoke(app, ["doctor", "--fix"], input=answer)
+    assert result.exit_code == 0, result.output
+    assert "Apply these repairs?" in result.output
+    assert "MCP Client Repair & Handshake" in result.output
+    assert (isolated_doctor_fix.read_text() != original) is applied
+
+
+def test_cli_doctor_fix_leaves_existing_entries_to_confirmed_repairs(isolated_home):
+    cursor_config = isolated_home / ".cursor" / "mcp.json"
+    cursor_config.parent.mkdir(parents=True)
+    original = json.dumps(
+        {
+            "mcpServers": {
+                "usagetrim": {
+                    "command": "/old/venv/bin/usagetrim",
+                    "args": ["mcp", "--profile", "full"],
+                }
+            }
+        }
+    )
+    cursor_config.write_text(original)
+    result = runner.invoke(app, ["doctor", "--fix"])
+    assert result.exit_code == 0, result.output
+    assert "pending: replaced stale command" in result.output
+    assert cursor_config.read_text() == original
+    windsurf_config = isolated_home / ".codeium" / "windsurf" / "mcp_config.json"
+    assert json.loads(windsurf_config.read_text())["mcpServers"]["usagetrim"]["command"] == (
+        "/bin/usagetrim"
+    )
+
+
+def test_cli_doctor_warns_that_yes_needs_fix():
+    result = runner.invoke(app, ["doctor", "--yes"])
+    assert result.exit_code == 0
+    assert "--yes only applies together with --fix" in result.output
 
 
 def test_cli_install_desktop_honors_installer_failure(monkeypatch):

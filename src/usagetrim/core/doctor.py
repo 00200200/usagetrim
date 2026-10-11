@@ -5,12 +5,16 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path, PurePath
 from typing import Literal
 
@@ -85,8 +89,12 @@ def check_claude_cli() -> DiagnosticItem:
     )
 
 
+def get_cursor_mcp_config_path() -> Path:
+    return Path.home() / ".cursor" / "mcp.json"
+
+
 def check_cursor_mcp() -> DiagnosticItem:
-    cursor_mcp_path = Path.home() / ".cursor" / "mcp.json"
+    cursor_mcp_path = get_cursor_mcp_config_path()
     if not cursor_mcp_path.exists():
         return DiagnosticItem(
             name="Cursor MCP Config",
@@ -387,9 +395,46 @@ def _local_mcp_command(profile: str | None = None) -> dict[str, object]:
     )
 
 
+def _backup_config(cfg_file: Path) -> Path:
+    """Copy the file next to itself as ``<name>.pre-usagetrim-<timestamp>-<random>``."""
+    timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    with tempfile.NamedTemporaryFile(
+        prefix=f"{cfg_file.name}.pre-usagetrim-{timestamp}-",
+        dir=cfg_file.parent,
+        delete=False,
+    ) as backup:
+        backup_path = Path(backup.name)
+    shutil.copy2(cfg_file, backup_path)
+    return backup_path
+
+
+def _write_text_atomic(cfg_file: Path, text: str) -> None:
+    """Replace the file via a staged copy; an existing file is backed up and keeps its mode."""
+    staged: Path | None = None
+    try:
+        cfg_file.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=cfg_file.name + ".tmp-",
+            dir=cfg_file.parent,
+            delete=False,
+        ) as temporary:
+            staged = Path(temporary.name)
+            temporary.write(text)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        if cfg_file.exists():
+            os.chmod(staged, cfg_file.stat().st_mode & 0o777)
+            _backup_config(cfg_file)
+        staged.replace(cfg_file)
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+
+
 def _configure_local_mcp(cfg_file: Path, profile: str | None = None) -> tuple[bool, str]:
     """Preserve settings, reject malformed files, and back up each actual change."""
-    staged: Path | None = None
     try:
         # Read and validate before creating directories, backups, or replacements.
         data = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.exists() else {}
@@ -403,45 +448,21 @@ def _configure_local_mcp(cfg_file: Path, profile: str | None = None) -> tuple[bo
             raise ValueError(
                 "existing usagetrim server uses another transport; update it explicitly"
             )
-        cmd_info = (
-            _local_mcp_command(profile=profile) if profile is not None else _local_mcp_command()
-        )
-        updated = {**previous, **cmd_info}
+        updated = {**previous, **_local_mcp_command(profile=profile)}
         if previous == updated:
             return True, str(cfg_file)
         servers["usagetrim"] = updated
-        cfg_file.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            prefix=cfg_file.name + ".tmp-",
-            dir=cfg_file.parent,
-            delete=False,
-        ) as temporary:
-            staged = Path(temporary.name)
-            json.dump(data, temporary, indent=2, ensure_ascii=False)
-            temporary.write("\n")
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        if cfg_file.exists():
-            os.chmod(staged, cfg_file.stat().st_mode & 0o777)
-            with tempfile.NamedTemporaryFile(
-                prefix=cfg_file.name + ".pre-usagetrim-",
-                dir=cfg_file.parent,
-                delete=False,
-            ) as backup:
-                backup_path = Path(backup.name)
-            shutil.copy2(cfg_file, backup_path)
-        staged.replace(cfg_file)
+        _write_text_atomic(cfg_file, _dump_json_config(data))
         return True, str(cfg_file)
     except (OSError, ValueError, TypeError) as exc:
         return (
             False,
             f"Could not configure {cfg_file}: {exc}. Existing configuration was not overwritten.",
         )
-    finally:
-        if staged is not None:
-            staged.unlink(missing_ok=True)
+
+
+def _dump_json_config(data: dict) -> str:
+    return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
 
 def configure_claude_desktop_mcp(
@@ -450,12 +471,71 @@ def configure_claude_desktop_mcp(
     return _configure_local_mcp(target_file or get_claude_desktop_config_path(), profile=profile)
 
 
+# Blok kończy się na pierwszej tabeli spoza [mcp_servers.usagetrim] i jej podtabel
+# (np. [mcp_servers.usagetrim-dev] to już inny serwer).
+_CODEX_BLOCK_PATTERN = re.compile(
+    r"(^|\n)\[mcp_servers\.usagetrim\]\n(?:(?!\n\[(?!mcp_servers\.usagetrim[.\]])).)*",
+    re.DOTALL,
+)
+# Komentarze i puste linie na końcu bloku zwykle opisują następną tabelę.
+_TRAILING_TRIVIA_PATTERN = re.compile(r"(?:\n[ \t]*(?:#[^\n]*)?)*\Z")
+_BARE_TOML_KEY = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _toml_key(key: str) -> str:
+    return key if _BARE_TOML_KEY.fullmatch(key) else json.dumps(key)
+
+
+def _toml_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (str, int, float)):
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        pairs = ", ".join(f"{_toml_key(key)} = {_toml_value(item)}" for key, item in value.items())
+        return "{ " + pairs + " }"
+    raise ValueError(f"cannot write {type(value).__name__} values into [mcp_servers.usagetrim]")
+
+
+def _codex_usagetrim_block(entry: dict) -> str:
+    lines = ["[mcp_servers.usagetrim]"]
+    lines += [
+        f"{_toml_key(key)} = {_toml_value(value)}"
+        for key, value in entry.items()
+        if not isinstance(value, dict)
+    ]
+    for key, value in entry.items():
+        if isinstance(value, dict):
+            lines += ["", f"[mcp_servers.usagetrim.{_toml_key(key)}]"]
+            lines += [f"{_toml_key(name)} = {_toml_value(item)}" for name, item in value.items()]
+    return "\n".join(lines) + "\n"
+
+
+def _rewrite_codex_entry(raw_text: str, entry: dict) -> str:
+    """Swap only UsageTrim's table and prove every other setting parses back unchanged."""
+    block = _codex_usagetrim_block(entry)
+    match = _CODEX_BLOCK_PATTERN.search(raw_text)
+    if match:
+        trailing = _TRAILING_TRIVIA_PATTERN.search(match.group(0)).group(0).removeprefix("\n")
+        before, after = raw_text[: match.start()] + match.group(1), raw_text[match.end() :]
+        updated_text, untouched_text = before + block + trailing + after, before + trailing + after
+    else:
+        separator = "" if not raw_text else ("\n" if raw_text.endswith("\n") else "\n\n")
+        updated_text, untouched_text = raw_text + separator + block, raw_text
+    expected = tomllib.loads(untouched_text)
+    expected.setdefault("mcp_servers", {})["usagetrim"] = entry
+    if tomllib.loads(updated_text) != expected:
+        raise ValueError("rewriting [mcp_servers.usagetrim] would change other settings")
+    return updated_text
+
+
 def configure_codex_mcp(
     target_file: Path | None = None, profile: str | None = None
 ) -> tuple[bool, str]:
     """Configure UsageTrim MCP in Codex config.toml safely and atomically."""
     cfg_file = target_file or get_codex_config_path()
-    staged: Path | None = None
     try:
         raw_text = cfg_file.read_text(encoding="utf-8") if cfg_file.exists() else ""
         data = tomllib.loads(raw_text) if raw_text else {}
@@ -465,82 +545,20 @@ def configure_codex_mcp(
         if not isinstance(servers, dict):
             raise ValueError("mcp_servers must be a table")
 
-        cmd_info = (
-            _local_mcp_command(profile=profile) if profile is not None else _local_mcp_command()
-        )
-        cmd_str = json.dumps(cmd_info["command"])
-        args_list = json.dumps(cmd_info["args"])
-
+        cmd_info = _local_mcp_command(profile=profile)
         previous = servers.get("usagetrim")
-        if (
-            isinstance(previous, dict)
-            and previous.get("command") == cmd_info["command"]
-            and previous.get("args") == cmd_info["args"]
-        ):
+        previous = previous if isinstance(previous, dict) else {}
+        updated = {**previous, **cmd_info}
+        if previous == updated:
             return True, str(cfg_file)
 
-        table_lines = [
-            "[mcp_servers.usagetrim]",
-            f"command = {cmd_str}",
-            f"args = {args_list}",
-        ]
-        # Preserve env table if previous server had one
-        if isinstance(previous, dict) and isinstance(previous.get("env"), dict) and previous["env"]:
-            table_lines.append("")
-            table_lines.append("[mcp_servers.usagetrim.env]")
-            for k, v in previous["env"].items():
-                table_lines.append(f"{k} = {json.dumps(str(v))}")
-
-        usagetrim_block = "\n".join(table_lines) + "\n"
-
-        block_pattern = re.compile(
-            r"(^|\n)\[mcp_servers\.usagetrim\]\n(?:(?!\n\[(?!mcp_servers\.usagetrim\b)).)*",
-            re.DOTALL,
-        )
-        if block_pattern.search(raw_text):
-            updated_text = block_pattern.sub(r"\1" + usagetrim_block, raw_text)
-        else:
-            sep = "" if not raw_text else ("\n" if raw_text.endswith("\n") else "\n\n")
-            updated_text = raw_text + sep + usagetrim_block
-
-        # Strictly validate that updated_text parses as valid TOML and usagetrim matches
-        parsed = tomllib.loads(updated_text)
-        if parsed.get("mcp_servers", {}).get("usagetrim", {}).get("command") != cmd_info["command"]:
-            raise ValueError("failed to verify updated [mcp_servers.usagetrim] table")
-
-        cfg_file.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            prefix=cfg_file.name + ".tmp-",
-            dir=cfg_file.parent,
-            delete=False,
-        ) as temporary:
-            staged = Path(temporary.name)
-            temporary.write(updated_text)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-
-        if cfg_file.exists():
-            os.chmod(staged, cfg_file.stat().st_mode & 0o777)
-            with tempfile.NamedTemporaryFile(
-                prefix=cfg_file.name + ".pre-usagetrim-",
-                dir=cfg_file.parent,
-                delete=False,
-            ) as backup:
-                backup_path = Path(backup.name)
-            shutil.copy2(cfg_file, backup_path)
-
-        staged.replace(cfg_file)
+        _write_text_atomic(cfg_file, _rewrite_codex_entry(raw_text, updated))
         return True, str(cfg_file)
     except (OSError, ValueError, TypeError) as exc:
         return (
             False,
             f"Could not configure {cfg_file}: {exc}. Existing configuration was not overwritten.",
         )
-    finally:
-        if staged is not None:
-            staged.unlink(missing_ok=True)
 
 
 EXTENSION_FILES = (
@@ -672,3 +690,360 @@ def configure_shell_alias(target_file: Path | None = None) -> tuple[bool, str]:
         rc_path.write_text(alias_line, encoding="utf-8")
 
     return True, str(rc_path)
+
+
+HANDSHAKE_TIMEOUT_SECONDS = 2.0
+
+
+@dataclass
+class HandshakeResult:
+    status: Literal["ok", "failed", "skipped"]
+    message: str
+
+
+@dataclass
+class McpClient:
+    name: str
+    get_config_path: Callable[[], Path]
+    config_format: Literal["json", "toml"]
+
+
+@dataclass
+class ClientRepairReport:
+    client: str
+    config_path: Path
+    applied: bool
+    actions: list[str] = field(default_factory=list)
+    server_entry: dict | None = None
+    error: str | None = None
+
+
+# Lambdy zamiast referencji do funkcji, żeby podmiana get_*_config_path (np. w testach) była widoczna.
+MCP_CLIENTS = (
+    McpClient("Claude Desktop", lambda: get_claude_desktop_config_path(), "json"),
+    McpClient("Cursor", lambda: get_cursor_mcp_config_path(), "json"),
+    McpClient("Windsurf", lambda: get_windsurf_mcp_config_path(), "json"),
+    McpClient("Codex", lambda: get_codex_config_path(), "toml"),
+)
+
+
+def _skip_json_trivia(text: str, index: int) -> int:
+    while index < len(text):
+        if text[index].isspace():
+            index += 1
+        elif text.startswith("//", index):
+            newline = text.find("\n", index)
+            index = len(text) if newline == -1 else newline
+        elif text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            index = len(text) if end == -1 else end + 2
+        else:
+            break
+    return index
+
+
+@dataclass
+class JsonRepair:
+    text: str
+    removed_comments: bool
+
+
+def repair_json_text(raw: str) -> JsonRepair | None:
+    """Fix only unambiguous damage: BOM, comments, and trailing commas.
+
+    Returns ``None`` when the result is still not a JSON object, so nothing is guessed.
+    """
+    removed_comments = False
+    text = raw.lstrip("\ufeff")
+    output: list[str] = []
+    index = 0
+    in_string = False
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            if char == "\\":
+                output.append(text[index : index + 2])
+                index += 2
+                continue
+            in_string = char != '"'
+            output.append(char)
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+        elif text.startswith("//", index) or text.startswith("/*", index):
+            if text.startswith("/*", index) and text.find("*/", index + 2) == -1:
+                return None
+            removed_comments = True
+            index = _skip_json_trivia(text, index)
+            continue
+        elif char == ",":
+            next_index = _skip_json_trivia(text, index + 1)
+            if next_index < len(text) and text[next_index] in "}]":
+                index += 1
+                continue
+        output.append(char)
+        index += 1
+    repaired = "".join(output)
+    try:
+        data = json.loads(repaired)
+    except ValueError:
+        return None
+    return JsonRepair(repaired, removed_comments) if isinstance(data, dict) else None
+
+
+def _is_local_stdio(entry: dict) -> bool:
+    return "url" not in entry and entry.get("type", "stdio") == "stdio"
+
+
+def _is_stale_command(entry: dict) -> bool:
+    command, args = entry.get("command"), entry.get("args", [])
+    if not isinstance(command, str) or not command.strip():
+        return True
+    # uvx pobrałby niepowiązany pakiet z PyPI zamiast tego projektu.
+    if PurePath(command).name == "uvx" and isinstance(args, list) and args[:1] == ["usagetrim"]:
+        return True
+    # Zmienne rozwijane przez klienta (~, ${userHome}, ${env:X}) są poza naszą oceną.
+    if command.startswith("~") or "${" in command:
+        return False
+    if PurePath(command).name != command:
+        return not _command_path_exists(command)
+    return shutil.which(command) is None
+
+
+def _command_path_exists(command: str) -> bool:
+    if Path(command).exists():
+        return True
+    if os.name != "nt":
+        return False
+    extensions = os.environ.get("PATHEXT", ".EXE").split(os.pathsep)
+    return any(Path(command + extension).exists() for extension in extensions if extension)
+
+
+def _profile_from_args(args: object) -> str | None:
+    if isinstance(args, list) and "--profile" in args:
+        position = args.index("--profile") + 1
+        if position < len(args) and isinstance(args[position], str):
+            return args[position]
+    return None
+
+
+def _replacement_for_stale(entry: dict | None) -> dict[str, object] | None:
+    """Return the active command for a stale local entry, or ``None`` when nothing would change."""
+    if entry is None or not _is_local_stdio(entry) or not _is_stale_command(entry):
+        return None
+    cmd_info = _local_mcp_command(profile=_profile_from_args(entry.get("args")))
+    if all(entry.get(key) == value for key, value in cmd_info.items()):
+        return None
+    return cmd_info
+
+
+def _repair_json_config(raw: str, actions: list[str]) -> tuple[str, dict | None]:
+    try:
+        data = json.loads(raw)
+        syntax_action = None
+    except ValueError:
+        repair = repair_json_text(raw)
+        if repair is None:
+            raise ValueError("JSON syntax cannot be repaired automatically") from None
+        data = json.loads(repair.text)
+        syntax_action = "repaired JSON syntax" + (
+            " (comments removed)" if repair.removed_comments else ""
+        )
+    if not isinstance(data, dict) or not isinstance(data.get("mcpServers", {}), dict):
+        raise ValueError("configuration and mcpServers must be JSON objects")
+    entry = data.get("mcpServers", {}).get("usagetrim")
+    # Plików bez wpisu UsageTrim nie przepisujemy — to nie nasza konfiguracja.
+    if entry is None:
+        return raw, None
+    if not isinstance(entry, dict):
+        raise ValueError("usagetrim server must be a JSON object")
+    if syntax_action:
+        actions.append(syntax_action)
+    cmd_info = _replacement_for_stale(entry)
+    if cmd_info is not None:
+        actions.append(f"replaced stale command {entry.get('command')!r}")
+        entry.update(cmd_info)
+    if syntax_action or cmd_info is not None:
+        return _dump_json_config(data), entry
+    return raw, entry
+
+
+def _repair_toml_config(raw: str, actions: list[str]) -> tuple[str, dict | None]:
+    try:
+        data = tomllib.loads(raw)
+    except tomllib.TOMLDecodeError as exc:
+        return _rebuild_broken_codex_table(raw, exc, actions)
+    servers = data.get("mcp_servers", {})
+    if not isinstance(servers, dict):
+        raise ValueError("mcp_servers must be a table")
+    entry = servers.get("usagetrim")
+    if entry is not None and not isinstance(entry, dict):
+        raise ValueError("usagetrim must be a server table")
+    cmd_info = _replacement_for_stale(entry)
+    if cmd_info is None:
+        return raw, entry
+    repaired_entry = {**entry, **cmd_info}
+    updated = _rewrite_codex_entry(raw, repaired_entry)
+    actions.append(f"replaced stale command {entry.get('command')!r}")
+    return updated, repaired_entry
+
+
+def _rebuild_broken_codex_table(
+    raw: str, error: tomllib.TOMLDecodeError, actions: list[str]
+) -> tuple[str, dict]:
+    """Rebuild an unparsable UsageTrim table only when nothing but command/args would be lost."""
+    outside_error = ValueError(f"TOML syntax error outside UsageTrim's table: {error}")
+    usagetrim_block = _CODEX_BLOCK_PATTERN.search(raw)
+    if not usagetrim_block:
+        raise outside_error
+    block_text = usagetrim_block.group(0)
+    other_keys = set(re.findall(r"(?m)^[ \t]*([^\s#=\[\]]+)[ \t]*=", block_text)) - {
+        "command",
+        "args",
+    }
+    if other_keys or len(re.findall(r"(?m)^[ \t]*\[", block_text)) > 1:
+        raise ValueError(
+            "broken [mcp_servers.usagetrim] table holds other settings (e.g. env); fix it manually"
+        )
+    profile_match = re.search(r"""["']--profile["']\s*,\s*["']([\w-]+)["']""", block_text)
+    entry = dict(_local_mcp_command(profile=profile_match.group(1) if profile_match else None))
+    try:
+        updated = _rewrite_codex_entry(raw, entry)
+    except tomllib.TOMLDecodeError:
+        raise outside_error from None
+    actions.append("rebuilt invalid [mcp_servers.usagetrim] table")
+    return updated, entry
+
+
+def _repair_permissions(entry: dict | None, actions: list[str], apply: bool) -> None:
+    if os.name == "nt":
+        return
+    command = entry.get("command") if entry else None
+    if not isinstance(command, str):
+        return
+    executable = Path(command)
+    if executable.is_absolute() and executable.is_file() and not os.access(executable, os.X_OK):
+        actions.append(f"made {executable.name} executable (0o755)")
+        if apply:
+            os.chmod(executable, (executable.stat().st_mode & 0o777) | 0o755)
+
+
+def repair_client(client: McpClient, *, apply: bool) -> ClientRepairReport:
+    """Plan (``apply=False``) or apply repairs; every content change is backed up first."""
+    cfg_file = client.get_config_path()
+    report = ClientRepairReport(client=client.name, config_path=cfg_file, applied=apply)
+    if not cfg_file.exists():
+        return report
+    try:
+        raw = cfg_file.read_text(encoding="utf-8")
+        repair = _repair_json_config if client.config_format == "json" else _repair_toml_config
+        updated, entry = repair(raw, report.actions)
+        # chmod przed zapisem: gdy się nie uda, treść configu na pewno pozostaje nietknięta.
+        _repair_permissions(entry, report.actions, apply)
+        if apply and updated != raw:
+            _write_text_atomic(cfg_file, updated)
+        report.server_entry = entry
+    except (OSError, ValueError, TypeError) as exc:
+        report.actions.clear()
+        report.error = f"{exc}; configuration was not changed"
+    return report
+
+
+def probe_mcp_handshake(
+    command: str,
+    args: list[str],
+    env: dict | None = None,
+    timeout: float = HANDSHAKE_TIMEOUT_SECONDS,
+) -> HandshakeResult:
+    """Start the server, send ``initialize`` and close stdin; never waits past ``timeout``."""
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "usagetrim-doctor", "version": "1"},
+        },
+    }
+    process_env = {**os.environ, **{key: str(value) for key, value in env.items()}} if env else None
+    started = time.monotonic()
+    try:
+        process = subprocess.Popen(
+            [shutil.which(command) or command, *args],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=process_env,
+            # Własna grupa procesów pozwala na POSIX zabić też procesy potomne wrappera.
+            start_new_session=os.name != "nt",
+        )
+    except OSError as exc:
+        return HandshakeResult("failed", f"cannot start server: {exc}")
+    try:
+        stdout, stderr = process.communicate(json.dumps(request) + "\n", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(process)
+        return HandshakeResult("failed", f"no initialize response within {timeout:g}s")
+    elapsed_ms = (time.monotonic() - started) * 1000
+    for line in stdout.splitlines():
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(message, dict) or message.get("id") != 1:
+            continue
+        result = message.get("result")
+        server_info = result.get("serverInfo") if isinstance(result, dict) else None
+        if isinstance(server_info, dict) and server_info.get("name") == "usagetrim":
+            return HandshakeResult("ok", f"handshake completed in {elapsed_ms:.0f} ms")
+        return HandshakeResult("failed", "unexpected initialize response")
+    stderr_lines = stderr.strip().splitlines()
+    detail = f": {stderr_lines[-1]}" if stderr_lines else ""
+    return HandshakeResult(
+        "failed", f"no initialize response (exit code {process.returncode}){detail}"
+    )
+
+
+def _kill_process_tree(process: subprocess.Popen) -> None:
+    """Kill the server and its children without waiting on pipes they may still hold open."""
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        process.kill()
+        process.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def probe_server_entry(
+    entry: dict | None, timeout: float = HANDSHAKE_TIMEOUT_SECONDS
+) -> HandshakeResult:
+    """Probe only UsageTrim's own entry; other configured servers are never started."""
+    if entry is None:
+        return HandshakeResult("skipped", "usagetrim not registered")
+    if not _is_local_stdio(entry):
+        return HandshakeResult("skipped", "remote transport")
+    if entry.get("disabled") is True or entry.get("enabled") is False:
+        return HandshakeResult("skipped", "disabled")
+    command, args = entry.get("command"), entry.get("args", [])
+    if not isinstance(command, str) or not command.strip():
+        return HandshakeResult("failed", "missing command")
+    if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+        return HandshakeResult("failed", "args must be a list of strings")
+    env = entry.get("env")
+    return probe_mcp_handshake(command, args, env if isinstance(env, dict) else None, timeout)
