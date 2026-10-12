@@ -47,6 +47,7 @@ from usagetrim.core.specialized import (
     filter_terraform_plan,
     filter_tsc,
     filter_uv_project,
+    filter_web_page,
     filter_xcodebuild,
 )
 from usagetrim.metrics.tokenizer import count_tokens
@@ -56,6 +57,30 @@ SAMPLE_KUBECTL_GET = author_kubectl_get_fixture()
 SAMPLE_KUBECTL_LOGS = author_kubectl_logs_fixture()
 SAMPLE_HELM_INSTALL = author_helm_install_fixture()
 SAMPLE_TERRAFORM_PLAN = author_terraform_plan_fixture()
+
+
+SAMPLE_WEB_PAGE = (
+    """<!doctype html>
+<html><head><style>.hidden{display:none}</style><script>window.__DATA__ = """
+    + "x" * 30000
+    + """;</script></head>
+<body>
+  <!-- internal build marker -->
+  <div class="app"><div><div><main>
+    <h1>Account settings</h1>
+    <p>Manage your profile and notifications.</p>
+    <label for="email">Email address</label>
+    <div><input id="email" type="email" value="ada@example.com" required></div>
+    <label><input type="checkbox" checked> Weekly digest</label>
+    <button aria-expanded="false">Save changes</button>
+    <a href="/help">Get help</a>
+    <svg viewBox="0 0 10 10"><path d="""
+    + "M0 0 " * 3000
+    + """></path></svg>
+    <div hidden>Private debug panel</div>
+  </main></div></div></div>
+</body></html>"""
+)
 
 SAMPLE_GIT_LOG = """commit a1b2c3d4e5f67890abcdef1234567890abcdef12
 Author: Alice Developer <alice@example.com>
@@ -2898,3 +2923,29 @@ def test_ansible_puppet_filters_import_and_aliases():
     assert fp1 is fpr1
     assert aaf1 is aaf2
     assert apf1 is apf2
+
+
+def test_filter_web_page_preserves_accessible_controls_and_text():
+    compacted = filter_web_page(SAMPLE_WEB_PAGE)
+
+    assert 'heading "Account settings" level=1' in compacted
+    assert 'paragraph "Manage your profile and notifications."' in compacted
+    assert 'textbox "Email address" value="ada@example.com" required=true' in compacted
+    assert 'checkbox "Weekly digest" checked=true' in compacted
+    assert 'button "Save changes" expanded=false' in compacted
+    assert 'link "Get help" url="/help"' in compacted
+    assert "<script" not in compacted
+    assert "<svg" not in compacted
+    assert "Private debug panel" not in compacted
+    assert "window.__DATA__" not in compacted
+
+
+def test_filter_web_page_reduces_spa_html_by_more_than_90_percent():
+    compacted = filter_web_page(SAMPLE_WEB_PAGE)
+    reduction = 1.0 - (count_tokens(compacted).avg / count_tokens(SAMPLE_WEB_PAGE).avg)
+    assert reduction > 0.90
+
+
+def test_auto_specialize_routes_browser_page_html():
+    compacted = auto_specialize_command_output("npx playwright page.content", SAMPLE_WEB_PAGE)
+    assert compacted == filter_web_page(SAMPLE_WEB_PAGE)

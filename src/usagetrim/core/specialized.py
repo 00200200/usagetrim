@@ -4,6 +4,7 @@ import json
 import re
 import shlex
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import PurePath
 
 from usagetrim.core.cache import ContextCache
@@ -14,6 +15,235 @@ from usagetrim.core.json_slimmer import (
     slim_json_data,
 )
 from usagetrim.core.spill import spill_large_output
+
+_WEB_VOID_TAGS = {
+    "area",
+    "base",
+    "br",
+    "col",
+    "embed",
+    "hr",
+    "img",
+    "input",
+    "link",
+    "meta",
+    "param",
+    "source",
+    "track",
+    "wbr",
+}
+_WEB_DISCARDED_TAGS = {"head", "script", "style", "svg", "template", "noscript"}
+
+
+@dataclass
+class _HTMLNode:
+    tag: str
+    attrs: dict[str, str]
+    children: list[_HTMLNode | str] = field(default_factory=list)
+    parent: _HTMLNode | None = None
+
+
+class _WebPageParser(HTMLParser):
+    """Build a minimal tolerant tree using only the standard library."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.root = _HTMLNode("document", {})
+        self.stack = [self.root]
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        node = _HTMLNode(
+            tag.lower(),
+            {name.lower(): value if value is not None else "" for name, value in attrs},
+            parent=self.stack[-1],
+        )
+        self.stack[-1].children.append(node)
+        if node.tag not in _WEB_VOID_TAGS:
+            self.stack.append(node)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        if self.stack[-1].tag == tag.lower():
+            self.stack.pop()
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        for index in range(len(self.stack) - 1, 0, -1):
+            if self.stack[index].tag == tag:
+                del self.stack[index:]
+                return
+
+    def handle_data(self, data: str) -> None:
+        self.stack[-1].children.append(data)
+
+
+def _web_hidden(node: _HTMLNode) -> bool:
+    style = node.attrs.get("style", "").replace(" ", "").lower()
+    return (
+        node.tag in _WEB_DISCARDED_TAGS
+        or "hidden" in node.attrs
+        or node.attrs.get("aria-hidden", "").lower() == "true"
+        or "display:none" in style
+        or "visibility:hidden" in style
+        or (node.tag == "input" and node.attrs.get("type", "").lower() == "hidden")
+    )
+
+
+def _web_text(node: _HTMLNode) -> str:
+    parts: list[str] = []
+    for child in node.children:
+        if isinstance(child, str):
+            parts.append(child)
+        elif not _web_hidden(child):
+            parts.append(_web_text(child))
+    return " ".join(" ".join(parts).split())
+
+
+def _web_role(node: _HTMLNode) -> str | None:
+    explicit = node.attrs.get("role", "").strip().lower()
+    if explicit and explicit not in {"none", "presentation"}:
+        return explicit
+    if node.tag == "a" and "href" in node.attrs:
+        return "link"
+    if node.tag in {"button", "summary"}:
+        return "button"
+    if node.tag == "input":
+        input_type = node.attrs.get("type", "text").lower()
+        if input_type in {"button", "submit", "reset", "image"}:
+            return "button"
+        if input_type in {"checkbox", "radio"}:
+            return input_type
+        if input_type == "range":
+            return "slider"
+        return "textbox"
+    if node.tag == "textarea":
+        return "textbox"
+    if node.tag == "select":
+        return "combobox"
+    if node.tag == "option":
+        return "option"
+    if node.tag == "img" and node.attrs.get("alt"):
+        return "img"
+    if re.fullmatch(r"h[1-6]", node.tag):
+        return "heading"
+    return {
+        "main": "main",
+        "nav": "navigation",
+        "form": "form",
+        "article": "article",
+        "ul": "list",
+        "ol": "list",
+        "li": "listitem",
+        "p": "paragraph",
+    }.get(node.tag)
+
+
+def filter_web_page(raw_html_or_dom: str) -> str:
+    """Compact HTML into a deterministic accessibility-oriented outline.
+
+    Active content, styles, SVG internals, comments, hidden nodes and anonymous
+    wrappers are discarded. Interactive controls retain their accessible name,
+    value, destination and state so browser agents can still act on the page.
+    """
+    if not raw_html_or_dom.strip():
+        return raw_html_or_dom
+
+    parser = _WebPageParser()
+    try:
+        parser.feed(raw_html_or_dom)
+        parser.close()
+    except Exception:
+        return raw_html_or_dom
+
+    labels: dict[str, str] = {}
+
+    def collect_labels(node: _HTMLNode) -> None:
+        if _web_hidden(node):
+            return
+        target = node.attrs.get("for") if node.tag == "label" else None
+        if target:
+            labels[target] = _web_text(node)
+        for child in node.children:
+            if isinstance(child, _HTMLNode):
+                collect_labels(child)
+
+    collect_labels(parser.root)
+
+    def accessible_name(node: _HTMLNode) -> str:
+        for key in ("aria-label", "alt", "title"):
+            if node.attrs.get(key, "").strip():
+                return " ".join(node.attrs[key].split())
+        node_id = node.attrs.get("id")
+        if node_id and labels.get(node_id):
+            return labels[node_id]
+        parent = node.parent
+        while parent is not None:
+            if parent.tag == "label":
+                text = _web_text(parent)
+                if text:
+                    return text
+            parent = parent.parent
+        text = _web_text(node)
+        if text:
+            return text
+        if node.tag == "input" and node.attrs.get("value"):
+            return " ".join(node.attrs["value"].split())
+        return " ".join(node.attrs.get("placeholder", "").split())
+
+    lines: list[str] = []
+
+    def render(node: _HTMLNode, depth: int) -> None:
+        if _web_hidden(node):
+            return
+        role = _web_role(node)
+        child_depth = depth
+        consumes_text = False
+        if role:
+            name = accessible_name(node)
+            details: list[str] = []
+            if name:
+                details.append(json.dumps(name, ensure_ascii=False))
+            if role == "heading" and node.tag[-1:].isdigit():
+                details.append(f"level={node.tag[-1]}")
+            if role == "link" and node.attrs.get("href"):
+                details.append(f"url={json.dumps(node.attrs['href'], ensure_ascii=False)}")
+            if role in {"textbox", "combobox", "slider"} and node.attrs.get("value"):
+                details.append(f"value={json.dumps(node.attrs['value'], ensure_ascii=False)}")
+            for attr in ("checked", "disabled", "required", "selected"):
+                aria_value = node.attrs.get(f"aria-{attr}")
+                if attr in node.attrs or aria_value == "true":
+                    details.append(f"{attr}=true")
+            for attr in ("expanded", "pressed"):
+                if node.attrs.get(f"aria-{attr}") in {"true", "false"}:
+                    details.append(f"{attr}={node.attrs[f'aria-{attr}']}")
+            lines.append(f"{'  ' * depth}{role}{(' ' + ' '.join(details)) if details else ''}")
+            child_depth += 1
+            consumes_text = role in {
+                "button",
+                "link",
+                "heading",
+                "img",
+                "listitem",
+                "option",
+                "paragraph",
+            }
+
+        if not consumes_text:
+            direct_text = " ".join(
+                " ".join(child.split()) for child in node.children if isinstance(child, str)
+            ).strip()
+            if direct_text:
+                lines.append(
+                    f"{'  ' * child_depth}text {json.dumps(direct_text, ensure_ascii=False)}"
+                )
+            for child in node.children:
+                if isinstance(child, _HTMLNode):
+                    render(child, child_depth)
+
+    render(parser.root, 0)
+    compacted = "\n".join(lines).strip()
+    return compacted or raw_html_or_dom
+
 
 # `git log` indents commit messages by exactly four spaces. Patch bodies (-p) and
 # --stat blocks sit at other indents, so they must be detected explicitly instead
@@ -2710,6 +2940,10 @@ def auto_specialize_command_output(command: str, raw_output: str) -> str | None:
     gh_compact = filter_gh_command_output(command, raw_output)
     if gh_compact is not None:
         return gh_compact
+    if any(
+        tool in cmd_lower for tool in ("playwright", "puppeteer", "stagehand")
+    ) and raw_output.lstrip().lower().startswith(("<!doctype html", "<html", "<body")):
+        return filter_web_page(raw_output)
     if cmd_lower.startswith("git log"):
         return filter_git_log(raw_output)
     elif cmd_lower.startswith("git status"):
