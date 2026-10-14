@@ -28,11 +28,8 @@ def test_bench_json_has_case_metrics_and_suite_totals():
     data = json.loads(result.stdout)
     assert data["passed"] and data["comparison"] is None
     suite = data["suite"]
-    assert [case["case_id"] for case in suite["results"]] == [
-        "pytest-failure",
-        "cargo-success",
-        "passthrough",
-    ]
+    entries = json.loads(cli._BENCHMARK_MANIFEST.read_bytes())
+    assert [case["case_id"] for case in suite["results"]] == [entry["id"] for entry in entries]
     assert suite["raw_tokens"] == sum(case["raw_tokens"] for case in suite["results"])
     assert suite["output_tokens"] == sum(case["output_tokens"] for case in suite["results"])
     assert suite["signals_preserved"] and suite["exact_recovery"]

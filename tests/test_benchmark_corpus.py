@@ -5,6 +5,13 @@ import pytest
 
 from usagetrim.core.benchmark import benchmark_suite
 from usagetrim.core.benchmark_corpus import load_benchmark_cases
+from usagetrim.core.redactor import redact_secrets
+from usagetrim.core.specialized import (
+    auto_specialize_command_output,
+    filter_eslint,
+    filter_pyright,
+    filter_tsc,
+)
 
 CORPUS = Path(__file__).parent / "fixtures" / "benchmarks"
 
@@ -13,7 +20,7 @@ def test_loads_manifest_fields_in_order_without_changing_fixture_bytes():
     entries = json.loads((CORPUS / "manifest.json").read_bytes())
     cases = load_benchmark_cases(CORPUS / "manifest.json")
 
-    assert len(cases) == 3
+    assert len(cases) == len(entries)
     for case, entry in zip(cases, entries, strict=True):
         assert case.case_id == entry["id"]
         assert case.command == entry["command"]
@@ -32,6 +39,32 @@ def test_loaded_cases_run_directly_in_suite():
     assert result.results[0].output_tokens < result.results[0].raw_tokens
     assert result.results[1].output_tokens < result.results[1].raw_tokens
     assert result.results[2].output_tokens == result.results[2].raw_tokens
+
+
+@pytest.mark.parametrize(
+    ("case_id", "specialized_filter"),
+    [
+        ("pytest-verbose-success", None),
+        ("pytest-verbose-assertion", None),
+        ("tsc-pretty-type-errors", filter_tsc),
+        ("eslint-stylish-mixed-severity", filter_eslint),
+        ("pyright-source-diagnostics", filter_pyright),
+    ],
+)
+def test_captured_fixtures_preserve_signals_recovery_and_expected_routing(
+    case_id, specialized_filter
+):
+    cases = {case.case_id: case for case in load_benchmark_cases(CORPUS / "manifest.json")}
+    case = cases[case_id]
+    assert redact_secrets(case.raw_output) == case.raw_output
+    routed = auto_specialize_command_output(case.command, case.raw_output)
+    if specialized_filter is None:
+        assert routed is None
+    else:
+        assert routed == specialized_filter(case.raw_output)
+    result = benchmark_suite((case,)).results[0]
+    assert result.signals_preserved and result.exact_recovery
+    assert result.raw_tokens > 0 and result.output_tokens > 0
 
 
 @pytest.fixture

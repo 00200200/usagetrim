@@ -1,0 +1,12 @@
+
+/workspace/capture/eslint/src/billing.js
+  2:9  error    'currency' is assigned a value but never used  no-unused-vars
+  3:3  warning  Unexpected console statement                   no-console
+
+/workspace/capture/eslint/src/session.js
+  2:9   error    'expiresAt' is assigned a value but never used  no-unused-vars
+  3:3   warning  Unexpected console statement                    no-console
+  4:16  error    Expected '===' and instead saw '=='             eqeqeq
+
+✖ 5 problems (3 errors, 2 warnings)
+

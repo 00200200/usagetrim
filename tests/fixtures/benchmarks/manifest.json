@@ -19,5 +19,55 @@
     "command": "custom-tool",
     "exit_code": null,
     "required_signals": ["No changes required."]
+  },
+  {
+    "id": "pytest-verbose-success",
+    "file": "pytest-verbose-success.log",
+    "command": "python -m pytest -v --color=no tests",
+    "exit_code": 0,
+    "required_signals": ["collected 14 items", "14 passed"]
+  },
+  {
+    "id": "pytest-verbose-assertion",
+    "file": "pytest-verbose-assertion.log",
+    "command": "python -m pytest -v --color=no tests",
+    "exit_code": 1,
+    "required_signals": [
+      "test_invoice_total_includes_shipping",
+      "AssertionError",
+      "tests/test_billing.py:30",
+      "Decimal('49.99')",
+      "Decimal('4.50')",
+      "1 failed, 14 passed"
+    ]
+  },
+  {
+    "id": "tsc-pretty-type-errors",
+    "file": "tsc-pretty-type-errors.log",
+    "command": "tsc --noEmit --pretty",
+    "exit_code": 2,
+    "required_signals": ["src/billing.ts", "src/session.ts", "src/user.ts", "TS2322", "TS2345", "TS2741", "Found 3 errors in 3 files."]
+  },
+  {
+    "id": "eslint-stylish-mixed-severity",
+    "file": "eslint-stylish-mixed-severity.log",
+    "command": "eslint src --format stylish",
+    "exit_code": 1,
+    "required_signals": ["src/billing.js", "src/session.js", "no-unused-vars", "no-console", "eqeqeq", "5 problems (3 errors, 2 warnings)"]
+  },
+  {
+    "id": "pyright-source-diagnostics",
+    "file": "pyright-source-diagnostics.log",
+    "command": "pyright",
+    "exit_code": 1,
+    "required_signals": [
+      "src/billing.py:2:12",
+      "src/session.py:6:22",
+      "src/user.py:4:12",
+      "Type \"str\" is not assignable to return type \"float\"",
+      "Argument of type \"str | None\" cannot be assigned to parameter \"token\"",
+      "Type \"None\" is not assignable to return type \"str\"",
+      "3 errors, 0 warnings, 0 informations"
+    ]
   }
 ]
