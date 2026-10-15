@@ -1,0 +1,36 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.7, pytest-9.1.1, pluggy-1.6.0 -- /opt/capture-venv/bin/python
+cachedir: .pytest_cache
+rootdir: /workspace/capture/pytest-assertion
+collecting ... collected 15 items
+
+tests/test_billing.py::test_price_in_cents[0-0] PASSED                   [  6%]
+tests/test_billing.py::test_price_in_cents[0.01-1] PASSED                [ 13%]
+tests/test_billing.py::test_price_in_cents[1.25-125] PASSED              [ 20%]
+tests/test_billing.py::test_price_in_cents[12.99-1299] PASSED            [ 26%]
+tests/test_billing.py::test_price_in_cents[100.00-10000] PASSED          [ 33%]
+tests/test_billing.py::test_price_in_cents[1.005-101] PASSED             [ 40%]
+tests/test_billing.py::test_price_in_cents[2.675-268] PASSED             [ 46%]
+tests/test_billing.py::test_price_in_cents[-1.25--125] PASSED            [ 53%]
+tests/test_billing.py::test_normalize_status[pending-PENDING] PASSED     [ 60%]
+tests/test_billing.py::test_normalize_status[paid-PAID] PASSED           [ 66%]
+tests/test_billing.py::test_normalize_status[failed-FAILED] PASSED       [ 73%]
+tests/test_billing.py::test_normalize_status[refunded-REFUNDED] PASSED   [ 80%]
+tests/test_billing.py::test_normalize_status[cancelled-CANCELLED] PASSED [ 86%]
+tests/test_billing.py::test_normalize_status[processing-PROCESSING] PASSED [ 93%]
+tests/test_billing.py::test_invoice_total_includes_shipping FAILED       [100%]
+
+=================================== FAILURES ===================================
+_____________________ test_invoice_total_includes_shipping _____________________
+
+    def test_invoice_total_includes_shipping():
+        subtotal = Decimal("49.99")
+        shipping = Decimal("4.50")
+        total = subtotal  # The implementation forgot to add shipping.
+>       assert total == subtotal + shipping
+E       AssertionError: assert Decimal('49.99') == (Decimal('49.99') + Decimal('4.50'))
+
+tests/test_billing.py:30: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_billing.py::test_invoice_total_includes_shipping - Assertio...
+========================= 1 failed, 14 passed in 0.03s =========================

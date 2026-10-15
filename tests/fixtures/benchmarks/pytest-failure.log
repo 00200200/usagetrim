@@ -1,0 +1,23 @@
+tests/test_api.py::test_endpoint_01 PASSED [  5%]
+tests/test_api.py::test_endpoint_02 PASSED [ 10%]
+tests/test_api.py::test_endpoint_03 PASSED [ 15%]
+tests/test_api.py::test_endpoint_04 PASSED [ 20%]
+tests/test_api.py::test_endpoint_05 PASSED [ 25%]
+tests/test_api.py::test_endpoint_06 PASSED [ 30%]
+tests/test_api.py::test_endpoint_07 PASSED [ 35%]
+tests/test_api.py::test_endpoint_08 PASSED [ 40%]
+tests/test_api.py::test_endpoint_09 PASSED [ 45%]
+tests/test_api.py::test_endpoint_10 PASSED [ 50%]
+tests/test_api.py::test_endpoint_11 PASSED [ 55%]
+tests/test_api.py::test_endpoint_12 PASSED [ 60%]
+tests/test_api.py::test_endpoint_13 PASSED [ 65%]
+tests/test_api.py::test_endpoint_14 PASSED [ 70%]
+tests/test_api.py::test_endpoint_15 PASSED [ 75%]
+tests/test_api.py::test_endpoint_16 PASSED [ 80%]
+tests/test_api.py::test_endpoint_17 PASSED [ 85%]
+tests/test_api.py::test_endpoint_18 PASSED [ 90%]
+tests/test_api.py::test_endpoint_19 PASSED [ 95%]
+====================== FAILURES ======================
+E   AssertionError: expected successful response
+FAILED tests/test_api.py::test_failure - AssertionError
+================= 1 failed, 19 passed =================

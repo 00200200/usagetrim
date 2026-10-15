@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Annotated
@@ -20,6 +21,14 @@ from rich.panel import Panel
 from rich.table import Table
 
 from usagetrim.core.adaptive import compress_to_budget
+from usagetrim.core.benchmark import benchmark_suite
+from usagetrim.core.benchmark_baseline import (
+    baseline_from_json,
+    baseline_to_json,
+    compare_baseline,
+    create_baseline,
+)
+from usagetrim.core.benchmark_corpus import load_benchmark_cases
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.cleaner import CleanerOptions, compact_terminal_output
 from usagetrim.core.command_family import command_family
@@ -81,6 +90,9 @@ app = typer.Typer(
 
 console = Console()
 err_console = Console(stderr=True)
+_BENCHMARK_MANIFEST = (
+    Path(__file__).resolve().parents[2] / "tests/fixtures/benchmarks/manifest.json"
+)
 
 
 def _print_version(value: bool) -> None:
@@ -2647,6 +2659,104 @@ Found 8 errors in 4 files (checked 24 source files)
             "No model calls. Fixture results are not subscription savings or a task-quality benchmark."
         )
         console.print("Try your own command: usagetrim run -- <command> <args>")
+    if not passed:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def bench(
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit benchmark results as JSON")
+    ] = False,
+    baseline: Annotated[
+        Path | None, typer.Option("--baseline", help="Compare against a baseline JSON file")
+    ] = None,
+    save: Annotated[
+        Path | None, typer.Option("--save", help="Save a passing baseline to a new JSON file")
+    ] = None,
+):
+    """Benchmark the offline developer corpus in a repository checkout."""
+    try:
+        if not _BENCHMARK_MANIFEST.is_file():
+            raise ValueError(
+                "Benchmark corpus is unavailable. Run bench from a source checkout with "
+                "tests/fixtures/benchmarks/manifest.json."
+            )
+        baseline_values = (
+            baseline_from_json(baseline.read_bytes().decode("utf-8"))
+            if baseline is not None
+            else None
+        )
+        suite = benchmark_suite(load_benchmark_cases(_BENCHMARK_MANIFEST))
+        comparison = (
+            compare_baseline(baseline_values, suite) if baseline_values is not None else None
+        )
+    except (OSError, ValueError) as exc:
+        err_console.print(f"Benchmark error: {exc}", markup=False)
+        raise typer.Exit(code=2) from exc
+
+    passed = (
+        suite.signals_preserved
+        and suite.exact_recovery
+        and (comparison is None or not comparison.has_regressions)
+    )
+    saved_baseline = None
+    if save is not None and passed:
+        try:
+            baseline_text = baseline_to_json(create_baseline(suite))
+            with save.open("x", encoding="utf-8", newline="\n") as baseline_file:
+                baseline_file.write(baseline_text)
+        except (OSError, ValueError) as exc:
+            err_console.print(f"Baseline save error: {exc}", markup=False)
+            raise typer.Exit(code=2) from exc
+        saved_baseline = str(save)
+    if json_output:
+        comparison_data = (
+            {**asdict(comparison), "has_regressions": comparison.has_regressions}
+            if comparison is not None
+            else None
+        )
+        report = {"suite": asdict(suite), "comparison": comparison_data, "passed": passed}
+        if save is not None:
+            report["saved_baseline"] = saved_baseline
+        _emit(
+            json.dumps(
+                report,
+                sort_keys=True,
+                indent=2,
+                allow_nan=False,
+            )
+        )
+    else:
+        table = Table(title="UsageTrim offline benchmark (local token estimates)")
+        for column in ("Case", "Raw", "Output", "Reduction %", "Latency ms", "Signals", "Recovery"):
+            table.add_column(column)
+        rows = [(result.case_id, result) for result in suite.results] + [("TOTAL", suite)]
+        for case_id, result in rows:
+            table.add_row(
+                case_id,
+                str(result.raw_tokens),
+                str(result.output_tokens),
+                f"{result.reduction_pct:.2f}",
+                f"{result.latency_ms:.2f}",
+                "PASS" if result.signals_preserved else "FAIL",
+                "PASS" if result.exact_recovery else "FAIL",
+            )
+        console.print(table)
+        if comparison is not None:
+            comparison_table = Table(title="Baseline comparison")
+            for column in ("Case", "Status", "Drop pp"):
+                comparison_table.add_column(column)
+            for result in comparison.results:
+                comparison_table.add_row(
+                    result.case_id,
+                    result.status,
+                    "-" if result.drop_pp is None else f"{result.drop_pp:.6f}",
+                )
+            console.print(comparison_table)
+        console.print("PASS" if passed else "FAIL")
+        if saved_baseline is not None:
+            console.print(f"Baseline saved to {saved_baseline}", markup=False)
     if not passed:
         raise typer.Exit(code=1)
 

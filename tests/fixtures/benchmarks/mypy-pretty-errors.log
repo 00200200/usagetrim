@@ -1,0 +1,10 @@
+src/user.py:4: error: Incompatible return value type (got "None", expected "str")  [return-value]
+        return None
+               ^~~~
+src/session.py:6: error: Argument 1 to "authorize" has incompatible type "str | None"; expected "str"  [arg-type]
+        return authorize(token)
+                         ^~~~~
+src/billing.py:2: error: Incompatible return value type (got "str", expected "float")  [return-value]
+        return f"{subtotal + shipping:.2f}"
+               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Found 3 errors in 3 files (checked 3 source files)

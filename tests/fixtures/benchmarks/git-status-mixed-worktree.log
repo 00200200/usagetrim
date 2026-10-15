@@ -1,0 +1,15 @@
+On branch main
+Changes not staged for commit:
+  (use "git add/rm <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   src/billing.py
+	deleted:    src/legacy.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	docs/payment-flow.md
+	docs/payment-notes.md
+	src/payments.py
+	tests/test_payments.py
+
+no changes added to commit (use "git add" and/or "git commit -a")

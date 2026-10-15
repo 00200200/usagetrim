@@ -1,0 +1,4 @@
+src/billing.ts(2,3): error TS2322: Type 'string' is not assignable to type 'number'.
+src/session.ts(6,22): error TS2345: Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+  Type 'undefined' is not assignable to type 'string'.
+src/user.ts(7,3): error TS2741: Property 'email' is missing in type '{ id: number; }' but required in type 'User'.

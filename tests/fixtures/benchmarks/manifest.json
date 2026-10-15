@@ -1,0 +1,322 @@
+[
+  {
+    "id": "pytest-failure",
+    "file": "pytest-failure.log",
+    "command": "pytest -v",
+    "exit_code": 1,
+    "required_signals": ["AssertionError", "FAILED tests/test_api.py::test_failure"]
+  },
+  {
+    "id": "cargo-success",
+    "file": "cargo-success.log",
+    "command": "cargo test",
+    "exit_code": 0,
+    "required_signals": ["test result: ok. 8 passed; 0 failed"]
+  },
+  {
+    "id": "passthrough",
+    "file": "passthrough.log",
+    "command": "custom-tool",
+    "exit_code": null,
+    "required_signals": ["No changes required."]
+  },
+  {
+    "id": "pytest-verbose-success",
+    "file": "pytest-verbose-success.log",
+    "command": "python -m pytest -v --color=no tests",
+    "exit_code": 0,
+    "required_signals": ["collected 14 items", "14 passed"]
+  },
+  {
+    "id": "pytest-verbose-assertion",
+    "file": "pytest-verbose-assertion.log",
+    "command": "python -m pytest -v --color=no tests",
+    "exit_code": 1,
+    "required_signals": [
+      "test_invoice_total_includes_shipping",
+      "AssertionError",
+      "tests/test_billing.py:30",
+      "Decimal('49.99')",
+      "Decimal('4.50')",
+      "1 failed, 14 passed"
+    ]
+  },
+  {
+    "id": "tsc-pretty-type-errors",
+    "file": "tsc-pretty-type-errors.log",
+    "command": "tsc --noEmit --pretty",
+    "exit_code": 2,
+    "required_signals": ["src/billing.ts", "src/session.ts", "src/user.ts", "TS2322", "TS2345", "TS2741", "Found 3 errors in 3 files."]
+  },
+  {
+    "id": "eslint-stylish-mixed-severity",
+    "file": "eslint-stylish-mixed-severity.log",
+    "command": "eslint src --format stylish",
+    "exit_code": 1,
+    "required_signals": ["src/billing.js", "src/session.js", "no-unused-vars", "no-console", "eqeqeq", "5 problems (3 errors, 2 warnings)"]
+  },
+  {
+    "id": "pyright-source-diagnostics",
+    "file": "pyright-source-diagnostics.log",
+    "command": "pyright",
+    "exit_code": 1,
+    "required_signals": [
+      "src/billing.py:2:12",
+      "src/session.py:6:22",
+      "src/user.py:4:12",
+      "Type \"str\" is not assignable to return type \"float\"",
+      "Argument of type \"str | None\" cannot be assigned to parameter \"token\"",
+      "Type \"None\" is not assignable to return type \"str\"",
+      "3 errors, 0 warnings, 0 informations"
+    ]
+  },
+  {
+    "id": "pytest-xdist-captured-failure",
+    "file": "pytest-xdist-captured-failure.log",
+    "command": "python -m pytest -p xdist.plugin -n 2 -v --color=no tests",
+    "exit_code": 1,
+    "required_signals": [
+      "test_shipping_is_included_in_receipt",
+      "tests/test_billing.py:27",
+      "AssertionError",
+      "Decimal('49.99')",
+      "Decimal('4.50')",
+      "1 failed, 5 passed",
+      "Captured stdout call",
+      "Captured stderr call"
+    ]
+  },
+  {
+    "id": "vitest-verbose-success",
+    "file": "vitest-verbose-success.log",
+    "command": "vitest run --reporter verbose --maxWorkers 1 --minWorkers 1",
+    "exit_code": 0,
+    "required_signals": [
+      "Test Files  1 passed (1)",
+      "Tests  5 passed (5)"
+    ]
+  },
+  {
+    "id": "jest-console-failure",
+    "file": "jest-console-failure.log",
+    "command": "jest --runInBand",
+    "exit_code": 1,
+    "required_signals": [
+      "includes shipping in invoice total",
+      "Invoice total excludes shipping charge",
+      "Expected: 54.49",
+      "Received: 49.99",
+      "Test Suites: 1 failed, 1 passed, 2 total"
+    ]
+  },
+  {
+    "id": "ruff-full-diagnostics",
+    "file": "ruff-full-diagnostics.log",
+    "command": "ruff check --output-format full src",
+    "exit_code": 1,
+    "required_signals": [
+      "src/billing.py:2:15",
+      "src/session.py:1:8",
+      "src/session.py:5:5",
+      "F821",
+      "F401",
+      "F841",
+      "Found 3 errors."
+    ]
+  },
+  {
+    "id": "mypy-pretty-errors",
+    "file": "mypy-pretty-errors.log",
+    "command": "python -m mypy --pretty --show-error-codes src",
+    "exit_code": 1,
+    "required_signals": [
+      "src/user.py:4",
+      "src/session.py:6",
+      "src/billing.py:2",
+      "[return-value]",
+      "[arg-type]",
+      "Found 3 errors in 3 files"
+    ]
+  },
+  {
+    "id": "tsc-plain-type-errors",
+    "file": "tsc-plain-type-errors.log",
+    "command": "tsc --noEmit --pretty false",
+    "exit_code": 2,
+    "required_signals": [
+      "src/billing.ts",
+      "src/session.ts",
+      "src/user.ts",
+      "TS2322",
+      "TS2345",
+      "TS2741"
+    ]
+  },
+  {
+    "id": "npm-install-success",
+    "file": "npm-install-success.log",
+    "command": "npm install --save-exact --no-audit --no-fund --cache /workspace/capture/npm-cache picocolors@1.1.1",
+    "exit_code": 0,
+    "required_signals": [
+      "added 1 package"
+    ]
+  },
+  {
+    "id": "git-diff-lockfile-code",
+    "file": "git-diff-lockfile-code.log",
+    "command": "git diff --no-color HEAD -- src/billing.py package-lock.json",
+    "exit_code": 0,
+    "required_signals": [
+      "diff --git a/package-lock.json",
+      "diff --git a/src/billing.py",
+      "+    return subtotal + shipping"
+    ]
+  },
+  {
+    "id": "git-log-patch-history",
+    "file": "git-log-patch-history.log",
+    "command": "git log --no-color -p -2 -- src/billing.py package-lock.json",
+    "exit_code": 0,
+    "required_signals": [
+      "fix: include shipping in invoice total",
+      "feat: add invoice calculation",
+      "+    return subtotal + shipping",
+      "diff --git a/src/billing.py"
+    ]
+  },
+  {
+    "id": "ripgrep-context-matches",
+    "file": "ripgrep-context-matches.log",
+    "command": "rg -n -C 1 invoice_total src",
+    "exit_code": 0,
+    "required_signals": [
+      "src/billing.py",
+      "src/checkout.py",
+      "def invoice_total",
+      "return invoice_total(subtotal, shipping)"
+    ]
+  },
+  {
+    "id": "pip-install-success",
+    "file": "pip-install-success.log",
+    "command": "python -m pip install --disable-pip-version-check --no-input --no-cache-dir --index-url https://pypi.org/simple packaging==24.2",
+    "exit_code": 0,
+    "required_signals": [
+      "Installing collected packages: packaging",
+      "Successfully installed packaging-24.2"
+    ]
+  },
+  {
+    "id": "python-threaded-json-traceback",
+    "file": "python-threaded-json-traceback.log",
+    "command": "python parse_invoice.py",
+    "exit_code": 1,
+    "required_signals": [
+      "Traceback (most recent call last):",
+      "parse_invoice.py",
+      "json.decoder.JSONDecodeError: Expecting property name enclosed in double quotes",
+      "line 1 column 2 (char 1)"
+    ]
+  },
+  {
+    "id": "directory-scan-dependencies",
+    "file": "directory-scan-dependencies.log",
+    "command": "find src .venv/lib/python3.12/site-packages/packaging -type f",
+    "exit_code": 0,
+    "required_signals": [
+      "src/billing.py",
+      "src/checkout.py",
+      ".venv/"
+    ]
+  },
+  {
+    "id": "curl-local-http-error",
+    "file": "curl-local-http-error.log",
+    "command": "curl --noproxy \"*\" --verbose --no-progress-meter http://127.0.0.1:8000/invoice",
+    "exit_code": 0,
+    "required_signals": [
+      "HTTP/1.0 422 Unprocessable Entity",
+      "Content-Type: application/json",
+      "invalid_invoice",
+      "shipping amount is required"
+    ]
+  },
+  {
+    "id": "git-status-mixed-worktree",
+    "file": "git-status-mixed-worktree.log",
+    "command": "git status --untracked-files=all",
+    "exit_code": 0,
+    "required_signals": [
+      "On branch main",
+      "modified:   src/billing.py",
+      "deleted:    src/legacy.py",
+      "Untracked files:",
+      "docs/",
+      "src/",
+      "tests/"
+    ]
+  },
+  {
+    "id": "git-log-stat-history",
+    "file": "git-log-stat-history.log",
+    "command": "git log --no-color --stat -2",
+    "exit_code": 0,
+    "required_signals": [
+      "fix: include shipping and replace legacy payment helper",
+      "feat: add invoice and checkout modules",
+      "src/billing.py",
+      "src/legacy.py",
+      "tests/test_payments.py",
+      "files changed"
+    ]
+  },
+  {
+    "id": "ripgrep-json-context",
+    "file": "ripgrep-json-context.log",
+    "command": "rg --json -C 1 invoice_total src",
+    "exit_code": 0,
+    "required_signals": [
+      "src/billing.py",
+      "src/checkout.py",
+      "src/payments.py",
+      "def invoice_total",
+      "return invoice_total(subtotal, shipping)"
+    ]
+  },
+  {
+    "id": "pip-resolver-conflict",
+    "file": "pip-resolver-conflict.log",
+    "command": "python -m pip install --dry-run --ignore-installed --disable-pip-version-check --no-input --no-cache-dir --index-url https://pypi.org/simple packaging==24.2 packaging==25.0",
+    "exit_code": 1,
+    "required_signals": [
+      "ResolutionImpossible",
+      "packaging==24.2",
+      "packaging==25.0",
+      "conflicting dependencies"
+    ]
+  },
+  {
+    "id": "pytest-collection-import-failure",
+    "file": "pytest-collection-import-failure.log",
+    "command": "python -m pytest -v --color=no tests",
+    "exit_code": 2,
+    "required_signals": [
+      "ERROR collecting tests/test_invoices.py",
+      "ModuleNotFoundError",
+      "No module named 'invoice_gateway_backend'",
+      "1 error during collection"
+    ]
+  },
+  {
+    "id": "pip-inspect-package-json",
+    "file": "pip-inspect-package-json.log",
+    "command": "python -m pip inspect --path /workspace/capture/inspect-site",
+    "exit_code": 0,
+    "required_signals": [
+      "\"name\": \"packaging\"",
+      "\"version\": \"24.2\"",
+      "\"installer\": \"pip\"",
+      "\"requested\": true"
+    ]
+  }
+]

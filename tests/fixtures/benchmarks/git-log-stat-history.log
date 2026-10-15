@@ -1,0 +1,24 @@
+commit 01ea249f31991eb5f21eaeb23b9dc705cc047c67
+Author: Capture Developer <capture@example.test>
+Date:   Thu Oct 15 14:00:00 2026 +0000
+
+    fix: include shipping and replace legacy payment helper
+
+ docs/payment-flow.md   | 3 +++
+ docs/payment-notes.md  | 3 +++
+ src/billing.py         | 2 +-
+ src/legacy.py          | 2 --
+ src/payments.py        | 5 +++++
+ tests/test_payments.py | 5 +++++
+ 6 files changed, 17 insertions(+), 3 deletions(-)
+
+commit c08bd71a71d2d3bb5718fca2c5839897fe1a6c2a
+Author: Capture Developer <capture@example.test>
+Date:   Thu Oct 15 14:00:00 2026 +0000
+
+    feat: add invoice and checkout modules
+
+ src/billing.py  | 2 ++
+ src/checkout.py | 5 +++++
+ src/legacy.py   | 2 ++
+ 3 files changed, 9 insertions(+)

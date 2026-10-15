@@ -171,6 +171,11 @@ def _compact_pytest_diagnostic(lines: list[str]) -> tuple[list[str], bool]:
     return result, changed
 
 
+def recovery_notice(ref_id: str) -> str:
+    """Return the standard full-output recovery notice, including its newline."""
+    return f"[UsageTrim: full output after redaction: usagetrim retrieve {ref_id}]\n"
+
+
 def safe_compact_output(text: str, *, command: str = "", exit_code: int | None = None) -> str:
     """Filter routine records without discarding actionable failure signal.
 
@@ -262,9 +267,7 @@ def safe_compact_output(text: str, *, command: str = "", exit_code: int | None =
         cache = ContextCache()
         ref = cache.store(original, source="safe-command-output")
         separator = "" if compact.endswith(("\n", "\r")) else "\n"
-        compact += (
-            f"{separator}[UsageTrim: full output after redaction: usagetrim retrieve {ref}]\n"
-        )
+        compact += separator + recovery_notice(ref)
         if count_tokens(compact).openai >= original_tokens:
             return original
         return compact

@@ -1,0 +1,35 @@
+diff --git a/package-lock.json b/package-lock.json
+index 9c27fd3..4ec5a3b 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -8,13 +8,13 @@
+       "name": "capture-invoice",
+       "version": "1.0.0",
+       "dependencies": {
+-        "picocolors": "1.1.0"
++        "picocolors": "1.1.1"
+       }
+     },
+     "node_modules/picocolors": {
+-      "version": "1.1.0",
+-      "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.0.tgz",
+-      "integrity": "sha512-TQ92mBOW0l3LeMeyLV6mzy/kWr8lkd/hp3mTg7wYK7zJhuBStmGMBG0BdeDZS/dZx1IukaX6Bk11zcln25o1Aw==",
++      "version": "1.1.1",
++      "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
++      "integrity": "sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA==",
+       "license": "ISC"
+     }
+   }
+diff --git a/src/billing.py b/src/billing.py
+index 47ad935..ea69f70 100644
+--- a/src/billing.py
++++ b/src/billing.py
+@@ -2,7 +2,7 @@ from decimal import Decimal
+ 
+ 
+ def invoice_total(subtotal: Decimal, shipping: Decimal) -> Decimal:
+-    return subtotal
++    return subtotal + shipping
+ 
+ 
+ def receipt_message(subtotal: Decimal, shipping: Decimal) -> str:

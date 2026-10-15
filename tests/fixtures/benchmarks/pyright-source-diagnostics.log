@@ -1,0 +1,11 @@
+/workspace/capture/pyright/src/billing.py
+  /workspace/capture/pyright/src/billing.py:2:12 - error: Type "str" is not assignable to return type "float"
+    "str" is not assignable to "float" (reportReturnType)
+/workspace/capture/pyright/src/session.py
+  /workspace/capture/pyright/src/session.py:6:22 - error: Argument of type "str | None" cannot be assigned to parameter "token" of type "str" in function "authorize"
+    Type "str | None" is not assignable to type "str"
+      "None" is not assignable to "str" (reportArgumentType)
+/workspace/capture/pyright/src/user.py
+  /workspace/capture/pyright/src/user.py:4:12 - error: Type "None" is not assignable to return type "str"
+    "None" is not assignable to "str" (reportReturnType)
+3 errors, 0 warnings, 0 informations 
