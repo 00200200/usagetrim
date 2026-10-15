@@ -1,0 +1,14 @@
+src/billing.py-3-
+src/billing.py:4:def invoice_total(subtotal: Decimal, shipping: Decimal) -> Decimal:
+src/billing.py-5-    return subtotal + shipping
+--
+src/billing.py-8-def receipt_message(subtotal: Decimal, shipping: Decimal) -> str:
+src/billing.py:9:    total = invoice_total(subtotal, shipping)
+src/billing.py-10-    return f"Invoice total: {total}"
+--
+src/checkout.py-1-from decimal import Decimal
+src/checkout.py:2:from billing import invoice_total
+src/checkout.py-3-
+--
+src/checkout.py-6-    shipping = Decimal("4.50")
+src/checkout.py:7:    return invoice_total(subtotal, shipping)

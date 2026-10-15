@@ -1,0 +1,91 @@
+commit 5c7215f24977f834dafcbd03d619a6358a31bfc3
+Author: Capture Developer <capture@example.test>
+Date:   Thu Oct 15 12:00:00 2026 +0000
+
+    fix: include shipping in invoice total
+
+diff --git a/package-lock.json b/package-lock.json
+index 9c27fd3..4ec5a3b 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -8,13 +8,13 @@
+       "name": "capture-invoice",
+       "version": "1.0.0",
+       "dependencies": {
+-        "picocolors": "1.1.0"
++        "picocolors": "1.1.1"
+       }
+     },
+     "node_modules/picocolors": {
+-      "version": "1.1.0",
+-      "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.0.tgz",
+-      "integrity": "sha512-TQ92mBOW0l3LeMeyLV6mzy/kWr8lkd/hp3mTg7wYK7zJhuBStmGMBG0BdeDZS/dZx1IukaX6Bk11zcln25o1Aw==",
++      "version": "1.1.1",
++      "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
++      "integrity": "sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA==",
+       "license": "ISC"
+     }
+   }
+diff --git a/src/billing.py b/src/billing.py
+index 47ad935..ea69f70 100644
+--- a/src/billing.py
++++ b/src/billing.py
+@@ -2,7 +2,7 @@ from decimal import Decimal
+ 
+ 
+ def invoice_total(subtotal: Decimal, shipping: Decimal) -> Decimal:
+-    return subtotal
++    return subtotal + shipping
+ 
+ 
+ def receipt_message(subtotal: Decimal, shipping: Decimal) -> str:
+
+commit 0fef80c5b62eb51ec89fc2cadcd14cdfc5712ef3
+Author: Capture Developer <capture@example.test>
+Date:   Thu Oct 15 12:00:00 2026 +0000
+
+    feat: add invoice calculation
+
+diff --git a/package-lock.json b/package-lock.json
+new file mode 100644
+index 0000000..9c27fd3
+--- /dev/null
++++ b/package-lock.json
+@@ -0,0 +1,21 @@
++{
++  "name": "capture-invoice",
++  "version": "1.0.0",
++  "lockfileVersion": 3,
++  "requires": true,
++  "packages": {
++    "": {
++      "name": "capture-invoice",
++      "version": "1.0.0",
++      "dependencies": {
++        "picocolors": "1.1.0"
++      }
++    },
++    "node_modules/picocolors": {
++      "version": "1.1.0",
++      "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.0.tgz",
++      "integrity": "sha512-TQ92mBOW0l3LeMeyLV6mzy/kWr8lkd/hp3mTg7wYK7zJhuBStmGMBG0BdeDZS/dZx1IukaX6Bk11zcln25o1Aw==",
++      "license": "ISC"
++    }
++  }
++}
+diff --git a/src/billing.py b/src/billing.py
+new file mode 100644
+index 0000000..47ad935
+--- /dev/null
++++ b/src/billing.py
+@@ -0,0 +1,10 @@
++from decimal import Decimal
++
++
++def invoice_total(subtotal: Decimal, shipping: Decimal) -> Decimal:
++    return subtotal
++
++
++def receipt_message(subtotal: Decimal, shipping: Decimal) -> str:
++    total = invoice_total(subtotal, shipping)
++    return f"Invoice total: {total}"

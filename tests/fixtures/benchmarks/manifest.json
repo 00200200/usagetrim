@@ -160,5 +160,85 @@
     "required_signals": [
       "added 1 package"
     ]
+  },
+  {
+    "id": "git-diff-lockfile-code",
+    "file": "git-diff-lockfile-code.log",
+    "command": "git diff --no-color HEAD -- src/billing.py package-lock.json",
+    "exit_code": 0,
+    "required_signals": [
+      "diff --git a/package-lock.json",
+      "diff --git a/src/billing.py",
+      "+    return subtotal + shipping"
+    ]
+  },
+  {
+    "id": "git-log-patch-history",
+    "file": "git-log-patch-history.log",
+    "command": "git log --no-color -p -2 -- src/billing.py package-lock.json",
+    "exit_code": 0,
+    "required_signals": [
+      "fix: include shipping in invoice total",
+      "feat: add invoice calculation",
+      "+    return subtotal + shipping",
+      "diff --git a/src/billing.py"
+    ]
+  },
+  {
+    "id": "ripgrep-context-matches",
+    "file": "ripgrep-context-matches.log",
+    "command": "rg -n -C 1 invoice_total src",
+    "exit_code": 0,
+    "required_signals": [
+      "src/billing.py",
+      "src/checkout.py",
+      "def invoice_total",
+      "return invoice_total(subtotal, shipping)"
+    ]
+  },
+  {
+    "id": "pip-install-success",
+    "file": "pip-install-success.log",
+    "command": "python -m pip install --disable-pip-version-check --no-input --no-cache-dir --index-url https://pypi.org/simple packaging==24.2",
+    "exit_code": 0,
+    "required_signals": [
+      "Installing collected packages: packaging",
+      "Successfully installed packaging-24.2"
+    ]
+  },
+  {
+    "id": "python-threaded-json-traceback",
+    "file": "python-threaded-json-traceback.log",
+    "command": "python parse_invoice.py",
+    "exit_code": 1,
+    "required_signals": [
+      "Traceback (most recent call last):",
+      "parse_invoice.py",
+      "json.decoder.JSONDecodeError: Expecting property name enclosed in double quotes",
+      "line 1 column 2 (char 1)"
+    ]
+  },
+  {
+    "id": "directory-scan-dependencies",
+    "file": "directory-scan-dependencies.log",
+    "command": "find src .venv/lib/python3.12/site-packages/packaging -type f",
+    "exit_code": 0,
+    "required_signals": [
+      "src/billing.py",
+      "src/checkout.py",
+      ".venv/"
+    ]
+  },
+  {
+    "id": "curl-local-http-error",
+    "file": "curl-local-http-error.log",
+    "command": "curl --noproxy \"*\" --verbose --no-progress-meter http://127.0.0.1:8000/invoice",
+    "exit_code": 0,
+    "required_signals": [
+      "HTTP/1.0 422 Unprocessable Entity",
+      "Content-Type: application/json",
+      "invalid_invoice",
+      "shipping amount is required"
+    ]
   }
 ]

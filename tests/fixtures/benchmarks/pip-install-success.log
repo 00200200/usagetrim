@@ -1,0 +1,5 @@
+Collecting packaging==24.2
+  Downloading packaging-24.2-py3-none-any.whl.metadata (3.2 kB)
+Downloading packaging-24.2-py3-none-any.whl (65 kB)
+Installing collected packages: packaging
+Successfully installed packaging-24.2

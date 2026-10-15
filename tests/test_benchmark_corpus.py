@@ -52,6 +52,13 @@ def test_loaded_cases_run_directly_in_suite():
         ("mypy-pretty-errors", "filter_mypy"),
         ("tsc-plain-type-errors", "filter_tsc"),
         ("npm-install-success", "filter_npm_install"),
+        ("git-diff-lockfile-code", "filter_git_diff"),
+        ("git-log-patch-history", "filter_git_log"),
+        ("ripgrep-context-matches", "filter_ripgrep_output"),
+        ("pip-install-success", "filter_pip_install"),
+        ("python-threaded-json-traceback", "filter_traceback"),
+        ("directory-scan-dependencies", "filter_directory_scan"),
+        ("curl-local-http-error", "filter_curl_http"),
     ],
 )
 def test_captured_fixtures_preserve_signals_recovery_and_expected_routing(
