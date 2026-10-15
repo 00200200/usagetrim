@@ -6,10 +6,18 @@ import pytest
 
 from usagetrim.core import specialized
 from usagetrim.core.benchmark import benchmark_suite
+from usagetrim.core.benchmark_baseline import baseline_from_json
 from usagetrim.core.benchmark_corpus import load_benchmark_cases
 from usagetrim.core.redactor import redact_secrets
 
 CORPUS = Path(__file__).parent / "fixtures" / "benchmarks"
+
+
+def test_repository_baseline_covers_manifest_cases():
+    cases = load_benchmark_cases(CORPUS / "manifest.json")
+    baseline = baseline_from_json((CORPUS / "baseline.json").read_bytes().decode("utf-8"))
+
+    assert set(baseline) == {case.case_id for case in cases}
 
 
 def test_loads_manifest_fields_in_order_without_changing_fixture_bytes():
