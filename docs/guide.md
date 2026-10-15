@@ -351,6 +351,33 @@ No models are called. These fixture checks are not an agent-quality benchmark;
 comparison requires equal tasks, successful results, retries and recovery costs.
 Do not publish fixture percentages as guaranteed account savings.
 
+### Benchmark regression checks
+
+`usagetrim bench` measures token reduction and checks required diagnostic signals
+and exact recovery against a frozen corpus in `tests/fixtures/benchmarks/`.
+It currently contains 25 captured outputs from real tool executions on small
+controlled projects and 3 authored/smoke fixtures. See the corpus
+[provenance](../tests/fixtures/benchmarks/PROVENANCE.md) for capture details.
+The corpus is a developer resource in the repository; `bench` requires a source
+checkout. After `uv sync --all-extras`, use `uv run` before these commands:
+
+```sh
+uv run usagetrim bench
+uv run usagetrim bench --json
+uv run usagetrim bench --baseline tests/fixtures/benchmarks/baseline.json
+uv run usagetrim bench --save PATH
+```
+
+`--baseline` fails if reduction drops by more than 2 percentage points for any
+individual fixture. Failed required-signal preservation or exact recovery also
+causes failure. `--save` writes the current baseline only when the run passes and
+refuses to overwrite an existing file.
+
+Exact recovery checks the original fixture's UTF-8 bytes through the harness's
+isolated `ContextCache`, independently of signal preservation by the filter.
+Reported latency measures filter/compression processing time, not the total
+wall-clock time of the command.
+
 README artwork reuses `assets/pet-3d.png`. To rebuild its four-second animation
 and reduced-motion poster, install FFmpeg, librsvg and ImageMagick and run
 `bash scripts/render_readme.sh`. It illustrates the product; it is not a live
