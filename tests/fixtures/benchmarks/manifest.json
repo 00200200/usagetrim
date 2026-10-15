@@ -240,5 +240,83 @@
       "invalid_invoice",
       "shipping amount is required"
     ]
+  },
+  {
+    "id": "git-status-mixed-worktree",
+    "file": "git-status-mixed-worktree.log",
+    "command": "git status --untracked-files=all",
+    "exit_code": 0,
+    "required_signals": [
+      "On branch main",
+      "modified:   src/billing.py",
+      "deleted:    src/legacy.py",
+      "Untracked files:",
+      "docs/",
+      "src/",
+      "tests/"
+    ]
+  },
+  {
+    "id": "git-log-stat-history",
+    "file": "git-log-stat-history.log",
+    "command": "git log --no-color --stat -2",
+    "exit_code": 0,
+    "required_signals": [
+      "fix: include shipping and replace legacy payment helper",
+      "feat: add invoice and checkout modules",
+      "src/billing.py",
+      "src/legacy.py",
+      "tests/test_payments.py",
+      "files changed"
+    ]
+  },
+  {
+    "id": "ripgrep-json-context",
+    "file": "ripgrep-json-context.log",
+    "command": "rg --json -C 1 invoice_total src",
+    "exit_code": 0,
+    "required_signals": [
+      "src/billing.py",
+      "src/checkout.py",
+      "src/payments.py",
+      "def invoice_total",
+      "return invoice_total(subtotal, shipping)"
+    ]
+  },
+  {
+    "id": "pip-resolver-conflict",
+    "file": "pip-resolver-conflict.log",
+    "command": "python -m pip install --dry-run --ignore-installed --disable-pip-version-check --no-input --no-cache-dir --index-url https://pypi.org/simple packaging==24.2 packaging==25.0",
+    "exit_code": 1,
+    "required_signals": [
+      "ResolutionImpossible",
+      "packaging==24.2",
+      "packaging==25.0",
+      "conflicting dependencies"
+    ]
+  },
+  {
+    "id": "pytest-collection-import-failure",
+    "file": "pytest-collection-import-failure.log",
+    "command": "python -m pytest -v --color=no tests",
+    "exit_code": 2,
+    "required_signals": [
+      "ERROR collecting tests/test_invoices.py",
+      "ModuleNotFoundError",
+      "No module named 'invoice_gateway_backend'",
+      "1 error during collection"
+    ]
+  },
+  {
+    "id": "pip-inspect-package-json",
+    "file": "pip-inspect-package-json.log",
+    "command": "python -m pip inspect --path /workspace/capture/inspect-site",
+    "exit_code": 0,
+    "required_signals": [
+      "\"name\": \"packaging\"",
+      "\"version\": \"24.2\"",
+      "\"installer\": \"pip\"",
+      "\"requested\": true"
+    ]
   }
 ]

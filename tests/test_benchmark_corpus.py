@@ -59,6 +59,12 @@ def test_loaded_cases_run_directly_in_suite():
         ("python-threaded-json-traceback", "filter_traceback"),
         ("directory-scan-dependencies", "filter_directory_scan"),
         ("curl-local-http-error", "filter_curl_http"),
+        ("git-status-mixed-worktree", "filter_git_status"),
+        ("git-log-stat-history", "filter_git_log"),
+        ("ripgrep-json-context", "filter_ripgrep_output"),
+        ("pip-resolver-conflict", "filter_pip_install"),
+        ("pytest-collection-import-failure", None),
+        ("pip-inspect-package-json", "filter_json_output"),
     ],
 )
 def test_captured_fixtures_preserve_signals_recovery_and_expected_routing(
@@ -76,7 +82,10 @@ def test_captured_fixtures_preserve_signals_recovery_and_expected_routing(
         original_filter = getattr(specialized, specialized_filter)
         with patch.object(specialized, specialized_filter, wraps=original_filter) as selected:
             routed = specialized.auto_specialize_command_output(case.command, case.raw_output)
-        selected.assert_called_once_with(case.raw_output)
+        if specialized_filter == "filter_json_output":
+            selected.assert_called_once_with(case.raw_output, command=case.command)
+        else:
+            selected.assert_called_once_with(case.raw_output)
         assert routed is not None
     result = benchmark_suite((case,)).results[0]
     assert result.signals_preserved and result.exact_recovery

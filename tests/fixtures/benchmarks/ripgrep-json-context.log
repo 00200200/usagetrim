@@ -1,0 +1,17 @@
+{"type":"begin","data":{"path":{"text":"src/billing.py"}}}
+{"type":"match","data":{"path":{"text":"src/billing.py"},"lines":{"text":"def invoice_total(subtotal, shipping):\n"},"line_number":1,"absolute_offset":0,"submatches":[{"match":{"text":"invoice_total"},"start":4,"end":17}]}}
+{"type":"context","data":{"path":{"text":"src/billing.py"},"lines":{"text":"    return subtotal + shipping\n"},"line_number":2,"absolute_offset":39,"submatches":[]}}
+{"type":"end","data":{"path":{"text":"src/billing.py"},"binary_offset":null,"stats":{"elapsed":{"secs":0,"nanos":390302,"human":"0.000390s"},"searches":1,"searches_with_match":1,"bytes_searched":70,"bytes_printed":449,"matched_lines":1,"matches":1}}}
+{"type":"begin","data":{"path":{"text":"src/checkout.py"}}}
+{"type":"match","data":{"path":{"text":"src/checkout.py"},"lines":{"text":"from billing import invoice_total\n"},"line_number":1,"absolute_offset":0,"submatches":[{"match":{"text":"invoice_total"},"start":20,"end":33}]}}
+{"type":"context","data":{"path":{"text":"src/checkout.py"},"lines":{"text":"\n"},"line_number":2,"absolute_offset":34,"submatches":[]}}
+{"type":"context","data":{"path":{"text":"src/checkout.py"},"lines":{"text":"def checkout(subtotal, shipping):\n"},"line_number":4,"absolute_offset":36,"submatches":[]}}
+{"type":"match","data":{"path":{"text":"src/checkout.py"},"lines":{"text":"    return invoice_total(subtotal, shipping)\n"},"line_number":5,"absolute_offset":70,"submatches":[{"match":{"text":"invoice_total"},"start":11,"end":24}]}}
+{"type":"end","data":{"path":{"text":"src/checkout.py"},"binary_offset":null,"stats":{"elapsed":{"secs":0,"nanos":148713,"human":"0.000149s"},"searches":1,"searches_with_match":1,"bytes_searched":115,"bytes_printed":821,"matched_lines":2,"matches":2}}}
+{"type":"begin","data":{"path":{"text":"src/payments.py"}}}
+{"type":"match","data":{"path":{"text":"src/payments.py"},"lines":{"text":"from billing import invoice_total\n"},"line_number":1,"absolute_offset":0,"submatches":[{"match":{"text":"invoice_total"},"start":20,"end":33}]}}
+{"type":"context","data":{"path":{"text":"src/payments.py"},"lines":{"text":"\n"},"line_number":2,"absolute_offset":34,"submatches":[]}}
+{"type":"context","data":{"path":{"text":"src/payments.py"},"lines":{"text":"def payment_amount(subtotal, shipping):\n"},"line_number":4,"absolute_offset":36,"submatches":[]}}
+{"type":"match","data":{"path":{"text":"src/payments.py"},"lines":{"text":"    return invoice_total(subtotal, shipping)\n"},"line_number":5,"absolute_offset":76,"submatches":[{"match":{"text":"invoice_total"},"start":11,"end":24}]}}
+{"type":"end","data":{"path":{"text":"src/payments.py"},"binary_offset":null,"stats":{"elapsed":{"secs":0,"nanos":271943,"human":"0.000272s"},"searches":1,"searches_with_match":1,"bytes_searched":121,"bytes_printed":827,"matched_lines":2,"matches":2}}}
+{"data":{"elapsed_total":{"human":"0.003690s","nanos":3689836,"secs":0},"stats":{"bytes_printed":2097,"bytes_searched":306,"elapsed":{"human":"0.000811s","nanos":810958,"secs":0},"matched_lines":5,"matches":5,"searches":3,"searches_with_match":3}},"type":"summary"}
