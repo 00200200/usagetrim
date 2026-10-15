@@ -20,6 +20,16 @@ usagetrim doctor
 To update, repeat the install command with `--force`. Reconnect existing MCP
 sessions after upgrading. Configuration checks do not prove live-client use.
 
+`usagetrim doctor --fix` also repairs the UsageTrim entry in Claude Desktop,
+Cursor, Windsurf and Codex configs: trailing commas, comments and a BOM in JSON,
+a broken `[mcp_servers.usagetrim]` table in Codex TOML, commands pointing at a
+removed virtualenv, and (on macOS/Linux) non-executable wrapper scripts. Planned
+repairs are listed and confirmed first; `--yes` applies them without prompting.
+Every content change writes a `<config>.pre-usagetrim-<timestamp>-*` backup next
+to the file, and damage it cannot repair unambiguously is left untouched. It then
+sends `initialize` to each configured UsageTrim server and reports whether it
+answered within 2 seconds. Only UsageTrim's own entry is started.
+
 ## Connect clients
 
 ### MCP profiles

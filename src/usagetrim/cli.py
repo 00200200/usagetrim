@@ -15,6 +15,7 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -26,14 +27,22 @@ from usagetrim.core.companion_state import already_wrapped, paused
 from usagetrim.core.config import load_config
 from usagetrim.core.diff_slimmer import slim_git_diff
 from usagetrim.core.doctor import (
+    MCP_CLIENTS,
+    ClientRepairReport,
+    HandshakeResult,
     _codex_available,
+    check_claude_desktop_mcp,
     check_codex_mcp,
+    check_cursor_mcp,
+    check_windsurf_mcp,
     configure_claude_desktop_mcp,
     configure_codex_mcp,
     configure_cursor_mcp,
     configure_shell_alias,
     configure_windsurf_mcp,
     install_cheap_explore,
+    probe_server_entry,
+    repair_client,
     run_all_diagnostics,
     write_claude_desktop_extension,
 )
@@ -1320,10 +1329,83 @@ def share_command(
     )
 
 
+_HANDSHAKE_BADGES = {
+    "ok": "[green]✓ {}[/green]",
+    "failed": "[red]✗ {}[/red]",
+    "skipped": "[dim]– {}[/dim]",
+}
+
+
+def _render_mcp_repair_table(reports: list[ClientRepairReport]) -> Table:
+    table = Table(title="MCP Client Repair & Handshake")
+    table.add_column("Client", style="cyan")
+    table.add_column("Config path", style="dim", overflow="fold")
+    table.add_column("Handshake", overflow="fold")
+    table.add_column("Repair", overflow="fold")
+    for report in reports:
+        if report.error:
+            handshake = HandshakeResult("skipped", "config unreadable")
+            repair = f"[red]✗ {escape(report.error)}[/red]"
+        elif report.actions and not report.applied:
+            handshake = HandshakeResult("skipped", "repairs not applied")
+            repair = f"[yellow]pending: {escape('; '.join(report.actions))}[/yellow]"
+        else:
+            handshake = probe_server_entry(report.server_entry)
+            repair = (
+                f"[green]fixed: {escape('; '.join(report.actions))}[/green]"
+                if report.actions
+                else "[dim]none needed[/dim]"
+            )
+        badge = _HANDSHAKE_BADGES[handshake.status].format(escape(handshake.message))
+        table.add_row(report.client, escape(str(report.config_path)), badge, repair)
+    return table
+
+
+def _stdin_is_interactive() -> bool:
+    return sys.stdin.isatty()
+
+
+def _repair_mcp_clients(assume_yes: bool) -> None:
+    plans = [repair_client(client, apply=False) for client in MCP_CLIENTS]
+    reports = plans
+    if any(plan.actions for plan in plans):
+        console.print(
+            "\n[bold cyan]Planned MCP config repairs (backups are written first):[/bold cyan]"
+        )
+        for plan in plans:
+            for action in plan.actions:
+                console.print(f"  • {plan.client}: {escape(action)}")
+        if assume_yes:
+            approved = True
+        elif _stdin_is_interactive():
+            # Na Windowsie NUL też udaje TTY — EOF lub Ctrl+C traktujemy jak odmowę.
+            try:
+                approved = typer.confirm("Apply these repairs?", default=False)
+            except typer.Abort:
+                approved = False
+        else:
+            console.print("[yellow]Non-interactive session: re-run with --yes to apply.[/yellow]")
+            approved = False
+        if approved:
+            reports = [
+                repair_client(client, apply=True) if plan.actions else plan
+                for client, plan in zip(MCP_CLIENTS, plans)
+            ]
+    console.print(_render_mcp_repair_table(reports))
+
+
 @app.command()
 def doctor(
     fix: Annotated[
-        bool, typer.Option("--fix", "-f", help="Automatically configure missing integrations")
+        bool,
+        typer.Option(
+            "--fix",
+            "-f",
+            help="Configure missing integrations, repair MCP configs and probe each server",
+        ),
+    ] = False,
+    yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Apply MCP config repairs without prompting")
     ] = False,
 ):
     """Diagnose environment and integration health across Claude, Cursor, and shell."""
@@ -1347,28 +1429,32 @@ def doctor(
 
     if fix:
         console.print("\n[bold cyan]Applying automatic configuration fixes...[/bold cyan]")
-        c_ok, c_msg = configure_cursor_mcp()
-        if c_ok:
-            console.print(f"[green]✓ Configured Cursor MCP in {c_msg}[/green]")
-        w_ok, w_msg = configure_windsurf_mcp()
-        if w_ok:
-            console.print(f"[green]✓ Configured Windsurf MCP in {w_msg}[/green]")
-        if sys.platform == "darwin":
+        # Istniejące wpisy zmienia wyłącznie potwierdzana naprawa poniżej.
+        if check_cursor_mcp().status == "missing":
+            c_ok, c_msg = configure_cursor_mcp()
+            if c_ok:
+                console.print(f"[green]✓ Configured Cursor MCP in {c_msg}[/green]")
+        if check_windsurf_mcp().status == "missing":
+            w_ok, w_msg = configure_windsurf_mcp()
+            if w_ok:
+                console.print(f"[green]✓ Configured Windsurf MCP in {w_msg}[/green]")
+        if sys.platform == "darwin" and check_claude_desktop_mcp().status == "missing":
             cd_ok, cd_msg = configure_claude_desktop_mcp()
             if cd_ok:
                 console.print(f"[green]✓ Configured Claude Desktop MCP in {cd_msg}[/green]")
-        if _codex_available():
-            codex_diag = check_codex_mcp()
-            if codex_diag.status in {"missing", "warning"}:
-                cx_ok, cx_msg = configure_codex_mcp()
-                if cx_ok:
-                    console.print(f"[green]✓ Configured Codex MCP in {cx_msg}[/green]")
+        if _codex_available() and check_codex_mcp().status == "missing":
+            cx_ok, cx_msg = configure_codex_mcp()
+            if cx_ok:
+                console.print(f"[green]✓ Configured Codex MCP in {cx_msg}[/green]")
         a_ok, a_msg = configure_shell_alias()
         if a_ok:
             console.print(f"[green]✓ Configured shell alias in {a_msg}[/green]")
         else:
             console.print(f"[dim]• {a_msg}[/dim]")
+        _repair_mcp_clients(assume_yes=yes)
     else:
+        if yes:
+            console.print("[yellow]--yes only applies together with --fix.[/yellow]")
         missing = [d for d in diagnostics if d.status in {"missing", "warning"} and d.remedy]
         if missing:
             console.print(
