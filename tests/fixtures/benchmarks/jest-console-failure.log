@@ -1,0 +1,50 @@
+PASS ./status.test.cjs
+  ● Console
+
+    console.log
+      Checking payment status normalization
+
+      at Object.<anonymous> (status.test.cjs:2:11)
+
+    console.log
+      Payment is pending authorization
+
+      at Object.<anonymous> (status.test.cjs:6:11)
+
+FAIL ./billing.test.cjs
+  ● Console
+
+    console.error
+      Invoice total excludes shipping charge
+
+      3 |   const shipping = 4.50;
+      4 |   const total = subtotal;
+    > 5 |   console.error('Invoice total excludes shipping charge');
+        |           ^
+      6 |   expect(total).toBe(subtotal + shipping);
+      7 | });
+      8 |
+
+      at Object.<anonymous> (billing.test.cjs:5:11)
+
+  ● includes shipping in invoice total
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 54.49
+    Received: 49.99
+
+      4 |   const total = subtotal;
+      5 |   console.error('Invoice total excludes shipping charge');
+    > 6 |   expect(total).toBe(subtotal + shipping);
+        |                 ^
+      7 | });
+      8 |
+
+      at Object.<anonymous> (billing.test.cjs:6:17)
+
+Test Suites: 1 failed, 1 passed, 2 total
+Tests:       1 failed, 2 passed, 3 total
+Snapshots:   0 total
+Time:        0.211 s
+Ran all test suites.

@@ -1,6 +1,6 @@
 # Benchmark fixture provenance
 
-Five fixtures are captured outputs from real tool executions on small, controlled
+Twelve fixtures are captured outputs from real tool executions on small, controlled
 projects authored for this corpus. They are not production-project dumps. The
 three original authored/smoke fixtures are not counted as captured outputs.
 
@@ -14,14 +14,30 @@ three original authored/smoke fixtures are not counted as captured outputs.
 | tsc-pretty-type-errors | captured | TypeScript 5.8.3; Node 22.17.1 | `tsc --noEmit --pretty` | Strict/noEmit project with three source files: missing email, optional token, incorrect numeric return; exit 2 | None; relative source paths and original ANSI retained |
 | eslint-stylish-mixed-severity | captured | ESLint 9.24.0; Node 22.17.1 | `eslint src --format stylish` | Two JavaScript files; flat config enables no-unused-vars/error, no-console/warn, eqeqeq/error; exit 1 | Capture root replaced with `/workspace/capture` |
 | pyright-source-diagnostics | captured | Pyright 1.1.398; Node 22.17.1 | `pyright` | Strict Python 3.12 project with three files: incompatible returns and optional token argument; exit 1 | Capture root replaced with `/workspace/capture` |
+| pytest-xdist-captured-failure | captured | pytest 9.1.1; pytest-xdist 3.8.0; Python 3.12.7; pluggy 1.6.0 | `python -m pytest -p xdist.plugin -n 2 -v --color=no tests` | Six billing/status tests on two workers, including an omitted-shipping assertion and captured stdout/stderr; exit 1 | Capture root replaced with `/workspace/capture`; interpreter replaced with `/opt/capture-venv/bin/python` |
+| vitest-verbose-success | captured | Vitest 3.1.1; Node 22.17.1 | `vitest run --reporter verbose --maxWorkers 1 --minWorkers 1` | Five invoice/status checks in a controlled JavaScript project; exit 0 | Capture root replaced with `/workspace/capture` |
+| jest-console-failure | captured | Jest 29.7.0; Node 22.17.1 | `jest --runInBand` | Two passing status tests with console logs and one failed shipping-total test with console.error; exit 1 | None; tool emits relative paths |
+| ruff-full-diagnostics | captured | Ruff 0.9.10; Python 3.12.7 | `ruff check --output-format full src` | Two Python files with undefined currency, unused import and unused assignment; exit 1 | None; tool emits relative paths |
+| mypy-pretty-errors | captured | Mypy 1.15.0; Python 3.12.7 | `python -m mypy --pretty --show-error-codes src` | Three Python files with incompatible returns and optional token argument, captured with `COLUMNS=120`; exit 1 | None; tool emits relative paths |
+| tsc-plain-type-errors | captured | TypeScript 5.8.3; Node 22.17.1 | `tsc --noEmit --pretty false` | Same strict three-file project as the 7A pretty capture, with plain diagnostic formatting; exit 2 | None; tool emits relative paths |
+| npm-install-success | captured | npm 11.21.0; Node 22.17.1 | `npm install --save-exact --no-audit --no-fund --cache /workspace/capture/npm-cache picocolors@1.1.1` | Actual registry installation of picocolors 1.1.1 into an empty private project; exit 0 | No output substitutions needed; command's machine-specific cache path is documented with `/workspace/capture/npm-cache` |
 
-All captures used a temporary directory outside the repository. Python used the
-existing local interpreter; Node tools were installed in an isolated npm project
+All captures used a temporary directory outside the repository. The 7A Python
+captures used the existing local interpreter; Node tools used an isolated npm project
 with exact package versions and npm 11.21.0. The command names above identify the
 actual arguments; Python resolved to the local venv executable and Node tools to
 the isolated project's `node_modules/.bin/`. No helper project or dependency was
 added to this repository. Pytest used `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`; captures
 used `NO_COLOR=1`, with TypeScript's explicit `--pretty` retaining ANSI.
+
+The 7B Python tools were installed with exact versions into a separate temporary
+venv; Vitest, Jest and TypeScript used a separate temporary npm project. Pytest
+xdist was loaded explicitly with `-p xdist.plugin` while plugin autoload stayed
+disabled. Mypy used `COLUMNS=120` to capture unwrapped diagnostic headers and error
+codes. The initial width-80 capture is retained in the temporary evidence: the
+current Mypy filter drops wrapped continuation lines, including their codes.
+Neither capture was manually reflowed. Worker order, durations and start times
+remain actual tool output and can vary on a fresh execution.
 
 Each log is the combined stdout/stderr byte stream (`stderr=STDOUT`), modified only
 by the path substitutions listed above. Timings, padding, line endings, trailing
@@ -37,9 +53,24 @@ Initial measurements with the existing local `.openai` estimator:
 | tsc-pretty-type-errors | specialized: filter_tsc | 502 | 502 | 0.000000 | PASS | PASS |
 | eslint-stylish-mixed-severity | specialized: filter_eslint | 133 | 134 | -0.751880 | PASS | PASS |
 | pyright-source-diagnostics | specialized: filter_pyright | 227 | 177 | 22.026432 | PASS | PASS |
+| pytest-xdist-captured-failure | safe | 617 | 530 | 14.100486 | PASS | PASS |
+| vitest-verbose-success | specialized: filter_jest_vitest | 159 | 122 | 23.270440 | PASS | PASS |
+| jest-console-failure | specialized: filter_jest_vitest | 325 | 314 | 3.384615 | PASS | PASS |
+| ruff-full-diagnostics | specialized: filter_ruff | 217 | 141 | 35.023041 | PASS | PASS |
+| mypy-pretty-errors | specialized: filter_mypy | 136 | 131 | 3.676471 | PASS | PASS |
+| tsc-plain-type-errors | specialized: filter_tsc | 108 | 114 | -5.555556 | PASS | PASS |
+| npm-install-success | specialized: filter_npm_install | 10 | 37 | -270.000000 | PASS | PASS |
 
 TypeScript's ANSI pretty output is an intentional captured no-op guard. ESLint's
 small output expands by one token including the recovery notice; it is retained
 without padding. Pyright keeps primary diagnostic headers and summary but drops
 continuation details, including rule IDs. Its required signals check the primary
 locations/messages and summary, not preservation of those omitted details.
+
+Plain TypeScript exercises recognized diagnostic headers but expands by six
+tokens including recovery metadata. npm's short install summary expands by 27
+tokens: the production filter changes whitespace, triggering the harness notice.
+The percentage is large because the input contains only ten tokens. Both are
+retained without padding. Required xdist signals check the assertion, location,
+summary and captured-section headers; they do not require preservation of the
+captured I/O bodies that safe filtering intentionally folds.

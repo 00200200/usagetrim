@@ -69,5 +69,96 @@
       "Type \"None\" is not assignable to return type \"str\"",
       "3 errors, 0 warnings, 0 informations"
     ]
+  },
+  {
+    "id": "pytest-xdist-captured-failure",
+    "file": "pytest-xdist-captured-failure.log",
+    "command": "python -m pytest -p xdist.plugin -n 2 -v --color=no tests",
+    "exit_code": 1,
+    "required_signals": [
+      "test_shipping_is_included_in_receipt",
+      "tests/test_billing.py:27",
+      "AssertionError",
+      "Decimal('49.99')",
+      "Decimal('4.50')",
+      "1 failed, 5 passed",
+      "Captured stdout call",
+      "Captured stderr call"
+    ]
+  },
+  {
+    "id": "vitest-verbose-success",
+    "file": "vitest-verbose-success.log",
+    "command": "vitest run --reporter verbose --maxWorkers 1 --minWorkers 1",
+    "exit_code": 0,
+    "required_signals": [
+      "Test Files  1 passed (1)",
+      "Tests  5 passed (5)"
+    ]
+  },
+  {
+    "id": "jest-console-failure",
+    "file": "jest-console-failure.log",
+    "command": "jest --runInBand",
+    "exit_code": 1,
+    "required_signals": [
+      "includes shipping in invoice total",
+      "Invoice total excludes shipping charge",
+      "Expected: 54.49",
+      "Received: 49.99",
+      "Test Suites: 1 failed, 1 passed, 2 total"
+    ]
+  },
+  {
+    "id": "ruff-full-diagnostics",
+    "file": "ruff-full-diagnostics.log",
+    "command": "ruff check --output-format full src",
+    "exit_code": 1,
+    "required_signals": [
+      "src/billing.py:2:15",
+      "src/session.py:1:8",
+      "src/session.py:5:5",
+      "F821",
+      "F401",
+      "F841",
+      "Found 3 errors."
+    ]
+  },
+  {
+    "id": "mypy-pretty-errors",
+    "file": "mypy-pretty-errors.log",
+    "command": "python -m mypy --pretty --show-error-codes src",
+    "exit_code": 1,
+    "required_signals": [
+      "src/user.py:4",
+      "src/session.py:6",
+      "src/billing.py:2",
+      "[return-value]",
+      "[arg-type]",
+      "Found 3 errors in 3 files"
+    ]
+  },
+  {
+    "id": "tsc-plain-type-errors",
+    "file": "tsc-plain-type-errors.log",
+    "command": "tsc --noEmit --pretty false",
+    "exit_code": 2,
+    "required_signals": [
+      "src/billing.ts",
+      "src/session.ts",
+      "src/user.ts",
+      "TS2322",
+      "TS2345",
+      "TS2741"
+    ]
+  },
+  {
+    "id": "npm-install-success",
+    "file": "npm-install-success.log",
+    "command": "npm install --save-exact --no-audit --no-fund --cache /workspace/capture/npm-cache picocolors@1.1.1",
+    "exit_code": 0,
+    "required_signals": [
+      "added 1 package"
+    ]
   }
 ]

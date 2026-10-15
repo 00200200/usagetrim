@@ -1,0 +1,14 @@
+
+ RUN  v3.1.1 /workspace/capture/vitest
+
+ ✓ billing.test.js > invoice totals > includes shipping 1ms
+ ✓ billing.test.js > invoice totals > handles free shipping 0ms
+ ✓ billing.test.js > invoice totals > handles an empty cart 0ms
+ ✓ billing.test.js > payment status > normalizes paid status 0ms
+ ✓ billing.test.js > payment status > normalizes pending status 0ms
+
+ Test Files  1 passed (1)
+      Tests  5 passed (5)
+   Start at  19:30:06
+   Duration  211ms (transform 26ms, setup 0ms, collect 13ms, tests 3ms, environment 0ms, prepare 62ms)
+

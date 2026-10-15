@@ -1,0 +1,25 @@
+src/billing.py:2:15: F821 Undefined name `currency`
+  |
+1 | def invoice_label(total: float) -> str:
+2 |     return f"{currency} {total:.2f}"
+  |               ^^^^^^^^ F821
+  |
+
+src/session.py:1:8: F401 [*] `os` imported but unused
+  |
+1 | import os
+  |        ^^ F401
+  |
+  = help: Remove unused import: `os`
+
+src/session.py:5:5: F841 Local variable `expires_at` is assigned to but never used
+  |
+4 | def is_authorized(token: str) -> bool:
+5 |     expires_at = 3600
+  |     ^^^^^^^^^^ F841
+6 |     return bool(token)
+  |
+  = help: Remove assignment to unused variable `expires_at`
+
+Found 3 errors.
+[*] 1 fixable with the `--fix` option (1 hidden fix can be enabled with the `--unsafe-fixes` option).

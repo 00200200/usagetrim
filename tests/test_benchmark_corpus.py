@@ -1,17 +1,13 @@
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
+from usagetrim.core import specialized
 from usagetrim.core.benchmark import benchmark_suite
 from usagetrim.core.benchmark_corpus import load_benchmark_cases
 from usagetrim.core.redactor import redact_secrets
-from usagetrim.core.specialized import (
-    auto_specialize_command_output,
-    filter_eslint,
-    filter_pyright,
-    filter_tsc,
-)
 
 CORPUS = Path(__file__).parent / "fixtures" / "benchmarks"
 
@@ -46,9 +42,16 @@ def test_loaded_cases_run_directly_in_suite():
     [
         ("pytest-verbose-success", None),
         ("pytest-verbose-assertion", None),
-        ("tsc-pretty-type-errors", filter_tsc),
-        ("eslint-stylish-mixed-severity", filter_eslint),
-        ("pyright-source-diagnostics", filter_pyright),
+        ("tsc-pretty-type-errors", "filter_tsc"),
+        ("eslint-stylish-mixed-severity", "filter_eslint"),
+        ("pyright-source-diagnostics", "filter_pyright"),
+        ("pytest-xdist-captured-failure", None),
+        ("vitest-verbose-success", "filter_jest_vitest"),
+        ("jest-console-failure", "filter_jest_vitest"),
+        ("ruff-full-diagnostics", "filter_ruff"),
+        ("mypy-pretty-errors", "filter_mypy"),
+        ("tsc-plain-type-errors", "filter_tsc"),
+        ("npm-install-success", "filter_npm_install"),
     ],
 )
 def test_captured_fixtures_preserve_signals_recovery_and_expected_routing(
@@ -56,12 +59,18 @@ def test_captured_fixtures_preserve_signals_recovery_and_expected_routing(
 ):
     cases = {case.case_id: case for case in load_benchmark_cases(CORPUS / "manifest.json")}
     case = cases[case_id]
+    assert case.raw_output.encode("utf-8").decode("utf-8") == case.raw_output
     assert redact_secrets(case.raw_output) == case.raw_output
-    routed = auto_specialize_command_output(case.command, case.raw_output)
+    assert all(signal in case.raw_output for signal in case.required_signals)
     if specialized_filter is None:
+        routed = specialized.auto_specialize_command_output(case.command, case.raw_output)
         assert routed is None
     else:
-        assert routed == specialized_filter(case.raw_output)
+        original_filter = getattr(specialized, specialized_filter)
+        with patch.object(specialized, specialized_filter, wraps=original_filter) as selected:
+            routed = specialized.auto_specialize_command_output(case.command, case.raw_output)
+        selected.assert_called_once_with(case.raw_output)
+        assert routed is not None
     result = benchmark_suite((case,)).results[0]
     assert result.signals_preserved and result.exact_recovery
     assert result.raw_tokens > 0 and result.output_tokens > 0
