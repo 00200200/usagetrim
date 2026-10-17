@@ -768,6 +768,69 @@ def prompt_cache_inject_command(
     )
 
 
+@prompt_app.command("trim")
+def prompt_trim_command(
+    file: Annotated[
+        Path,
+        typer.Argument(help="Path to JSON file containing messages array or request payload"),
+    ],
+    max_tokens: Annotated[
+        int,
+        typer.Option("--max-tokens", "-m", help="Target token ceiling for conversation context"),
+    ] = 16000,
+    keep_recent_turns: Annotated[
+        int,
+        typer.Option("--keep-recent", "-k", help="Number of recent turns to preserve verbatim"),
+    ] = 6,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Write trimmed conversation JSON to file"),
+    ] = None,
+):
+    """Dynamically trim chat conversation history with rolling milestone checkpoints."""
+    from usagetrim.core.distill import count_history_tokens, trim_conversation_history
+
+    try:
+        raw = file.read_text(encoding="utf-8", errors="replace")
+        data = json.loads(raw)
+    except Exception as exc:
+        raise typer.BadParameter(f"Cannot parse JSON file: {exc}") from exc
+
+    is_payload = False
+    if isinstance(data, list):
+        messages = data
+    elif isinstance(data, dict) and "messages" in data:
+        messages = data["messages"]
+        is_payload = True
+    else:
+        raise typer.BadParameter(
+            "JSON file must be a list of messages or a dict with 'messages' key"
+        )
+
+    before_tokens = count_history_tokens(messages)
+    trimmed_messages = trim_conversation_history(
+        messages, max_tokens=max_tokens, keep_recent_turns=keep_recent_turns
+    )
+    after_tokens = count_history_tokens(trimmed_messages)
+
+    if is_payload:
+        data["messages"] = trimmed_messages
+        result_obj = data
+    else:
+        result_obj = trimmed_messages
+
+    out_json = json.dumps(result_obj, indent=2, ensure_ascii=False)
+    if output is not None:
+        output.write_text(out_json, encoding="utf-8")
+        err_console.print(
+            f"[green]Trimmed {len(messages)} messages: {before_tokens} -> {after_tokens} tokens "
+            f"({round((before_tokens - after_tokens) / max(1, before_tokens) * 100, 1)}% reduction) "
+            f"written to {output}[/green]"
+        )
+    else:
+        _emit(out_json)
+
+
 @app.command("optimize")
 def optimize_command(
     target: Annotated[

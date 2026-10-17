@@ -728,3 +728,39 @@ def test_cli_install_codex_and_profile(tmp_path, monkeypatch):
     assert "Claude Desktop MCP configured" in res_claude.output
     assert fake_claude_cfg.exists()
     assert "desktop" in fake_claude_cfg.read_text()
+
+
+def test_cli_prompt_trim(tmp_path):
+    import json
+
+    messages = [
+        {"role": "system", "content": "You are an assistant."},
+        {"role": "user", "content": "Fix bug in app."},
+    ]
+    for i in range(10):
+        messages.append({"role": "assistant", "content": f"Step {i} investigating"})
+        messages.append({"role": "tool", "name": "bash", "content": "pytest passed\n" * 50})
+
+    input_file = tmp_path / "chat.json"
+    output_file = tmp_path / "chat_trimmed.json"
+    input_file.write_text(json.dumps(messages), encoding="utf-8")
+
+    res = runner.invoke(
+        app,
+        [
+            "prompt",
+            "trim",
+            str(input_file),
+            "--max-tokens",
+            "8000",
+            "--keep-recent",
+            "4",
+            "-o",
+            str(output_file),
+        ],
+    )
+    assert res.exit_code == 0
+    assert output_file.exists()
+    trimmed_data = json.loads(output_file.read_text(encoding="utf-8"))
+    assert len(trimmed_data) == len(messages)
+    assert "omitted by usagetrim" in trimmed_data[3]["content"]
