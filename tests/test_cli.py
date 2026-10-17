@@ -589,6 +589,39 @@ def test_cli_prompt_minify(tmp_path):
     assert "comment" not in res.output
 
 
+def test_cli_prompt_cache_inject(tmp_path):
+    payload_file = tmp_path / "payload.json"
+    out_file = tmp_path / "cached_payload.json"
+    payload = {
+        "tools": [
+            {"name": "zebra_tool", "description": "Zebra tool description"},
+            {"name": "alpha_tool", "description": "Alpha tool description"},
+        ],
+        "messages": [
+            {"role": "user", "content": "Instructions and prompt content. " * 60},
+        ],
+    }
+    payload_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    res = runner.invoke(
+        app,
+        [
+            "prompt",
+            "cache-inject",
+            str(payload_file),
+            "--output",
+            str(out_file),
+            "--min-tokens",
+            "100",
+        ],
+    )
+    assert res.exit_code == 0
+    assert out_file.exists()
+    cached = json.loads(out_file.read_text(encoding="utf-8"))
+    assert [t["name"] for t in cached["tools"]] == ["alpha_tool", "zebra_tool"]
+    assert "cache_control" in cached["messages"][-1]["content"][-1]
+
+
 def test_cli_optimize_file(tmp_path):
     f = tmp_path / "prompt.md"
     f.write_text("""Review this table:

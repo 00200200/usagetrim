@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -278,3 +280,190 @@ def stabilize_cache_prefix(text: str) -> str:
     stabilized = _VOLATILE_PATH_PATTERN.sub("<tmpdir>", aligned)
 
     return stabilized
+
+
+class PromptCacheResult(tuple):
+    """Result tuple supporting (messages, tools) unpacking while providing metadata attributes."""
+
+    def __new__(
+        cls,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        breakpoints_placed: int = 0,
+        total_tokens: int = 0,
+        system: str | list[dict[str, Any]] | None = None,
+    ):
+        return super().__new__(cls, (messages, tools))
+
+    def __init__(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        breakpoints_placed: int = 0,
+        total_tokens: int = 0,
+        system: str | list[dict[str, Any]] | None = None,
+    ):
+        self.messages = messages
+        self.tools = tools
+        self.breakpoints_placed = breakpoints_placed
+        self.total_tokens = total_tokens
+        self.system = system
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "messages": self.messages,
+            "tools": self.tools,
+            "breakpoints_placed": self.breakpoints_placed,
+            "total_tokens": self.total_tokens,
+            "system": self.system,
+        }
+
+
+def _message_token_count(msg: dict[str, Any]) -> int:
+    content = msg.get("content")
+    if isinstance(content, str):
+        return count_tokens(content).claude
+    elif isinstance(content, list):
+        total = 0
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text") or block.get("content") or ""
+                if not text and "input" in block:
+                    text = json.dumps(block["input"], sort_keys=True)
+                total += count_tokens(str(text)).claude
+            else:
+                total += count_tokens(str(block)).claude
+        return max(1, total)
+    elif content is None:
+        return 0
+    else:
+        return count_tokens(str(content)).claude
+
+
+def _tool_token_count(tool: dict[str, Any]) -> int:
+    return count_tokens(json.dumps(tool, sort_keys=True)).claude
+
+
+def _add_cache_control_to_tool(tool: dict[str, Any]) -> None:
+    tool["cache_control"] = {"type": "ephemeral"}
+
+
+def _add_cache_control_to_message(msg: dict[str, Any]) -> None:
+    content = msg.get("content")
+    if isinstance(content, str):
+        msg["content"] = [
+            {
+                "type": "text",
+                "text": content,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+    elif isinstance(content, list) and content:
+        for b in content:
+            if isinstance(b, dict) and "cache_control" in b:
+                return
+        last_block = content[-1]
+        if isinstance(last_block, dict):
+            last_block["cache_control"] = {"type": "ephemeral"}
+        else:
+            content[-1] = {
+                "type": "text",
+                "text": str(last_block),
+                "cache_control": {"type": "ephemeral"},
+            }
+    elif isinstance(content, list) and not content:
+        msg["content"] = [
+            {
+                "type": "text",
+                "text": "",
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
+
+def inject_prompt_cache_breakpoints(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    system: str | list[dict[str, Any]] | None = None,
+    min_tokens: int = 1024,
+    max_breakpoints: int = 4,
+) -> PromptCacheResult:
+    """Auto-inject Anthropic Prompt Caching breakpoints at optimal prefix boundaries.
+
+    Positions up to `max_breakpoints` (default: 4) `cache_control: {"type": "ephemeral"}`
+    breakpoints at stable prefix milestones meeting Anthropic's `min_tokens` (default: 1024)
+    threshold.
+
+    1. Stabilizes tool definitions alphabetically by name to prevent cache busts.
+    2. Places a breakpoint on the last tool definition if tools + system >= min_tokens.
+    3. Positions remaining breakpoints across conversational message history turns,
+       ensuring the most recent stable context is cached for subsequent turns.
+    """
+    messages_copy = copy.deepcopy(messages)
+    tools_copy = copy.deepcopy(tools) if tools is not None else []
+    system_copy = copy.deepcopy(system) if system is not None else None
+
+    # 1. Stabilize tool definitions alphabetically
+    if tools_copy:
+        tools_copy = sorted(tools_copy, key=lambda t: str(t.get("name", "")))
+        for t in tools_copy:
+            t.pop("cache_control", None)
+
+    # 2. Compute prefix token counts
+    system_tokens = 0
+    if isinstance(system_copy, str):
+        system_tokens = count_tokens(system_copy).claude
+    elif isinstance(system_copy, list):
+        for block in system_copy:
+            if isinstance(block, dict):
+                system_tokens += count_tokens(block.get("text", "")).claude
+
+    tools_tokens = sum(_tool_token_count(t) for t in tools_copy)
+    prefix_tokens = system_tokens + tools_tokens
+
+    breakpoints_placed = 0
+    remaining_breakpoints = max_breakpoints
+
+    # 3. Checkpoint on System / Tools
+    if tools_copy and prefix_tokens >= min_tokens and remaining_breakpoints > 0:
+        _add_cache_control_to_tool(tools_copy[-1])
+        breakpoints_placed += 1
+        remaining_breakpoints -= 1
+
+    # 4. Checkpoints in Messages
+    cumulative_tokens = prefix_tokens
+    cum_token_counts: list[int] = []
+
+    for msg in messages_copy:
+        t_count = _message_token_count(msg)
+        cumulative_tokens += t_count
+        cum_token_counts.append(cumulative_tokens)
+
+    eligible_indices = [idx for idx, c_tok in enumerate(cum_token_counts) if c_tok >= min_tokens]
+
+    if eligible_indices and remaining_breakpoints > 0:
+        if len(eligible_indices) <= remaining_breakpoints:
+            selected_indices = eligible_indices
+        else:
+            last_idx = eligible_indices[-1]
+            earlier = eligible_indices[:-1]
+            num_earlier = remaining_breakpoints - 1
+
+            if num_earlier > 0 and earlier:
+                step = len(earlier) / num_earlier
+                selected_earlier = [earlier[int(k * step)] for k in range(num_earlier)]
+                selected_indices = sorted(set(selected_earlier + [last_idx]))
+            else:
+                selected_indices = [last_idx]
+
+        for idx in selected_indices:
+            _add_cache_control_to_message(messages_copy[idx])
+            breakpoints_placed += 1
+
+    return PromptCacheResult(
+        messages=messages_copy,
+        tools=tools_copy,
+        breakpoints_placed=breakpoints_placed,
+        total_tokens=cumulative_tokens,
+        system=system_copy,
+    )
