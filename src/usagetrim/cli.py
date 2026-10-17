@@ -68,7 +68,7 @@ from usagetrim.core.rules_linter import (
     optimize_rules,
 )
 from usagetrim.core.safe_filter import safe_compact_output
-from usagetrim.core.skeleton import extract_symbol_or_range
+from usagetrim.core.skeleton import extract_symbol_or_range, extract_types_stub
 from usagetrim.core.specialized import (
     author_kubectl_describe_fixture,
     author_terraform_plan_fixture,
@@ -947,6 +947,12 @@ def cat(
     budget: Annotated[
         int | None, typer.Option("--budget", "-b", help="Strict token ceiling budget")
     ] = None,
+    types_only: Annotated[
+        bool,
+        typer.Option(
+            "--types", "-t", help="Extract pure type definitions / interface stubs (.pyi / .d.ts)"
+        ),
+    ] = False,
 ):
     """Inspect file with AST skeletonization, symbol filtering, or line slicing."""
     if not file_path.exists():
@@ -985,6 +991,7 @@ def cat(
             lines_range=lines,
             skeleton=skeleton,
             strip_comments=strip_comments,
+            types_only=types_only,
         )
     except (ValueError, SyntaxError, OSError) as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -1005,6 +1012,48 @@ def cat(
         requested,
         _emit(output),
         operation="read",
+        project=file_path,
+        duration_s=time.perf_counter() - start,
+        engine="none" if paused() else "usagetrim",
+    )
+
+
+@app.command(name="types")
+def types_cmd(
+    file_path: Annotated[
+        Path, typer.Argument(help="Path to source file (.py, .ts, .go, .rs, etc.)")
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional output file path to write type stubs to"),
+    ] = None,
+    budget: Annotated[
+        int | None,
+        typer.Option("--budget", "-b", help="Strict token ceiling budget"),
+    ] = None,
+):
+    """Generate on-the-fly .pyi / .d.ts type definition stubs eliding function bodies."""
+    if not file_path.exists():
+        err_console.print(f"[bold red]File not found:[/bold red] {file_path}")
+        raise typer.Exit(code=1)
+
+    start = time.perf_counter()
+    raw = file_path.read_text(encoding="utf-8", errors="replace")
+    stub = extract_types_stub(raw, file_path.suffix)
+
+    if budget:
+        stub = compress_to_budget(stub, max_tokens=budget, source=str(file_path))
+
+    if output:
+        output.write_text(stub, encoding="utf-8")
+        console.print(f"[green]Wrote type stub to {output}[/green]")
+    else:
+        _emit(stub)
+
+    record_text(
+        raw,
+        stub,
+        operation="types",
         project=file_path,
         duration_s=time.perf_counter() - start,
         engine="none" if paused() else "usagetrim",

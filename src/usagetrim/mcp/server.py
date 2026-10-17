@@ -200,6 +200,11 @@ TOOLS_DEFINITIONS = [
                     "description": "If true and file exceeds budget without symbol/lines, returns structural AST outline.",
                     "default": False,
                 },
+                "types_only": {
+                    "type": "boolean",
+                    "description": "If true, extracts pure type definition / interface stubs (.d.ts / .pyi) eliding function bodies.",
+                    "default": False,
+                },
             },
             "required": ["path"],
         },
@@ -786,6 +791,7 @@ def handle_usagetrim_read(arguments: dict[str, Any]) -> str:
         return _record(raw_full, output, operation="read", project=path)
 
     auto_skeleton = bool(arguments.get("auto_skeleton", False))
+    types_only = bool(arguments.get("types_only", False))
 
     extracted = extract_symbol_or_range(
         path,
@@ -793,6 +799,7 @@ def handle_usagetrim_read(arguments: dict[str, Any]) -> str:
         lines_range=lines,
         skeleton=skeleton,
         strip_comments=strip_comments,
+        types_only=types_only,
     )
     if auto_skeleton and symbol is None and lines is None and not skeleton:
         if count_tokens(extracted).avg > budget:

@@ -457,6 +457,36 @@ def test_cli_cat_if_modified_since_and_hash(tmp_path):
     assert "var = 'constant'" in res_hash.output
 
 
+def test_cli_cat_types(tmp_path):
+    f = tmp_path / "service.py"
+    f.write_text(
+        "class MyService:\n    timeout: int = 30\n    def execute(self):\n        for i in range(100): pass\n"
+    )
+    res = runner.invoke(app, ["cat", str(f), "--types"])
+    assert res.exit_code == 0
+    assert "class MyService:" in res.output
+    assert "timeout: int = 30" in res.output
+    assert "def execute(self): ..." in res.output
+    assert "for i in range" not in res.output
+
+
+def test_cli_types_command(tmp_path):
+    f = tmp_path / "types_test.py"
+    f.write_text("class Config:\n    debug: bool = False\n    def run(self):\n        pass\n")
+    res = runner.invoke(app, ["types", str(f)])
+    assert res.exit_code == 0
+    assert "class Config:" in res.output
+    assert "debug: bool = False" in res.output
+    assert "def run(self): ..." in res.output
+
+    # Test output to file
+    out_file = tmp_path / "types_test.pyi"
+    res_out = runner.invoke(app, ["types", str(f), "-o", str(out_file)])
+    assert res_out.exit_code == 0
+    assert out_file.exists()
+    assert "class Config:" in out_file.read_text()
+
+
 def test_cli_cache():
     res_stats = runner.invoke(app, ["cache", "stats"])
     assert res_stats.exit_code == 0
