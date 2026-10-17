@@ -223,6 +223,9 @@ def test_cli_diff():
     res_ignore = runner.invoke(app, ["diff", "--ignore", r"\.tmp$"])
     assert res_ignore.exit_code == 0
 
+    res_budget = runner.invoke(app, ["diff", "--budget", "1000"])
+    assert res_budget.exit_code == 0
+
 
 def test_cli_lint(tmp_path):
     f = tmp_path / "CLAUDE.md"

@@ -199,6 +199,9 @@ def test_handle_usagetrim_diff():
     res_ignore = handle_usagetrim_diff({"ignore_patterns": [r"\.tmp$"]})
     assert isinstance(res_ignore, str)
 
+    res_budget = handle_usagetrim_diff({"budget": 1500})
+    assert isinstance(res_budget, str)
+
 
 def test_handle_usagetrim_tree(tmp_path):
     (tmp_path / "sub").mkdir()

@@ -5,7 +5,7 @@ __version__ = "0.4.0"
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.cleaner import CleanerOptions, compact_terminal_output, strip_ansi
 from usagetrim.core.config import UsagetrimConfig, load_config
-from usagetrim.core.diff_slimmer import slim_git_diff
+from usagetrim.core.diff_slimmer import budgeted_diff_slice, slim_git_diff
 from usagetrim.core.doctor import run_all_diagnostics
 from usagetrim.core.json_slimmer import slim_json
 from usagetrim.core.optimizer import OptimizeResult, optimize_context
@@ -35,6 +35,7 @@ __all__ = [
     "TokenReductionMetrics",
     "UsagetrimConfig",
     "analyze_pr_tokens",
+    "budgeted_diff_slice",
     "compact_terminal_output",
     "compute_metrics",
     "count_tokens",
