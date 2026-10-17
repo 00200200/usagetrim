@@ -453,7 +453,28 @@ TOOLS_DEFINITIONS = [
     },
 ]
 
+_DEFAULT_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "content": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string"},
+                    "text": {"type": "string"},
+                },
+                "required": ["type", "text"],
+            },
+        },
+        "isError": {"type": "boolean"},
+    },
+    "required": ["content"],
+}
+
 for _tool in TOOLS_DEFINITIONS:
+    if "outputSchema" not in _tool:
+        _tool["outputSchema"] = _DEFAULT_OUTPUT_SCHEMA
     _tool["annotations"] = {
         "readOnlyHint": _tool["name"]
         not in {"usagetrim_exec", "usagetrim_context", "usagetrim_edit_symbol"},
