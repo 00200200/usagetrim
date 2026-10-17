@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 
-def skeletonize_python(source_code: str) -> str:
+def skeletonize_python(source_code: str, *, include_docstrings: bool = True) -> str:
     """Extract signatures, classes, methods, docstrings and replace bodies with `...` using Python AST."""
     try:
         tree = ast.parse(source_code)
@@ -18,9 +18,10 @@ def skeletonize_python(source_code: str) -> str:
     lines: list[str] = []
 
     # Module docstring
-    docstring = ast.get_docstring(tree)
-    if docstring:
-        lines.append(f'"""{docstring}"""\n')
+    if include_docstrings:
+        docstring = ast.get_docstring(tree)
+        if docstring:
+            lines.append(f'"""{docstring}"""\n')
 
     for node in tree.body:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -42,7 +43,7 @@ def skeletonize_python(source_code: str) -> str:
             bases_str = f"({', '.join(bases)})" if bases else ""
             lines.append(f"class {node.name}{bases_str}:")
 
-            class_doc = ast.get_docstring(node)
+            class_doc = ast.get_docstring(node) if include_docstrings else None
             if class_doc:
                 lines.append(f'    """{class_doc}"""')
 
@@ -62,7 +63,7 @@ def skeletonize_python(source_code: str) -> str:
                         args_str = "..."
                     ret_str = f" -> {ast.unparse(item.returns)}" if item.returns else ""
                     lines.append(f"    {fn_prefix}{item.name}({args_str}){ret_str}:")
-                    fn_doc = ast.get_docstring(item)
+                    fn_doc = ast.get_docstring(item) if include_docstrings else None
                     if fn_doc:
                         lines.append(f'        """{fn_doc}"""')
                     lines.append("        ...")
@@ -88,7 +89,7 @@ def skeletonize_python(source_code: str) -> str:
                 args_str = "..."
             ret_str = f" -> {ast.unparse(node.returns)}" if node.returns else ""
             lines.append(f"{fn_prefix}{node.name}({args_str}){ret_str}:")
-            fn_doc = ast.get_docstring(node)
+            fn_doc = ast.get_docstring(node) if include_docstrings else None
             if fn_doc:
                 lines.append(f'    """{fn_doc}"""')
             lines.append("    ...")
@@ -100,6 +101,186 @@ def skeletonize_python(source_code: str) -> str:
                     lines.append(f"{target.id} = {ast.unparse(node.value)}")
 
     return "\n".join(lines)
+
+
+def extract_python_types_stub(source_code: str) -> str:
+    """Extract pure .pyi type stubs with elided bodies, no docstrings, keeping type annotations."""
+    try:
+        tree = ast.parse(source_code)
+    except Exception:
+        return _skeletonize_by_regex(source_code)
+
+    lines: list[str] = []
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            try:
+                lines.append(ast.unparse(node))
+            except Exception:
+                pass
+        elif isinstance(node, ast.ClassDef):
+            lines.append("")
+            for dec in node.decorator_list:
+                try:
+                    lines.append(f"@{ast.unparse(dec)}")
+                except Exception:
+                    pass
+            bases = [ast.unparse(b) for b in node.bases]
+            bases_str = f"({', '.join(bases)})" if bases else ""
+            lines.append(f"class {node.name}{bases_str}:")
+            has_body = False
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    has_body = True
+                    for dec in item.decorator_list:
+                        try:
+                            lines.append(f"    @{ast.unparse(dec)}")
+                        except Exception:
+                            pass
+                    fn_prefix = "async def " if isinstance(item, ast.AsyncFunctionDef) else "def "
+                    try:
+                        args_str = ast.unparse(item.args)
+                    except Exception:
+                        args_str = "..."
+                    ret_str = f" -> {ast.unparse(item.returns)}" if item.returns else ""
+                    lines.append(f"    {fn_prefix}{item.name}({args_str}){ret_str}: ...")
+                elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                    has_body = True
+                    val = f" = {ast.unparse(item.value)}" if item.value else ""
+                    lines.append(f"    {item.target.id}: {ast.unparse(item.annotation)}{val}")
+            if not has_body:
+                lines.append("    ...")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            lines.append("")
+            for dec in node.decorator_list:
+                try:
+                    lines.append(f"@{ast.unparse(dec)}")
+                except Exception:
+                    pass
+            fn_prefix = "async def " if isinstance(node, ast.AsyncFunctionDef) else "def "
+            try:
+                args_str = ast.unparse(node.args)
+            except Exception:
+                args_str = "..."
+            ret_str = f" -> {ast.unparse(node.returns)}" if node.returns else ""
+            lines.append(f"{fn_prefix}{node.name}({args_str}){ret_str}: ...")
+        elif isinstance(node, ast.AnnAssign):
+            val = f" = {ast.unparse(node.value)}" if node.value else ""
+            lines.append(f"{ast.unparse(node.target)}: {ast.unparse(node.annotation)}{val}")
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    val_str = ast.unparse(node.value)
+                    if target.id.isupper() or any(
+                        k in val_str
+                        for k in (
+                            "TypeVar",
+                            "NewType",
+                            "Union",
+                            "Optional",
+                            "Annotated",
+                            "Literal",
+                            "Callable",
+                            "TypeAlias",
+                        )
+                    ):
+                        lines.append(f"{target.id} = {val_str}")
+        elif hasattr(ast, "TypeAlias") and isinstance(node, ast.TypeAlias):
+            lines.append(ast.unparse(node))
+
+    return "\n".join(lines).strip()
+
+
+def extract_ts_types_stub(source: str, suffix: str = ".ts") -> str:
+    """Extract TypeScript / JavaScript .d.ts type definitions and signatures."""
+    lang = "tsx" if suffix in (".tsx", ".jsx") else "typescript"
+    skel = skeletonize_code_ast(source, suffix)
+    try:
+        from ast_grep_py import SgRoot
+
+        root = SgRoot(skel, lang)
+        has_exports = any(c.kind() == "export_statement" for c in root.root().children())
+        allowed_kinds = {
+            "import_statement",
+            "export_statement",
+            "interface_declaration",
+            "type_alias_declaration",
+            "enum_declaration",
+            "ambient_declaration",
+        }
+        if not has_exports:
+            allowed_kinds.update(
+                {"class_declaration", "abstract_class_declaration", "function_declaration"}
+            )
+
+        lines = [c.text() for c in root.root().children() if c.kind() in allowed_kinds]
+        if lines:
+            return "\n\n".join(lines).strip()
+    except Exception:
+        pass
+    return skel
+
+
+def extract_go_types_stub(source: str) -> str:
+    """Extract Go type definitions, interfaces, structs, and method signatures."""
+    skel = skeletonize_code_ast(source, ".go")
+    try:
+        from ast_grep_py import SgRoot
+
+        root = SgRoot(skel, "go")
+        allowed_kinds = {
+            "package_clause",
+            "import_declaration",
+            "type_declaration",
+            "const_declaration",
+            "function_declaration",
+            "method_declaration",
+        }
+        lines = [c.text() for c in root.root().children() if c.kind() in allowed_kinds]
+        if lines:
+            return "\n\n".join(lines).strip()
+    except Exception:
+        pass
+    return skel
+
+
+def extract_rust_types_stub(source: str) -> str:
+    """Extract Rust structs, traits, enums, type aliases, and method signatures."""
+    skel = skeletonize_code_ast(source, ".rs")
+    try:
+        from ast_grep_py import SgRoot
+
+        root = SgRoot(skel, "rust")
+        allowed_kinds = {
+            "use_declaration",
+            "const_item",
+            "struct_item",
+            "trait_item",
+            "enum_item",
+            "impl_item",
+            "type_item",
+            "function_item",
+        }
+        lines = [c.text() for c in root.root().children() if c.kind() in allowed_kinds]
+        if lines:
+            return "\n\n".join(lines).strip()
+    except Exception:
+        pass
+    return skel
+
+
+def extract_types_stub(source_code: str, suffix: str) -> str:
+    """Extract type definition and interface stubs on the fly across Python, TypeScript, Go, and Rust."""
+    s = suffix.lower()
+    if s in {".py", ".pyi"}:
+        return extract_python_types_stub(source_code)
+    elif s in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".d.ts"}:
+        return extract_ts_types_stub(source_code, s)
+    elif s == ".go":
+        return extract_go_types_stub(source_code)
+    elif s == ".rs":
+        return extract_rust_types_stub(source_code)
+    else:
+        return skeletonize_code_ast(source_code, suffix)
 
 
 def _skeletonize_by_regex(source: str) -> str:
@@ -437,8 +618,9 @@ def extract_symbol_or_range(
     lines_range: str | None = None,
     skeleton: bool = False,
     strip_comments: bool = False,
+    types_only: bool = False,
 ) -> str:
-    """Read a file with targeted extraction (symbol, line range, or full skeleton)."""
+    """Read a file with targeted extraction (symbol, line range, skeleton, or types stub)."""
     p = Path(file_path)
     if not p.exists():
         raise FileNotFoundError(f"File not found: {file_path}")
@@ -450,7 +632,7 @@ def extract_symbol_or_range(
     if is_lockfile(p.name):
         if symbol and not lines_range:
             return summarize_lockfile(content, p.name, query_package=symbol)
-        if skeleton:
+        if skeleton or types_only:
             return summarize_lockfile(content, p.name)
 
     if symbol and not lines_range:
@@ -475,6 +657,9 @@ def extract_symbol_or_range(
     # Notebooks are always stripped on full reads: outputs/base64 dominate tokens.
     if p.suffix.lower() == ".ipynb":
         return skeletonize_notebook(content)
+
+    if types_only:
+        return extract_types_stub(content, p.suffix)
 
     if skeleton:
         if p.suffix == ".py":
