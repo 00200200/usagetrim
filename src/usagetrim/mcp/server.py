@@ -15,7 +15,7 @@ from usagetrim.core.adaptive import compress_to_budget
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.cleaner import CleanerOptions, compact_terminal_output
 from usagetrim.core.companion_state import already_wrapped, client_name, paused
-from usagetrim.core.diff_slimmer import slim_git_diff
+from usagetrim.core.diff_slimmer import budgeted_diff_slice
 from usagetrim.core.gain import build_gain_report
 from usagetrim.core.json_slimmer import slim_json
 from usagetrim.core.redactor import redact_secrets
@@ -245,6 +245,10 @@ TOOLS_DEFINITIONS = [
                 "path": {
                     "type": "string",
                     "description": "Optional file or directory path to scope git diff.",
+                },
+                "budget": {
+                    "type": "integer",
+                    "description": "Optional token budget ceiling for the diff (e.g. 2000). High-priority code files retain full hunks; low-priority and overflow files are folded.",
                 },
                 "ignore_patterns": {
                     "type": "array",
@@ -892,7 +896,7 @@ def handle_usagetrim_diff(arguments: dict[str, Any]) -> str:
     ignore_patterns = arguments.get("ignore_patterns")
     output = (
         _compress(
-            slim_git_diff(raw_diff, extra_patterns=ignore_patterns),
+            budgeted_diff_slice(raw_diff, budget_tokens=budget, extra_patterns=ignore_patterns),
             budget,
             original_text=raw_diff,
             source="diff",

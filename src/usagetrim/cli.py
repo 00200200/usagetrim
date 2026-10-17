@@ -34,7 +34,7 @@ from usagetrim.core.cleaner import CleanerOptions, compact_terminal_output
 from usagetrim.core.command_family import command_family
 from usagetrim.core.companion_state import already_wrapped, paused
 from usagetrim.core.config import load_config
-from usagetrim.core.diff_slimmer import slim_git_diff
+from usagetrim.core.diff_slimmer import budgeted_diff_slice, slim_git_diff
 from usagetrim.core.doctor import (
     MCP_CLIENTS,
     ClientRepairReport,
@@ -1808,6 +1808,10 @@ def pipe(
 @app.command()
 def diff(
     staged: Annotated[bool, typer.Option("--staged", "-s", help="Inspect staged changes")] = False,
+    budget: Annotated[
+        int | None,
+        typer.Option("--budget", "-b", help="Max token budget ceiling for diff output (e.g. 4000)"),
+    ] = None,
     ignore_patterns: Annotated[
         list[str] | None,
         typer.Option("--ignore", "-i", help="Regex patterns of files to fold in diff"),
@@ -1823,7 +1827,14 @@ def diff(
     if res.returncode:
         sys.stderr.write(res.stderr)
         raise typer.Exit(res.returncode)
-    slimmed = raw_diff if paused() else slim_git_diff(raw_diff, extra_patterns=ignore_patterns)
+    if paused():
+        slimmed = raw_diff
+    elif budget is not None:
+        slimmed = budgeted_diff_slice(
+            raw_diff, budget_tokens=budget, extra_patterns=ignore_patterns
+        )
+    else:
+        slimmed = slim_git_diff(raw_diff, extra_patterns=ignore_patterns)
     emitted = _emit(slimmed)
     sys.stderr.write(res.stderr)
     record_text(

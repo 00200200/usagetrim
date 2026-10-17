@@ -1,4 +1,5 @@
-from usagetrim.core.diff_slimmer import slim_git_diff
+from usagetrim.core.diff_slimmer import budgeted_diff_slice, score_file_importance, slim_git_diff
+from usagetrim.metrics.tokenizer import count_tokens
 
 SAMPLE_DIFF = """diff --git a/src/main.py b/src/main.py
 index 1234567..89abcdef 100644
@@ -79,3 +80,150 @@ index 1111111..2222222 100644
     assert "diff --git a/fixtures/mock_data.json" in slimmed
     assert "omitted by usagetrim" in slimmed
     assert '+{"id": 1}' not in slimmed
+
+
+def test_score_file_importance_ordering():
+    # Code > Tests > Config > Docs > Data > Lockfile
+    code_score = score_file_importance(
+        "src/core/router.py", additions=10, deletions=5, is_lockfile=False
+    )
+    test_score = score_file_importance(
+        "tests/test_router.py", additions=10, deletions=5, is_lockfile=False
+    )
+    config_score = score_file_importance(
+        "pyproject.toml", additions=10, deletions=5, is_lockfile=False
+    )
+    docs_score = score_file_importance("docs/api.md", additions=10, deletions=5, is_lockfile=False)
+    data_score = score_file_importance(
+        "data/mock.json", additions=10, deletions=5, is_lockfile=False
+    )
+    lock_score = score_file_importance("uv.lock", additions=10, deletions=5, is_lockfile=True)
+
+    assert code_score > test_score > config_score > docs_score > data_score > lock_score
+
+    # Auth/security boost
+    auth_score = score_file_importance(
+        "src/auth/policy.py", additions=5, deletions=2, is_lockfile=False
+    )
+    plain_score = score_file_importance(
+        "src/utils/helpers.py", additions=5, deletions=2, is_lockfile=False
+    )
+    assert auth_score > plain_score
+
+
+def test_budgeted_diff_slice_small_diff_fits_budget():
+    diff = """diff --git a/src/core/calc.py b/src/core/calc.py
+index 1111111..2222222 100644
+--- a/src/core/calc.py
++++ b/src/core/calc.py
+@@ -1,5 +1,6 @@
+ def add(a, b):
++    # add comment
+     return a + b
+"""
+    result = budgeted_diff_slice(diff, budget_tokens=1000)
+    assert "diff --git a/src/core/calc.py b/src/core/calc.py" in result
+    assert "+    # add comment" in result
+    assert count_tokens(result).openai <= 1000
+
+
+def test_budgeted_diff_slice_prioritizes_code_over_docs_and_lockfile():
+    code_hunk = "\n".join([f"+    line_of_code_{i} = {i}" for i in range(20)])
+    docs_hunk = "\n".join(
+        [f"+ This is documentation paragraph line {i} explaining architecture." for i in range(40)]
+    )
+    lock_hunk = "\n".join(
+        [f"+ [[package]]\n+ name = 'pkg_{i}'\n+ version = '1.0.0'" for i in range(50)]
+    )
+
+    diff = f"""diff --git a/src/auth/service.py b/src/auth/service.py
+index 1111111..2222222 100644
+--- a/src/auth/service.py
++++ b/src/auth/service.py
+@@ -1,5 +1,25 @@
+ def authenticate(user):
+{code_hunk}
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 3333333..4444444 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -1,5 +1,45 @@
+ # Architecture
+{docs_hunk}
+diff --git a/uv.lock b/uv.lock
+index 5555555..6666666 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -1,5 +1,155 @@
+{lock_hunk}
+"""
+    budget = 400
+    result = budgeted_diff_slice(diff, budget_tokens=budget)
+
+    # 1. Output must not exceed budget
+    assert count_tokens(result).openai <= budget
+
+    # 2. All 3 touched paths must be preserved in output
+    assert "diff --git a/src/auth/service.py" in result
+    assert "diff --git a/docs/architecture.md" in result
+    assert "diff --git a/uv.lock" in result
+
+    # 3. High-priority code retains full diff context
+    assert "+    line_of_code_15 = 15" in result
+
+    # 4. Low-priority docs and lockfile are folded
+    assert "folded by usagetrim" in result or "omitted by usagetrim" in result
+
+
+def test_budgeted_diff_slice_sliding_hunk_window():
+    # 6 hunks in a single file
+    hunks = []
+    for h in range(6):
+        body = "\n".join([f"+    modified_statement_{h}_{i}()" for i in range(15)])
+        hunks.append(f"@@ -{h * 50},5 +{h * 50},20 @@ def func_{h}():\n{body}")
+
+    diff = (
+        "diff --git a/src/large_service.py b/src/large_service.py\n--- a/src/large_service.py\n+++ b/src/large_service.py\n"
+        + "\n".join(hunks)
+    )
+
+    # Budget big enough for 2 hunks but not all 6
+    budget = 250
+    result = budgeted_diff_slice(diff, budget_tokens=budget)
+
+    assert count_tokens(result).openai <= budget
+    assert "diff --git a/src/large_service.py" in result
+    # First hunk is retained
+    assert "def func_0():" in result
+    # Later hunks folded with exact receipt
+    assert "folded by usagetrim to respect token budget" in result
+
+
+def test_budgeted_diff_slice_all_paths_preserved_under_tight_budget():
+    diff_parts = []
+    for i in range(15):
+        ext = "py" if i % 3 == 0 else ("ts" if i % 3 == 1 else "md")
+        diff_parts.append(f"""diff --git a/module_{i}.{ext} b/module_{i}.{ext}
+index 100000{i}..200000{i} 100644
+--- a/module_{i}.{ext}
++++ b/module_{i}.{ext}
+@@ -1,5 +1,10 @@
++line_{i}_a
++line_{i}_b
++line_{i}_c
+""")
+
+    raw_diff = "\n".join(diff_parts)
+    budget = 350
+    result = budgeted_diff_slice(raw_diff, budget_tokens=budget)
+
+    assert count_tokens(result).openai <= budget
+    # Every single one of the 15 paths MUST be present
+    for i in range(15):
+        ext = "py" if i % 3 == 0 else ("ts" if i % 3 == 1 else "md")
+        assert f"module_{i}.{ext}" in result
+
+
+def test_budgeted_diff_slice_empty_and_whitespace():
+    assert budgeted_diff_slice("") == ""
+    assert budgeted_diff_slice("   \n\n\t  ") == ""
