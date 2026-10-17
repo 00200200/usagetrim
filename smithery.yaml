@@ -1,0 +1,11 @@
+# Smithery configuration for usagetrim MCP server
+# https://smithery.ai/docs/config
+startCommand:
+  type: stdio
+  config:
+    command: uvx
+    args:
+      - --from
+      - usagetrim[mcp]
+      - usagetrim
+      - mcp

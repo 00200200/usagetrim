@@ -1,0 +1,31 @@
+{
+  "$schema": "https://glama.ai/mcp/schema.json",
+  "name": "usagetrim",
+  "description": "Bound AI coding tool output with local compaction, targeted reads, and recoverable context.",
+  "homepage": "https://github.com/00200200/usagetrim",
+  "repository": "https://github.com/00200200/usagetrim",
+  "license": "MIT",
+  "command": "uvx",
+  "args": ["--from", "usagetrim[mcp]", "usagetrim", "mcp"],
+  "tools": [
+    "usagetrim_context",
+    "usagetrim_code",
+    "usagetrim_edit_symbol",
+    "usagetrim_exec",
+    "usagetrim_read",
+    "usagetrim_retrieve",
+    "usagetrim_diff",
+    "usagetrim_tree",
+    "usagetrim_json",
+    "usagetrim_clip",
+    "usagetrim_pack",
+    "usagetrim_distill",
+    "usagetrim_table",
+    "usagetrim_optimize",
+    "usagetrim_stats",
+    "usagetrim_gain",
+    "usagetrim_session_start",
+    "usagetrim_session_end",
+    "usagetrim_doctor"
+  ]
+}

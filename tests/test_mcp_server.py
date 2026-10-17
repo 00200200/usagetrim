@@ -651,3 +651,39 @@ Let me know if you see any issues.
     assert "Please analyze this user data:" in text
     assert "[id | name | role]" in text
     assert "Alice" in text
+
+
+def test_mcp_registry_metadata_and_output_schemas():
+    import json
+    from pathlib import Path
+
+    from usagetrim.mcp.server import tool_definitions
+
+    root = Path(__file__).resolve().parents[1]
+
+    # 1. smithery.yaml verification
+    smithery_file = root / "smithery.yaml"
+    assert smithery_file.is_file()
+    content = smithery_file.read_text(encoding="utf-8")
+    assert "startCommand:" in content
+    assert "usagetrim" in content
+
+    # 2. glama.json verification
+    glama_file = root / "glama.json"
+    assert glama_file.is_file()
+    glama_data = json.loads(glama_file.read_text(encoding="utf-8"))
+    assert glama_data["name"] == "usagetrim"
+    assert "command" in glama_data
+    assert "tools" in glama_data
+    assert len(glama_data["tools"]) > 0
+
+    # 3. OutputSchema presence on all tool definitions
+    tools = tool_definitions("full")
+    assert len(tools) > 0
+    for tool in tools:
+        assert "name" in tool
+        assert "inputSchema" in tool
+        assert "outputSchema" in tool, f"Missing outputSchema on tool: {tool['name']}"
+        out_schema = tool["outputSchema"]
+        assert out_schema.get("type") == "object"
+        assert "content" in out_schema.get("properties", {})
