@@ -710,6 +710,64 @@ def prompt_minify_command(
         )
 
 
+@prompt_app.command("cache-inject")
+def prompt_cache_inject_command(
+    file: Annotated[
+        Path, typer.Argument(help="Path to JSON request payload with messages and optional tools")
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Write modified payload with breakpoints to file"),
+    ] = None,
+    min_tokens: Annotated[
+        int, typer.Option("--min-tokens", "-m", help="Minimum token threshold for caching")
+    ] = 1024,
+    max_breakpoints: Annotated[
+        int, typer.Option("--max-breakpoints", "-b", help="Maximum breakpoints to inject (1-4)")
+    ] = 4,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit modified request as JSON")
+    ] = False,
+):
+    """Auto-inject Anthropic Prompt Caching breakpoints into conversation turns."""
+    from usagetrim.core.prompt_optimizer import inject_prompt_cache_breakpoints
+
+    try:
+        raw_data = json.loads(file.read_text(encoding="utf-8", errors="replace"))
+    except Exception as exc:
+        raise typer.BadParameter(f"Cannot parse JSON file: {exc}") from exc
+
+    messages = raw_data.get("messages", [])
+    tools = raw_data.get("tools")
+    system = raw_data.get("system")
+
+    res = inject_prompt_cache_breakpoints(
+        messages=messages,
+        tools=tools,
+        system=system,
+        min_tokens=min_tokens,
+        max_breakpoints=max_breakpoints,
+    )
+
+    out_payload = dict(raw_data)
+    out_payload["messages"] = res.messages
+    if tools is not None:
+        out_payload["tools"] = res.tools
+    if res.system is not None:
+        out_payload["system"] = res.system
+
+    rendered = json.dumps(out_payload, indent=2)
+    if output is not None:
+        output.write_text(rendered, encoding="utf-8")
+        err_console.print(f"[green]Cached request payload written to {output}[/green]")
+    else:
+        _emit(rendered)
+
+    err_console.print(
+        f"[dim]Injected {res.breakpoints_placed} breakpoint(s) across {res.total_tokens:,} tokens[/dim]"
+    )
+
+
 @app.command("optimize")
 def optimize_command(
     target: Annotated[
