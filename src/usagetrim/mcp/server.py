@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import time
@@ -19,7 +20,7 @@ from usagetrim.core.diff_slimmer import budgeted_diff_slice
 from usagetrim.core.gain import build_gain_report
 from usagetrim.core.json_slimmer import slim_json
 from usagetrim.core.redactor import redact_secrets
-from usagetrim.core.safe_filter import safe_compact_output
+from usagetrim.core.safe_filter import recovery_notice, safe_compact_output
 from usagetrim.core.skeleton import extract_symbol_or_range
 from usagetrim.core.specialized import auto_specialize_command_output
 from usagetrim.core.telemetry import record_text, recovery_engine
@@ -694,6 +695,42 @@ def _compress(text, budget, **kwargs):
     return compress_to_budget(text, budget, **kwargs)
 
 
+def _budget_repo_map(full_result: str, budget: int) -> str:
+    """Fit complete ranked entries, reserving the header, notices and recovery.
+
+    Recovery contains the full query result, including its existing limit and
+    incomplete-index notices. Oversized entries are skipped, never truncated.
+    """
+    safe_result = redact_secrets(full_result)
+    if count_tokens(safe_result).claude <= budget:
+        return safe_result
+    ref_id = ContextCache().store(safe_result, source="code-query")
+    notice = recovery_notice(ref_id)
+    lines = safe_result.splitlines()
+    entries, notices = [], []
+    for line in lines[1:]:
+        if re.fullmatch(r".+:\d+-\d+ .+ \| .*", line):
+            entries.append(line)
+        else:
+            notices.append(line)
+
+    def render(selected):
+        return "\n".join([lines[0], *selected, *notices]) + "\n" + notice
+
+    selected = []
+    output = render(selected)
+    if count_tokens(output).claude > budget:
+        raise ValueError(
+            "max_tokens is too small for the repo map header, notices and recovery reference"
+        )
+    for entry in entries:
+        candidate = render([*selected, entry])
+        if count_tokens(candidate).claude <= budget:
+            selected.append(entry)
+            output = candidate
+    return output
+
+
 def _cwd(arguments: dict[str, Any]) -> str | None:
     cwd = arguments.get("cwd")
     if cwd is not None and (not isinstance(cwd, str) or not Path(cwd).is_absolute()):
@@ -707,13 +744,18 @@ def handle_usagetrim_code(arguments: dict[str, Any]) -> str:
 
     budget = _budget(arguments)
     index = CodeIndex(arguments["root"])
+    mode = arguments.get("mode", "map")
     result = index.query(
-        arguments.get("mode", "map"),
+        mode,
         arguments.get("query", ""),
         arguments.get("file"),
         arguments.get("limit", 30),
     )
-    output = _compress(result, budget, source="code-query")
+    output = (
+        _budget_repo_map(result, budget)
+        if mode == "map" and not paused()
+        else _compress(result, budget, source="code-query")
+    )
     return _record(result, output, operation="code", project=arguments["root"])
 
 
