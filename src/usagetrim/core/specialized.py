@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -1663,6 +1664,195 @@ def filter_gh_command_output(command: str, raw_output: str) -> str | None:
     return None
 
 
+_CLOUD_MESSAGE_FIELDS = ("@message", "message", "textPayload", "log")
+_CLOUD_TIMESTAMP_FIELDS = ("@timestamp", "timestamp")
+_CLOUD_SEVERITY_FIELDS = ("severity", "level", "logLevel")
+_CLOUD_METADATA_FIELDS = frozenset(
+    {
+        "@logStream",
+        "@log",
+        "@ingestionTime",
+        "@ptr",
+        "logGroup",
+        "logGroupName",
+        "logStream",
+        "logStreamName",
+        "ingestionTime",
+        "eventId",
+        "account",
+        "accountId",
+        "region",
+        "traceId",
+        "spanId",
+        "logName",
+        "insertId",
+        "resource",
+        "labels",
+        "receiveTimestamp",
+        "trace",
+        "traceSampled",
+    }
+)
+
+
+def _compact_cloud_record(record: object) -> str | None:
+    """Extract supported log fields; retain records with unhandled payload data."""
+    if not isinstance(record, dict):
+        return None
+    allowed = (
+        set(_CLOUD_MESSAGE_FIELDS + _CLOUD_TIMESTAMP_FIELDS + _CLOUD_SEVERITY_FIELDS)
+        | _CLOUD_METADATA_FIELDS
+        | {"jsonPayload"}
+    )
+    if record.keys() - allowed:
+        return None
+    payload = record.get("jsonPayload", {})
+    if not isinstance(payload, dict) or payload.keys() - set(
+        _CLOUD_MESSAGE_FIELDS + _CLOUD_TIMESTAMP_FIELDS + _CLOUD_SEVERITY_FIELDS
+    ):
+        return None
+    messages = [
+        source[key]
+        for source in (record, payload)
+        for key in _CLOUD_MESSAGE_FIELDS
+        if key in source
+    ]
+    if len(messages) != 1 or not isinstance(messages[0], str) or not messages[0]:
+        return None
+    prefix = []
+    for fields in (_CLOUD_TIMESTAMP_FIELDS, _CLOUD_SEVERITY_FIELDS):
+        values = [source[key] for source in (record, payload) for key in fields if key in source]
+        if any(
+            type(value) not in (str, int, float)
+            or (isinstance(value, float) and not math.isfinite(value))
+            for value in values
+        ):
+            return None
+        # Conflicting aliases must not silently discard timestamps or severity.
+        if values and any(value != values[0] for value in values[1:]):
+            return None
+        if values and str(values[0]):
+            prefix.append(str(values[0]))
+    return (f"[{' '.join(prefix)}] " if prefix else "") + messages[0]
+
+
+def filter_cloud_logs(raw_output: str) -> str:
+    """Extract cloud log messages without sampling records or shortening payloads.
+
+    Support record objects, arrays, AWS events envelopes, and mixed JSONL.
+    Unsupported whole documents stay byte-for-byte unchanged; in mixed streams,
+    unsupported lines retain their original text and line endings.
+    """
+    try:
+        document = json.loads(raw_output)
+    except (json.JSONDecodeError, ValueError):
+        result = []
+        for line in raw_output.splitlines(keepends=True):
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                result.append(line)
+                continue
+            compact = _compact_cloud_record(record)
+            ending = (
+                "\r\n"
+                if line.endswith("\r\n")
+                else line[-1:]
+                if line.endswith(("\r", "\n"))
+                else ""
+            )
+            result.append(line if compact is None else compact + ending)
+        return "".join(result)
+
+    records = document
+    searched_streams = []
+    pagination = []
+    if isinstance(document, dict) and "events" in document:
+        token_fields = ("nextToken", "nextForwardToken", "nextBackwardToken")
+        if (
+            document.keys() - {"events", "searchedLogStreams", *token_fields}
+            or not isinstance(document["events"], list)
+            or not isinstance(document.get("searchedLogStreams", []), list)
+        ):
+            return raw_output
+        for stream in document.get("searchedLogStreams", []):
+            if (
+                not isinstance(stream, dict)
+                or set(stream) != {"logStreamName", "searchedCompletely"}
+                or not isinstance(stream["logStreamName"], str)
+                or type(stream["searchedCompletely"]) is not bool
+            ):
+                return raw_output
+            searched_streams.append(
+                f"[searchedLogStream] {stream['logStreamName']} "
+                f"searchedCompletely={str(stream['searchedCompletely']).lower()}"
+            )
+        for field in token_fields:
+            if field in document:
+                if not isinstance(document[field], str):
+                    return raw_output
+                pagination.append(f"[{field}] {document[field]}")
+        records = document["events"]
+    if not isinstance(records, list):
+        records = [records]
+    compacted = [_compact_cloud_record(record) for record in records]
+    if not compacted or any(record is None for record in compacted):
+        return raw_output
+    compacted.extend(searched_streams)
+    compacted.extend(pagination)
+    ending = (
+        "\r\n"
+        if raw_output.endswith("\r\n")
+        else raw_output[-1:]
+        if raw_output.endswith(("\r", "\n"))
+        else ""
+    )
+    return "\n".join(compacted) + ending
+
+
+def _is_cloud_log_command(command: str) -> bool:
+    """Match cloud CLI groups, skipping only explicitly supported global flags."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>")
+        lexer.whitespace_split = True
+        words = list(lexer)
+    except ValueError:
+        return False
+    if not words or any(word and set(word) <= set("|&;<>") for word in words):
+        return False
+    tool = PurePath(words[0]).name
+    groups = {"aws": "logs", "gcloud": "logging", "az": "monitor"}
+    value_flags = {
+        "aws": {"--profile", "--region", "--output", "--endpoint-url", "--color"},
+        "gcloud": {"--project", "--account", "--configuration", "--format", "--verbosity"},
+        "az": {"--subscription", "--output", "-o", "--query"},
+    }
+    boolean_flags = {
+        "aws": {"--no-cli-pager", "--no-paginate", "--no-sign-request", "--debug"},
+        "gcloud": {"--quiet", "-q", "--log-http"},
+        "az": {"--only-show-errors", "--debug", "--verbose"},
+    }
+    if tool not in groups:
+        return False
+    index = 1
+    while index < len(words) and words[index].startswith("-"):
+        flag, separator, value = words[index].partition("=")
+        if flag in value_flags[tool]:
+            if separator:
+                if not value:
+                    return False
+                index += 1
+            else:
+                if index + 1 >= len(words) or words[index + 1].startswith("-"):
+                    return False
+                index += 2
+        elif flag in boolean_flags[tool] and not separator:
+            index += 1
+        else:
+            return False
+    return index < len(words) and words[index] == groups[tool]
+
+
 def filter_json_output(raw_output: str, command: str = "") -> str | None:
     """Automatically slim large or verbose JSON output from commands.
 
@@ -2940,6 +3130,8 @@ def auto_specialize_command_output(command: str, raw_output: str) -> str | None:
     gh_compact = filter_gh_command_output(command, raw_output)
     if gh_compact is not None:
         return gh_compact
+    if _is_cloud_log_command(command):
+        return filter_cloud_logs(raw_output)
     if any(
         tool in cmd_lower for tool in ("playwright", "puppeteer", "stagehand")
     ) and raw_output.lstrip().lower().startswith(("<!doctype html", "<html", "<body")):

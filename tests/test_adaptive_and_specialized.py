@@ -22,6 +22,7 @@ from usagetrim.core.specialized import (
     filter_cargo_build,
     filter_cargo_test,
     filter_ci_logs,
+    filter_cloud_logs,
     filter_compiler_output,
     filter_docker_build,
     filter_eslint,
@@ -2949,3 +2950,324 @@ def test_filter_web_page_reduces_spa_html_by_more_than_90_percent():
 def test_auto_specialize_routes_browser_page_html():
     compacted = auto_specialize_command_output("npx playwright page.content", SAMPLE_WEB_PAGE)
     assert compacted == filter_web_page(SAMPLE_WEB_PAGE)
+
+
+@pytest.mark.parametrize(
+    ("record", "expected"),
+    [
+        (
+            {"@message": "Connected", "@timestamp": "2026-10-19T12:00:00.123Z"},
+            "[2026-10-19T12:00:00.123Z] Connected",
+        ),
+        (
+            {"message": "Connected", "timestamp": 1792411200123, "level": "INFO"},
+            "[1792411200123 INFO] Connected",
+        ),
+        ({"message": "Connected", "timestamp": "1792411200123"}, "[1792411200123] Connected"),
+        (
+            {
+                "textPayload": "Quota exceeded",
+                "timestamp": "2026-10-19T14:00:00+02:00",
+                "severity": "ERROR",
+            },
+            "[2026-10-19T14:00:00+02:00 ERROR] Quota exceeded",
+        ),
+        ({"jsonPayload": {"message": "Retrying"}, "severity": "WARNING"}, "[WARNING] Retrying"),
+        ({"jsonPayload": {"message": "Retrying", "level": "WARNING"}}, "[WARNING] Retrying"),
+        ({"log": "Saved", "logLevel": "DEBUG"}, "[DEBUG] Saved"),
+        ({"message": "Saved"}, "Saved"),
+    ],
+)
+def test_filter_cloud_logs_extracts_supported_fields(record, expected):
+    assert filter_cloud_logs(json.dumps(record)) == expected
+
+
+@pytest.mark.parametrize("envelope", [False, True])
+def test_filter_cloud_logs_preserves_every_record_in_order(envelope):
+    records = [{"message": f"event {number}", "timestamp": number} for number in (3, 1, 2)]
+    raw = json.dumps({"events": records} if envelope else records, indent=2) + "\n"
+    assert filter_cloud_logs(raw) == "[3] event 3\n[1] event 1\n[2] event 2\n"
+
+
+def test_filter_cloud_logs_preserves_multiline_message_and_unicode():
+    message = 'Traceback (most recent call last):\n  File "billing.py", line 7\nValueError: café e\u0301 λ 🚀\n'
+    raw = json.dumps({"message": message, "severity": "ERROR"}, ensure_ascii=False)
+    assert filter_cloud_logs(raw) == "[ERROR] " + message
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "plain output\r\n  diagnostic  \n",
+        '{"message": invalid}\r\n',
+        '{"status": "healthy"}',
+        '{"message": {"error": "denied"}}',
+        '{"message": ["denied"]}',
+        '{"message": null}',
+        '{"message": "denied", "stack": "important traceback"}',
+        '{"message": "denied", "error": {"code": 403}}',
+        '{"jsonPayload": {"message": "denied", "details": "permission missing"}}',
+        '{"message": "one", "textPayload": "two"}',
+        '{"message": "denied", "severity": "ERROR", "level": "INFO"}',
+        '{"message": "event", "timestamp": {"seconds": 100}}',
+        '{"message": "event", "timestamp": true}',
+        '{"message": "event", "timestamp": NaN}',
+        '[{"message": "event"}, {"unsupported": "diagnostic"}]',
+        '{"events": {"message": "not an events array"}}',
+        '{"results": [[{"field": "@message", "value": "event"}]]}',
+    ],
+)
+def test_filter_cloud_logs_leaves_unsupported_data_unchanged(raw):
+    assert filter_cloud_logs(raw) == raw
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected_pagination"),
+    [
+        (
+            {"searchedLogStreams": [], "nextToken": "  next/page+token==  "},
+            "[nextToken]   next/page+token==  ",
+        ),
+        (
+            {"nextBackwardToken": "b/backward+token==", "nextForwardToken": "f/forward+token=="},
+            "[nextForwardToken] f/forward+token==\n[nextBackwardToken] b/backward+token==",
+        ),
+    ],
+)
+def test_filter_cloud_logs_compacts_aws_envelopes_and_preserves_pagination(
+    metadata, expected_pagination
+):
+    raw = (
+        json.dumps(
+            {
+                "events": [
+                    {"message": "Connected", "timestamp": 1792411200123},
+                    {"message": "Permission denied", "timestamp": 1792411200456},
+                ],
+                **metadata,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    assert filter_cloud_logs(raw) == (
+        "[1792411200123] Connected\n[1792411200456] Permission denied\n"
+        + expected_pagination
+        + "\n"
+    )
+
+
+def test_filter_cloud_logs_preserves_previously_unsupported_next_token_envelope():
+    raw = '{"events": [{"message": "event"}], "nextToken": "more-results"}'
+    assert filter_cloud_logs(raw) == "event\n[nextToken] more-results"
+
+
+@pytest.mark.parametrize("complete", [True, False])
+def test_filter_cloud_logs_preserves_searched_stream_before_pagination(complete):
+    stream_name = "  ecs/billing/λ-worker  "
+    raw = json.dumps(
+        {
+            "events": [{"message": "Connected", "timestamp": 1792411200123}],
+            "searchedLogStreams": [{"logStreamName": stream_name, "searchedCompletely": complete}],
+            "nextToken": "next/page+token==",
+        }
+    )
+    assert filter_cloud_logs(raw) == (
+        "[1792411200123] Connected\n"
+        f"[searchedLogStream] {stream_name} searchedCompletely={str(complete).lower()}\n"
+        "[nextToken] next/page+token=="
+    )
+
+
+def test_filter_cloud_logs_preserves_searched_stream_order():
+    raw = json.dumps(
+        {
+            "events": [{"message": "Connected"}],
+            "searchedLogStreams": [
+                {"logStreamName": "ecs/billing/worker-b", "searchedCompletely": False},
+                {"logStreamName": "ecs/billing/worker-a", "searchedCompletely": True},
+            ],
+        }
+    )
+    assert filter_cloud_logs(raw) == (
+        "Connected\n"
+        "[searchedLogStream] ecs/billing/worker-b searchedCompletely=false\n"
+        "[searchedLogStream] ecs/billing/worker-a searchedCompletely=true"
+    )
+
+
+@pytest.mark.parametrize(
+    "streams",
+    [
+        {},
+        "billing",
+        [None],
+        ["billing"],
+        [{"searchedCompletely": True}],
+        [{"logStreamName": "billing", "searchedCompletely": True, "extra": "diagnostic"}],
+        [{"logStreamName": 42, "searchedCompletely": True}],
+        [{"logStreamName": "billing", "searchedCompletely": "true"}],
+        [{"logStreamName": "billing", "searchedCompletely": 1}],
+        [
+            {"logStreamName": "valid", "searchedCompletely": True},
+            {"logStreamName": "missing-completion"},
+        ],
+    ],
+)
+def test_filter_cloud_logs_preserves_invalid_searched_streams_unchanged(streams):
+    raw = (
+        json.dumps(
+            {
+                "events": [{"message": "Connected"}],
+                "searchedLogStreams": streams,
+                "nextToken": "more-results",
+            },
+            indent=2,
+        )
+        + "\r\n"
+    )
+    assert filter_cloud_logs(raw) == raw
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        {"events": [{"message": "event"}], "searchedLogStreams": [{"logStreamName": "billing"}]},
+        {"events": [{"message": "event"}], "searchedLogStreams": None},
+        {"events": [{"message": "event"}], "unknown": "important diagnostic"},
+        {"events": {"message": "not a list"}, "nextToken": "more-results"},
+        {"events": [{"message": "event"}, {"message": {"error": "denied"}}], "nextToken": "more"},
+        {"events": [{"message": "event"}], "nextToken": {"unexpected": "value"}},
+        {"events": [], "nextForwardToken": "more-results"},
+    ],
+)
+def test_filter_cloud_logs_preserves_unsafe_aws_envelopes_unchanged(envelope):
+    raw = json.dumps(envelope, indent=2) + "\r\n"
+    assert filter_cloud_logs(raw) == raw
+
+
+def test_filter_cloud_logs_preserves_mixed_stream_lines_and_endings():
+    raw = (
+        'CLI warning  \r\n{"@message": "first", "severity": "INFO"}\r\n'
+        '{malformed json  \n{"message": {"error": "denied"}}\r'
+        '\n{"message": "last"}'
+    )
+    expected = (
+        "CLI warning  \r\n[INFO] first\r\n{malformed json  \n"
+        '{"message": {"error": "denied"}}\r\nlast'
+    )
+    assert filter_cloud_logs(raw) == expected
+    assert filter_cloud_logs(expected) == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "aws logs tail group",
+        "gcloud logging read 'severity>=ERROR'",
+        "az monitor activity-log list",
+        "/opt/aws/bin/aws logs filter-log-events --log-group-name 'billing service'",
+        "/opt/google/bin/gcloud --project 'billing project' logging read severity=ERROR",
+        "/opt/azure/bin/az --subscription=test monitor activity-log list",
+        "aws --profile dev --region=eu-west-1 --no-cli-pager logs get-log-events",
+        "gcloud --quiet --project=billing logging read 'severity>=ERROR'",
+        "az --only-show-errors --output json monitor activity-log list",
+    ],
+)
+def test_auto_specialize_routes_cloud_log_commands(command):
+    raw = '{"message": "Permission denied", "severity": "ERROR"}'
+    assert auto_specialize_command_output(command, raw) == "[ERROR] Permission denied"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "aws s3 ls",
+        "gcloud compute instances list",
+        "az storage account list",
+        "awslogs get group",
+        'echo "aws logs tail group"',
+        "sudo aws logs tail group",
+        "aws logs tail group | cat",
+        "aws --profile logs s3 ls",
+        "aws --unknown logs tail group",
+        "aws --profile",
+        'aws logs "unterminated',
+    ],
+)
+def test_auto_specialize_does_not_route_unrelated_commands_as_cloud_logs(command):
+    raw = '{"message": "Permission denied", "severity": "ERROR"}'
+    assert auto_specialize_command_output(command, raw) is None
+
+
+def test_cloud_command_unchanged_output_does_not_fall_through_to_other_filters():
+    raw = json.dumps({"unrelated": [{"id": number} for number in range(40)]}, indent=2)
+    assert auto_specialize_command_output("aws logs describe-log-groups", raw) == raw
+    assert auto_specialize_command_output("docker inspect app", raw) != raw
+
+
+def _metadata_heavy_cloud_records(provider):
+    events = [
+        ("2026-10-19T12:00:00.123Z", "INFO", "Invoice accepted"),
+        ("2026-10-19T12:00:01.456Z", "WARNING", "Gateway retry scheduled"),
+        ("2026-10-19T12:00:02.789Z", "ERROR", "Payment authorization denied"),
+    ]
+    records = []
+    for index, (timestamp, severity, message) in enumerate(events):
+        if provider == "aws":
+            record = {
+                "@timestamp": timestamp,
+                "@message": message,
+                "level": severity,
+                "@logStream": f"ecs/billing/worker-{index}",
+                "@log": "123456789012:/ecs/billing-service",
+                "logGroupName": "/ecs/billing-service",
+                "accountId": "123456789012",
+                "region": "eu-west-1",
+                "ingestionTime": 1792411201000 + index,
+                "eventId": f"billing-event-20261019-{index}",
+                "traceId": f"1-68f4c000-abcdef0123456789abcdef0{index:03d}",
+                "spanId": f"0123456789abc{index:03d}",
+            }
+        else:
+            record = {
+                "timestamp": timestamp,
+                "textPayload": message,
+                "severity": severity,
+                "logName": "projects/billing-prod/logs/run.googleapis.com%2Fstdout",
+                "insertId": f"billing-instance-20261019-{index}",
+                "resource": {
+                    "type": "cloud_run_revision",
+                    "labels": {
+                        "project_id": "billing-prod",
+                        "service_name": "billing-api",
+                        "revision_name": "billing-api-00042-abc",
+                        "location": "europe-west1",
+                        "configuration_name": "billing-api",
+                    },
+                },
+                "labels": {"instanceId": f"billing-worker-{index}", "deployment": "release-42"},
+                "receiveTimestamp": f"2026-10-19T12:00:0{index}.999Z",
+                "trace": f"projects/billing-prod/traces/abcdef0123456789abcdef0123456{index:05d}",
+                "spanId": f"abcdef0123456{index:03d}",
+                "traceSampled": True,
+            }
+        records.append(record)
+    return records, events
+
+
+@pytest.mark.parametrize("provider", ["aws", "gcp"])
+def test_filter_cloud_logs_reduces_provider_tokens_by_more_than_75_percent(provider):
+    records, events = _metadata_heavy_cloud_records(provider)
+    raw = "\n".join(json.dumps(record) for record in records)
+    compacted = filter_cloud_logs(raw)
+    assert compacted.splitlines() == [
+        f"[{timestamp} {severity}] {message}" for timestamp, severity, message in events
+    ]
+    raw_tokens = count_tokens(raw).openai
+    output_tokens = count_tokens(compacted).openai
+    reduction_pct = 100 * (raw_tokens - output_tokens) / raw_tokens
+    assert reduction_pct > 75.0, (
+        f"{provider}: {reduction_pct:.2f}% reduction ({raw_tokens}->{output_tokens})"
+    )
