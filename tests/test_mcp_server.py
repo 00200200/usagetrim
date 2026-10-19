@@ -690,3 +690,140 @@ def test_mcp_registry_metadata_and_output_schemas():
         out_schema = tool["outputSchema"]
         assert out_schema.get("type") == "object"
         assert "content" in out_schema.get("properties", {})
+
+
+@pytest.fixture
+def structural_mcp_repo(tmp_path):
+    import subprocess
+
+    def git(*args):
+        return subprocess.check_output(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", *args],
+            cwd=tmp_path,
+        ).decode("utf-8")
+
+    git("init", "-q", "--initial-branch=main")
+    source = """def check(value):
+    if value > 5:
+        return value * 2
+    return value
+
+
+def summarize(values):
+    total = 0
+    for value in values:
+        total += check(value)
+    return total
+
+
+def report(values):
+    return {"count": len(values), "total": summarize(values)}
+"""
+    (tmp_path / "formatted.py").write_text(source)
+    (tmp_path / "other.py").write_text("value = 1\n")
+    git("add", ".")
+    git("commit", "-qm", "Initial sources")
+    formatted = (
+        "\n".join(
+            "  " * (len(line) - len(line.lstrip())) + line.lstrip() for line in source.splitlines()
+        )
+        + "\n"
+    )
+    (tmp_path / "formatted.py").write_text(formatted)
+    return tmp_path, git
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_mcp_structural_diff_receipt_recovers_exact_raw_diff(structural_mcp_repo, staged):
+    root, git = structural_mcp_repo
+    if staged:
+        git("add", "formatted.py")
+    raw = git(
+        "diff", "--no-ext-diff", "--no-textconv", "--no-color", *(["--cached"] if staged else [])
+    )
+    output = handle_usagetrim_diff({"cwd": str(root), "staged": staged, "max_tokens": 4000})
+    assert "formatting-only" in output
+    assert "+        return value" not in output
+    ref = re.search(r"tc_[a-f0-9]+", output)
+    assert ref is not None
+    recovered = ContextCache().retrieve(ref.group())
+    assert recovered == raw
+    assert "-    if value > 5:" in recovered and "+        if value > 5:" in recovered
+    assert "formatting-only" not in recovered
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_mcp_genuine_diff_remains_visible(structural_mcp_repo, staged):
+    root, git = structural_mcp_repo
+    path = root / "formatted.py"
+    path.write_text(path.read_text().replace("value > 5", "value >= 5"))
+    if staged:
+        git("add", "formatted.py")
+    output = handle_usagetrim_diff({"cwd": str(root), "staged": staged, "max_tokens": 10000})
+    assert "formatting-only" not in output
+    assert "+        if value >= 5:" in output
+
+
+def test_mcp_structural_diff_path_scope_and_cwd(structural_mcp_repo, monkeypatch):
+    root, _ = structural_mcp_repo
+    (root / "other.py").write_text("value = 2\n")
+    elsewhere = root / "sub"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    output = handle_usagetrim_diff({"cwd": str(root), "path": "formatted.py", "max_tokens": 4000})
+    assert "formatting-only" in output
+    assert "other.py" not in output
+    assert "a/formatted.py" in output
+
+
+def test_mcp_structural_diff_redacts_output_and_recovered_raw(structural_mcp_repo):
+    root, git = structural_mcp_repo
+    secret = "ghp_" + "a" * 36
+    path = root / "formatted.py"
+    source = path.read_text() + f'\ncredential = "{secret}"\n'
+    path.write_text(source)
+    git("add", "formatted.py")
+    git("commit", "-qm", "Add controlled redaction fixture")
+    path.write_text(source.replace("credential = ", "credential="))
+    output = handle_usagetrim_diff({"cwd": str(root), "max_tokens": 4000})
+    assert "formatting-only" in output and secret not in output
+    ref = re.search(r"tc_[a-f0-9]+", output)
+    assert ref is not None
+    recovered = ContextCache().retrieve(ref.group())
+    assert secret not in recovered and "REDACTED" in recovered
+    assert '-credential = "' in recovered and '+credential="' in recovered
+
+
+def test_mcp_diff_pause_skips_classifier_budget_and_recovery(structural_mcp_repo, monkeypatch):
+    root, git = structural_mcp_repo
+    raw = git("diff", "--no-ext-diff", "--no-textconv", "--no-color")
+    before = ContextCache().get_stats()["count"]
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Pause must bypass structural classification and slimming")
+
+    monkeypatch.setattr(server, "paused", lambda: True)
+    monkeypatch.setattr(server, "classify_git_diff", forbidden)
+    monkeypatch.setattr(server, "budgeted_diff_slice", forbidden)
+    monkeypatch.setattr(server, "_compress", forbidden)
+    output = handle_usagetrim_diff({"cwd": str(root), "max_tokens": 64})
+    assert output == raw
+    assert ContextCache().get_stats()["count"] == before
+
+
+def test_mcp_structural_diff_with_process_cwd_and_ignore(structural_mcp_repo, monkeypatch):
+    root, _ = structural_mcp_repo
+    monkeypatch.chdir(root)
+    output = handle_usagetrim_diff({"max_tokens": 4000})
+    assert "formatting-only" in output
+    ignored = handle_usagetrim_diff({"ignore_patterns": [r"formatted\.py$"], "max_tokens": 4000})
+    assert "formatting-only" not in ignored and "lockfile/generated" in ignored
+
+
+def test_mcp_structural_diff_empty_keeps_message(structural_mcp_repo, monkeypatch):
+    root, git = structural_mcp_repo
+    git("add", "formatted.py")
+    monkeypatch.setattr(
+        server, "classify_git_diff", lambda *a, **kw: pytest.fail("Empty diff must skip classifier")
+    )
+    assert handle_usagetrim_diff({"cwd": str(root)}) == "No git changes detected."

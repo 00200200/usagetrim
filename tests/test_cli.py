@@ -764,3 +764,104 @@ def test_cli_prompt_trim(tmp_path):
     trimmed_data = json.loads(output_file.read_text(encoding="utf-8"))
     assert len(trimmed_data) == len(messages)
     assert "omitted by usagetrim" in trimmed_data[3]["content"]
+
+
+@pytest.fixture
+def structural_cli_repo(tmp_path, monkeypatch):
+    import subprocess
+
+    def git(*args):
+        return subprocess.check_output(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", *args],
+            cwd=tmp_path,
+        ).decode("utf-8")
+
+    git("init", "-q", "--initial-branch=main")
+    (tmp_path / "formatted.py").write_text("def check(x):\n    return x > 5\n")
+    (tmp_path / "logic.py").write_text("value = 1\n")
+    git("add", ".")
+    git("commit", "-qm", "Initial sources")
+    monkeypatch.chdir(tmp_path)
+    return tmp_path, git
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("logic", [False, True])
+def test_cli_diff_structural_and_genuine_changes(structural_cli_repo, staged, logic):
+    root, git = structural_cli_repo
+    (root / "formatted.py").write_text(
+        "def check( x ):\n    return x" + (">=5" if logic else ">5") + "\n"
+    )
+    if staged:
+        git("add", "formatted.py")
+    result = runner.invoke(app, ["diff"] + (["--staged"] if staged else []))
+    assert result.exit_code == 0, result.output
+    if logic:
+        assert "formatting-only" not in result.stdout
+        assert "+    return x>=5" in result.stdout
+    else:
+        assert "formatting-only" in result.stdout
+        assert "+def check( x ):" not in result.stdout
+
+
+def test_cli_structural_diff_preserves_mixed_logic_and_raw_telemetry(
+    structural_cli_repo, monkeypatch
+):
+    import usagetrim.cli as cli
+
+    root, git = structural_cli_repo
+    (root / "formatted.py").write_text("def check( x ):\n    return x>5\n")
+    (root / "logic.py").write_text("value = 2\n")
+    raw = git("diff", "--no-ext-diff", "--no-textconv", "--no-color")
+    records = []
+    monkeypatch.setattr(cli, "record_text", lambda *args, **kwargs: records.append((args, kwargs)))
+    result = runner.invoke(app, ["diff"])
+    assert result.exit_code == 0
+    assert "formatting-only" in result.stdout
+    assert "-value = 1" in result.stdout and "+value = 2" in result.stdout
+    assert records[0][0] == (raw, result.stdout)
+    assert records[0][1]["engine"] == "usagetrim"
+
+
+def test_cli_structural_diff_budget_and_ignore(structural_cli_repo):
+    from usagetrim.metrics.tokenizer import count_tokens
+
+    root, _ = structural_cli_repo
+    (root / "formatted.py").write_text("def check( x ):\n    return x>5\n")
+    result = runner.invoke(app, ["diff", "--budget", "300"])
+    assert result.exit_code == 0 and "formatting-only" in result.stdout
+    assert count_tokens(result.stdout).openai <= 300
+    ignored = runner.invoke(app, ["diff", "--ignore", r"formatted\.py$"])
+    assert ignored.exit_code == 0
+    assert "formatting-only" not in ignored.stdout and "lockfile/generated" in ignored.stdout
+
+
+def test_cli_diff_pause_skips_classifier_and_budget(structural_cli_repo, monkeypatch):
+    import usagetrim.cli as cli
+
+    root, git = structural_cli_repo
+    (root / "formatted.py").write_text("def check( x ):\n    return x>5\n")
+    raw = git("diff", "--no-ext-diff", "--no-textconv", "--no-color")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Pause must bypass structural classification and slimming")
+
+    monkeypatch.setattr(cli, "paused", lambda: True)
+    monkeypatch.setattr(cli, "classify_git_diff", forbidden)
+    monkeypatch.setattr(cli, "budgeted_diff_slice", forbidden)
+    records = []
+    monkeypatch.setattr(cli, "record_text", lambda *args, **kwargs: records.append((args, kwargs)))
+    result = runner.invoke(app, ["diff", "--budget", "64"])
+    assert result.exit_code == 0 and result.stdout == raw
+    assert records[0][0] == (raw, raw) and records[0][1]["engine"] == "none"
+
+
+def test_cli_malformed_source_keeps_existing_diff_behavior(structural_cli_repo):
+    from usagetrim.core.diff_slimmer import slim_git_diff
+
+    root, git = structural_cli_repo
+    (root / "formatted.py").write_text("def check(:\n pass\n")
+    raw = git("diff", "--no-ext-diff", "--no-textconv", "--no-color")
+    result = runner.invoke(app, ["diff"])
+    assert result.exit_code == 0
+    assert result.stdout.rstrip("\n") == slim_git_diff(raw).rstrip("\n")

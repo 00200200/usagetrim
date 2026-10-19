@@ -1,10 +1,114 @@
 from __future__ import annotations
 
+import ast
+import hashlib
 import re
+import stat
+import subprocess
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ast_grep_py import SgRoot
+
 from usagetrim.metrics.tokenizer import count_tokens
+
+_STRUCTURAL_LANGUAGES = {
+    ".py": "python",
+    ".pyi": "python",
+    ".ts": "typescript",
+    ".go": "go",
+    ".rs": "rust",
+}
+_MAX_STRUCTURAL_SOURCE_BYTES = 2 * 1024 * 1024
+_COMMENT_KINDS = {"comment", "line_comment", "block_comment"}
+_LITERAL_KINDS = {
+    "string",
+    "template_string",
+    "string_literal",
+    "raw_string_literal",
+    "interpreted_string_literal",
+    "char_literal",
+    "character_literal",
+}
+
+
+def _structural_fingerprint(source: str, language: str) -> tuple | None:
+    """Retain concrete syntax and opaque text; reject incomplete parser coverage."""
+    try:
+        if language == "python":
+            ast.parse(source)
+        root = SgRoot(source, language).root()
+        fingerprint = []
+        # Visit even opaque descendants to detect parser errors and missing tokens.
+        stack = [(root, False, False)]
+        while stack:
+            node, hidden, closing = stack.pop()
+            kind = node.kind()
+            if closing:
+                if not hidden:
+                    fingerprint.append(("end", kind))
+                continue
+            span = node.range()
+            start, end = span.start.index, span.end.index
+            if kind == "ERROR" or (start == end and node is not root):
+                return None
+            children = node.children()
+            opaque = kind in _COMMENT_KINDS or kind in _LITERAL_KINDS
+            if language == "rust" and ("macro" in kind or "token_tree" in kind):
+                return None
+            if not hidden:
+                if opaque or not children:
+                    text = node.text()
+                    if source[start:end] != text:
+                        return None
+                    if node is root and not text.strip():
+                        fingerprint.append(("empty", kind))
+                    else:
+                        fingerprint.append(("text", kind, text))
+                else:
+                    fingerprint.append(("start", kind))
+                    stack.append((node, False, True))
+                    cursor = start
+                    for child in children:
+                        child_span = child.range()
+                        left, right = child_span.start.index, child_span.end.index
+                        if left < cursor or right > end or source[cursor:left].strip():
+                            return None
+                        cursor = right
+                    if source[cursor:end].strip():
+                        return None
+            stack.extend((child, hidden or opaque, False) for child in reversed(children))
+        span = root.range()
+        if source[: span.start.index].strip() or source[span.end.index :].strip():
+            return None
+        return tuple(fingerprint)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+
+
+def structurally_equivalent(old_source: str, new_source: str, path: str | Path) -> bool | None:
+    """Compare full sources, returning None when syntax cannot be trusted.
+
+    Ordinary inter-token whitespace is ignored. Comments and literal text are
+    exact; Rust macros conservatively fall back instead of normalizing tokens.
+    This is parser structural equality, not a claim of semantic equivalence.
+    """
+    language = _STRUCTURAL_LANGUAGES.get(Path(path).suffix.lower())
+    if language is None:
+        return None
+    try:
+        if any(
+            len(source.encode("utf-8")) > _MAX_STRUCTURAL_SOURCE_BYTES or "\0" in source
+            for source in (old_source, new_source)
+        ):
+            return None
+    except UnicodeError:
+        return None
+    old = _structural_fingerprint(old_source, language)
+    new = _structural_fingerprint(new_source, language)
+    return None if old is None or new is None else old == new
+
 
 LOCKFILE_PATTERNS = [
     re.compile(
@@ -23,10 +127,154 @@ def is_lockfile_or_generated(filename: str, extra_patterns: list[re.Pattern] | N
     return False
 
 
+def _git_bytes(root: str | Path | None, *args: str) -> bytes:
+    result = subprocess.run(
+        ["git", "--literal-pathspecs", *args],
+        cwd=root,
+        capture_output=True,
+        timeout=10,
+    )
+    if result.returncode:
+        raise ValueError("Git source unavailable")
+    return result.stdout
+
+
+def _structural_candidates(raw_diff: str) -> list[tuple[str, str, str, str]]:
+    """Accept only unambiguous, unquoted modified-file headers with text hunks."""
+    candidates = []
+    seen = set()
+    duplicates = set()
+    for chunk in re.split(r"(?=^diff --git )", raw_diff, flags=re.MULTILINE):
+        lines = chunk.splitlines()
+        if not lines or not lines[0].startswith("diff --git "):
+            continue
+        match = re.fullmatch(r"diff --git a/([A-Za-z0-9_./-]+) b/([A-Za-z0-9_./-]+)", lines[0])
+        if match is None or match[1] != match[2]:
+            continue
+        path = match[1]
+        if path in seen:
+            duplicates.add(path)
+        seen.add(path)
+        if any(part in {"", ".", "..", ".git"} for part in path.split("/")):
+            continue
+        if len(lines) < 5 or lines[2:4] != [f"--- a/{path}", f"+++ b/{path}"]:
+            continue
+        index = re.fullmatch(r"index ([0-9a-f]+)\.\.([0-9a-f]+) (100644|100755)", lines[1])
+        if index is None or any(not value.strip("0") for value in index.groups()[:2]):
+            continue
+        if not re.fullmatch(r"@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@.*", lines[4]):
+            continue
+        candidates.append((path, index[1], index[2], index[3]))
+    return [candidate for candidate in candidates if candidate[0] not in duplicates]
+
+
+def _git_blob(root: Path, oid: str) -> bytes:
+    size = int(_git_bytes(root, "cat-file", "-s", oid))
+    if size > _MAX_STRUCTURAL_SOURCE_BYTES:
+        raise ValueError("Source exceeds structural size limit")
+    data = _git_bytes(root, "cat-file", "blob", oid)
+    if len(data) > _MAX_STRUCTURAL_SOURCE_BYTES:
+        raise ValueError("Source exceeds structural size limit")
+    return data
+
+
+def classify_git_diff(
+    raw_diff: str,
+    *,
+    cwd: str | Path | None = None,
+    staged: bool = False,
+    extra_patterns: list[str] | None = None,
+) -> set[str]:
+    """Identify AST-equal modified files only after verifying both snapshot blobs.
+
+    Unstaged compares INDEX to WORKTREE; staged compares HEAD to INDEX.
+    Unusual metadata, path quoting, transforms or changed snapshots fall back.
+    """
+    patterns = [re.compile(pattern) for pattern in extra_patterns or []]
+    candidates = [
+        candidate
+        for candidate in _structural_candidates(raw_diff)
+        if Path(candidate[0]).suffix.lower() in _STRUCTURAL_LANGUAGES
+        and not is_lockfile_or_generated(candidate[0], patterns)
+    ]
+    if not candidates:
+        return set()
+    try:
+        root = Path(
+            _git_bytes(cwd, "rev-parse", "--show-toplevel").decode("utf-8").rstrip("\n")
+        ).resolve()
+        algorithm = _git_bytes(root, "rev-parse", "--show-object-format").decode("ascii").strip()
+        if algorithm not in {"sha1", "sha256"}:
+            return set()
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return set()
+    equivalent = set()
+    for path, old_prefix, new_prefix, mode in candidates:
+        try:
+            if any(
+                len(prefix) < 4 or len(prefix) > hashlib.new(algorithm).digest_size * 2
+                for prefix in (old_prefix, new_prefix)
+            ):
+                continue
+            # Reject symlinks in every component, not just the final filename.
+            target = root
+            for part in path.split("/"):
+                target = target / part
+                if target.is_symlink():
+                    raise ValueError("Symlink source is not a structural candidate")
+            if not target.resolve().is_relative_to(root):
+                continue
+            records = _git_bytes(root, "ls-files", "--stage", "-z", "--", path).split(b"\0")
+            if len(records) != 2 or records[1]:
+                continue
+            metadata, indexed_path = records[0].split(b"\t", 1)
+            index_mode, index_oid, stage = metadata.decode("ascii").split()
+            if indexed_path.decode("utf-8") != path or stage != "0" or index_mode != mode:
+                continue
+            index_source = _git_blob(root, index_oid)
+            if staged:
+                tree = _git_bytes(root, "ls-tree", "-z", "HEAD", "--", path).split(b"\0")
+                if len(tree) != 2 or tree[1]:
+                    continue
+                head_metadata, head_path = tree[0].split(b"\t", 1)
+                head_mode, object_type, head_oid = head_metadata.decode("ascii").split()
+                if head_path.decode("utf-8") != path or head_mode != mode or object_type != "blob":
+                    continue
+                old, new = _git_blob(root, head_oid), index_source
+            else:
+                file_stat = target.stat()
+                if (
+                    not stat.S_ISREG(file_stat.st_mode)
+                    or file_stat.st_size > _MAX_STRUCTURAL_SOURCE_BYTES
+                ):
+                    continue
+                if bool(file_stat.st_mode & stat.S_IXUSR) != (mode == "100755"):
+                    continue
+                with target.open("rb") as stream:
+                    new = stream.read(_MAX_STRUCTURAL_SOURCE_BYTES + 1)
+                old = index_source
+            if len(new) > _MAX_STRUCTURAL_SOURCE_BYTES:
+                continue
+
+            def matches(data: bytes, prefix: str) -> bool:
+                blob = b"blob " + str(len(data)).encode("ascii") + b"\0" + data
+                return hashlib.new(algorithm, blob).hexdigest().startswith(prefix)
+
+            if not matches(old, old_prefix) or not matches(new, new_prefix):
+                continue
+            if structurally_equivalent(old.decode("utf-8"), new.decode("utf-8"), path) is True:
+                equivalent.add(path)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            continue
+    return equivalent
+
+
 def slim_git_diff(
     raw_diff: str,
     max_context_lines: int = 2,
     extra_patterns: list[str] | None = None,
+    *,
+    formatting_only_paths: Collection[str] = (),
 ) -> str:
     """Compress unified git diffs.
 
@@ -36,6 +284,26 @@ def slim_git_diff(
     """
     if not raw_diff:
         return ""
+
+    if formatting_only_paths:
+        _, files = _parse_diff(
+            raw_diff,
+            max_context_lines,
+            extra_patterns,
+            formatting_only_paths=formatting_only_paths,
+        )
+        receipts = {
+            file.header_lines[0]: _render_formatting_only(file)
+            for file in files
+            if file.formatting_only
+        }
+        if receipts:
+            return "\n".join(
+                receipts.get(chunk.splitlines()[0])
+                or slim_git_diff(chunk, max_context_lines, extra_patterns)
+                for chunk in re.split(r"(?=^diff --git )", raw_diff, flags=re.MULTILINE)
+                if chunk
+            )
 
     compiled_extra = [re.compile(p) for p in extra_patterns] if extra_patterns else None
 
@@ -134,6 +402,7 @@ class FileDiff:
     hunks: list[DiffHunk] = field(default_factory=list)
     raw_body_lines: list[str] = field(default_factory=list)
     is_lockfile: bool = False
+    formatting_only: bool = False
     additions: int = 0
     deletions: int = 0
     priority_score: float = 0.0
@@ -290,7 +559,23 @@ def score_file_importance(
     return base * change_multiplier
 
 
+def _render_formatting_only(file_diff: FileDiff) -> str:
+    """Count changed body lines as additions plus deletions, across all hunks."""
+    changed_lines = sum(
+        line.startswith(("+", "-")) for hunk in file_diff.hunks for line in hunk.lines
+    )
+    return "\n".join(
+        [
+            *file_diff.header_lines,
+            f"  [... {changed_lines} formatting-only changed lines "
+            "folded by usagetrim; parser structure and token text unchanged ...]",
+        ]
+    )
+
+
 def _render_full(file_diff: FileDiff) -> str:
+    if file_diff.formatting_only:
+        return _render_formatting_only(file_diff)
     if file_diff.is_lockfile:
         return _render_folded(file_diff)
     lines = list(file_diff.header_lines)
@@ -301,6 +586,8 @@ def _render_full(file_diff: FileDiff) -> str:
 
 
 def _render_folded(file_diff: FileDiff) -> str:
+    if file_diff.formatting_only:
+        return _render_formatting_only(file_diff)
     lines = []
     if file_diff.header_lines:
         lines.append(file_diff.header_lines[0])
@@ -327,6 +614,8 @@ def _render_folded(file_diff: FileDiff) -> str:
 
 
 def _render_window(file_diff: FileDiff, num_hunks: int) -> str:
+    if file_diff.formatting_only:
+        return _render_formatting_only(file_diff)
     lines = list(file_diff.header_lines)
     kept_hunks = file_diff.hunks[:num_hunks]
     folded_hunks = file_diff.hunks[num_hunks:]
@@ -344,6 +633,8 @@ def _render_window(file_diff: FileDiff, num_hunks: int) -> str:
 
 
 def _render_compact_receipt(file_diff: FileDiff) -> str:
+    if file_diff.formatting_only:
+        return _render_formatting_only(file_diff)
     return f"diff --git a/{file_diff.path} b/{file_diff.path} (+{file_diff.additions}, -{file_diff.deletions} folded)"
 
 
@@ -351,7 +642,16 @@ def _parse_diff(
     raw_diff: str,
     max_context_lines: int = 2,
     extra_patterns: list[str] | None = None,
+    *,
+    formatting_only_paths: Collection[str] = (),
 ) -> tuple[str, list[FileDiff]]:
+    # Reuse strict ordinary-file metadata checks; manual callers may be mistaken.
+    safe_paths = (
+        {candidate[0] for candidate in _structural_candidates(raw_diff)}
+        & set(formatting_only_paths)
+        if formatting_only_paths
+        else set()
+    )
     compiled_extra = [re.compile(p) for p in extra_patterns] if extra_patterns else None
 
     raw_chunks = re.split(r"(?=^diff --git )", raw_diff, flags=re.MULTILINE)
@@ -443,6 +743,7 @@ def _parse_diff(
                 hunks=hunks,
                 raw_body_lines=raw_body_lines,
                 is_lockfile=is_lock,
+                formatting_only=path in safe_paths and not is_lock,
                 additions=total_adds,
                 deletions=total_dels,
                 original_index=idx,
@@ -467,6 +768,8 @@ def budgeted_diff_slice(
     budget_tokens: int = 4000,
     extra_patterns: list[str] | None = None,
     max_context_lines: int = 2,
+    *,
+    formatting_only_paths: Collection[str] = (),
 ) -> str:
     """Dynamically slices and budgets large git diffs to strictly stay within token limits.
 
@@ -484,13 +787,19 @@ def budgeted_diff_slice(
 
     # Quick check: does standard slim_git_diff already fit comfortably?
     slimmed_full = slim_git_diff(
-        raw_diff, max_context_lines=max_context_lines, extra_patterns=extra_patterns
+        raw_diff,
+        max_context_lines=max_context_lines,
+        extra_patterns=extra_patterns,
+        formatting_only_paths=formatting_only_paths,
     )
     if count_tokens(slimmed_full).openai <= target_budget:
         return slimmed_full
 
     preamble, file_diffs = _parse_diff(
-        raw_diff, max_context_lines=max_context_lines, extra_patterns=extra_patterns
+        raw_diff,
+        max_context_lines=max_context_lines,
+        extra_patterns=extra_patterns,
+        formatting_only_paths=formatting_only_paths,
     )
 
     if not file_diffs:
@@ -525,7 +834,7 @@ def budgeted_diff_slice(
         sorted_files = sorted(file_diffs, key=lambda f: f.priority_score, reverse=True)
 
         for f in sorted_files:
-            if f.is_lockfile:
+            if f.is_lockfile or f.formatting_only:
                 continue
 
             cost_to_full = full_tokens[f.original_index] - folded_tokens[f.original_index]
