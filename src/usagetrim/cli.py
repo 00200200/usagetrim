@@ -119,6 +119,31 @@ def _emit(text: str) -> str:
     return emitted
 
 
+memory_app = typer.Typer(name="memory", help="Manage task memory retention.", no_args_is_help=True)
+app.add_typer(memory_app, name="memory")
+
+
+@memory_app.command("clean")
+def memory_clean_command(
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Report without deleting tasks.")
+    ] = False,
+    root: Annotated[
+        str | None, typer.Option("--root", help="Scope to an absolute project path.")
+    ] = None,
+):
+    """Report or remove ephemeral tasks inactive for more than seven days."""
+    import sqlite3
+
+    from usagetrim.core.redactor import redact_secrets
+    from usagetrim.core.task_context import clean_task_memory
+
+    try:
+        _emit(json.dumps(clean_task_memory(root=root, dry_run=dry_run), ensure_ascii=False))
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        raise typer.BadParameter(redact_secrets(str(exc))) from exc
+
+
 @app.command("context")
 def task_context(request_file: Annotated[Path | None, typer.Option("--request-file")] = None):
     """Save/read/list/forget task checkpoints using a JSON request on stdin or from a file."""

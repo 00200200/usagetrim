@@ -264,6 +264,44 @@ Task memory does not scan transcripts, prompts or native summaries. The
 separate `distill` command reads only text explicitly supplied to it. Notes are
 fallible data; newer user requests and current files take precedence.
 
+New tasks saved by the current version default to `ephemeral`. They expire after
+more than seven days without activity. Successful saves, reads (including earlier
+revisions), and lifecycle observations refresh activity. Cleanup is opportunistic
+after saves and lifecycle observations, scoped to the current project; there is
+no background daemon or timer. New lifecycle-only session tasks are ephemeral.
+Legacy tasks without retention metadata remain protected as effective `permanent`.
+
+To keep project guidelines out of TTL cleanup, save through `usagetrim_context`
+with `retention: "permanent"`, for example:
+
+```json
+{
+  "action": "save",
+  "root": "/absolute/project",
+  "task": "project-guidelines",
+  "expected_revision": 0,
+  "retention": "permanent",
+  "checkpoint": {"goal": "Preserve project conventions", "constraints": ["Run affected tests"]}
+}
+```
+
+Omitting retention on an existing task preserves its class. Changing retention
+requires the current `expected_revision`; changing only retention does not add a
+checkpoint revision. `permanent` disables TTL expiry; manual `forget` still removes
+the task regardless of retention.
+
+Inspect or remove expired ephemeral tasks in the selected `context.db`:
+
+```sh
+usagetrim memory clean --dry-run
+usagetrim memory clean
+```
+
+Both commands emit JSON listing candidate task IDs and metadata, without checkpoint
+payloads. Dry-run is read-only. By default cleanup covers all projects in that
+store; add `--root /absolute/project` to scope it, even if the project directory
+no longer exists.
+
 ## macOS companion
 
 Requires macOS 13+ and Apple's Swift toolchain. From a source checkout:
