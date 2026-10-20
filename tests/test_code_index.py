@@ -11,6 +11,7 @@ from usagetrim.core.code_index import (
     _build_file_graph,
     _calculate_pagerank,
     _language_family,
+    _RepoMapResult,
     digest,
     parse_source,
     read_symbol,
@@ -720,16 +721,21 @@ def test_map_budget_reserves_metadata_and_rejects_impossible_budget():
     metadata = header + "\n" + notice + "\n" + server.recovery_notice(ref)
     minimum = count_tokens(metadata).claude
     assert minimum > 64
-    assert server._budget_repo_map(full, minimum) == metadata
+    assert (
+        server._budget_repo_map(_RepoMapResult(header + "\n", [entry], [notice]), minimum)
+        == metadata
+    )
     with pytest.raises(ValueError, match="header, notices and recovery reference"):
-        server._budget_repo_map(full, minimum - 1)
+        server._budget_repo_map(_RepoMapResult(header + "\n", [entry], [notice]), minimum - 1)
     with pytest.raises(ValueError, match="header, notices and recovery reference"):
-        server._budget_repo_map(full, 64)
+        server._budget_repo_map(_RepoMapResult(header + "\n", [entry], [notice]), 64)
 
 
 def test_map_budget_can_return_only_header_and_reference_at_64_tokens():
     full = "# map\nsample.py:1-1 giant | " + "parameter " * 200
-    output = server._budget_repo_map(full, 64)
+    output = server._budget_repo_map(
+        _RepoMapResult("# map\n", [full.removeprefix("# map\n")], []), 64
+    )
     assert count_tokens(output).claude <= 64
     ref = re.search(r"tc_[a-f0-9]+", output).group()
     assert output == "# map\n" + server.recovery_notice(ref)
@@ -739,7 +745,9 @@ def test_map_budget_can_return_only_header_and_reference_at_64_tokens():
 def test_map_recovery_retains_existing_cache_redaction():
     secret = "ghp_" + "a" * 36
     full = "# map\nsample.py:1-1 giant | " + "parameter " * 200 + secret
-    output = server._budget_repo_map(full, 64)
+    output = server._budget_repo_map(
+        _RepoMapResult("# map\n", [full.removeprefix("# map\n")], []), 64
+    )
     ref = re.search(r"tc_[a-f0-9]+", output).group()
     recovered = ContextCache().retrieve(ref)
     assert secret not in recovered and secret not in output
@@ -892,3 +900,50 @@ def test_code_index_references_and_callers_mode(tmp_path):
         {"root": str(root), "mode": "references", "query": "AuthService.verify_token"}
     )
     assert "login_endpoint" in mcp_res
+
+
+@pytest.mark.parametrize(
+    "computed_name,budget",
+    [
+        ('true ? "method":1-2', 96),
+        ('"foo.py:10-20 [Incomplete index: not a notice]"', 128),
+    ],
+)
+def test_mcp_map_structured_entries_ignore_boundary_like_symbol_text(
+    tmp_path, computed_name, budget
+):
+    source = "\n".join(
+        f"class C{number} {{\n  [\n    {computed_name}\n  ]() {{ return 1; }}\n}}"
+        for number in range(5)
+    )
+    (tmp_path / "computed.ts").write_text(source, encoding="utf-8")
+    index = CodeIndex(tmp_path)
+    index.sync()
+    full = index.query(mode="map")
+    symbols, _ = parse_source(source, "typescript")
+    entries = [
+        f"computed.ts:{symbol.line}-{symbol.end_line} {symbol.qualified} | {symbol.signature}"
+        for symbol in symbols
+    ]
+    assert sum("\n" in entry for entry in entries) == 5
+    structured = index._query_repo_map()
+    assert structured.entries == entries
+    assert structured.notices == []
+    assert structured.render() == full
+
+    output = server.handle_usagetrim_code(
+        {"root": str(tmp_path), "mode": "map", "max_tokens": budget}
+    )
+    assert count_tokens(output).claude <= budget
+    ref = re.search(r"tc_[a-f0-9]+", output).group()
+    selected = [entry for entry in entries if entry in output]
+    # No physical line is independently interpreted as an entry or notice.
+    assert output == structured.header + "\n".join(selected) + "\n" + server.recovery_notice(ref)
+    assert selected == [entry for entry in entries if entry in selected]
+    assert len(selected) < len(entries)
+    for entry in selected:
+        if "\n" in entry:
+            assert "] | " in entry
+    recovered = ContextCache().retrieve(ref)
+    assert recovered == full
+    assert all(entry in recovered for entry in entries if entry not in selected)

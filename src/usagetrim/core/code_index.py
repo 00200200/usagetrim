@@ -349,6 +349,19 @@ def source_files(root: Path) -> list[Path]:
     return paths
 
 
+@dataclass
+class _RepoMapResult:
+    header: str
+    entries: list[str]
+    notices: list[str]
+
+    def render(self) -> str:
+        body = "\n".join(self.entries)
+        for notice in self.notices:
+            body += ("\n" if body or notice != "No matches." else "") + notice
+        return self.header + (body or "No matches.")
+
+
 class CodeIndex:
     def __init__(self, root: str | Path):
         root = Path(root)
@@ -461,6 +474,13 @@ class CodeIndex:
             return len(seen)
 
     def query(self, mode="map", query="", file=None, limit=30) -> str:
+        result = self._query(mode, query, file, limit)
+        return result.render() if isinstance(result, _RepoMapResult) else result
+
+    def _query_repo_map(self, query="", file=None, limit=30) -> _RepoMapResult:
+        return self._query("map", query, file, limit)
+
+    def _query(self, mode, query, file, limit) -> str | _RepoMapResult:
         if mode not in {
             "map",
             "symbols",
@@ -550,10 +570,10 @@ class CodeIndex:
                         row[1],
                     )
                 )
-                body = "\n".join(
+                entries = [
                     f"{p}:{line}-{end} {name} | {signature}"
                     for p, name, line, end, signature in rows[:limit]
-                )
+                ]
             elif mode == "symbols":
                 rows = db.execute(
                     """SELECT s.path,s.qualified,s.line,s.end_line,s.signature,
@@ -608,6 +628,17 @@ class CodeIndex:
                     if len(rows) > limit:
                         break
                 body = "\n".join(f"{p}:{line}\n{text}" for p, line, text in rows[:limit])
+        if mode == "map":
+            notices = []
+            if len(rows) > limit:
+                notices.append(
+                    "[More results omitted; narrow query/file or raise limit (max 200).]"
+                )
+            if self.issues:
+                notices.append("[Incomplete index: " + "; ".join(self.issues[:8]) + "]")
+            if not entries and not notices:
+                notices.append("No matches.")
+            return _RepoMapResult(header, entries, notices)
         if len(rows) > limit:
             body += "\n[More results omitted; narrow query/file or raise limit (max 200).]"
         if self.issues:

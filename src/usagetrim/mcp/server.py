@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import subprocess
 import sys
 import time
@@ -695,33 +694,23 @@ def _compress(text, budget, **kwargs):
     return compress_to_budget(text, budget, **kwargs)
 
 
-def _budget_repo_map(full_result: str, budget: int) -> str:
+def _budget_repo_map(map_result, budget: int) -> str:
     """Fit complete ranked entries, reserving the header, notices and recovery.
 
     Recovery contains the full query result, including its existing limit and
     incomplete-index notices. Oversized entries are skipped, never truncated.
     """
-    safe_result = redact_secrets(full_result)
+    safe_result = redact_secrets(map_result.render())
     if count_tokens(safe_result).claude <= budget:
         return safe_result
     ref_id = ContextCache().store(safe_result, source="code-query")
     notice = recovery_notice(ref_id)
-    lines = safe_result.splitlines()
-    entries, notices = [], []
-    for line in lines[1:]:
-        if line in {
-            "No matches.",
-            "[More results omitted; narrow query/file or raise limit (max 200).]",
-        } or re.fullmatch(r"\[Incomplete index: .*\]", line):
-            notices.append(line)
-        elif re.match(r".+:\d+-\d+ ", line) or not entries:
-            entries.append(line)
-        else:
-            # Qualified computed names can span lines before the signature separator.
-            entries[-1] += "\n" + line
+    header = redact_secrets(map_result.header).removesuffix("\n")
+    entries = [redact_secrets(entry) for entry in map_result.entries]
+    notices = [redact_secrets(notice) for notice in map_result.notices]
 
     def render(selected):
-        return "\n".join([lines[0], *selected, *notices]) + "\n" + notice
+        return "\n".join([header, *selected, *notices]) + "\n" + notice
 
     selected = []
     output = render(selected)
@@ -751,17 +740,18 @@ def handle_usagetrim_code(arguments: dict[str, Any]) -> str:
     budget = _budget(arguments)
     index = CodeIndex(arguments["root"])
     mode = arguments.get("mode", "map")
-    result = index.query(
-        mode,
+    query_args = (
         arguments.get("query", ""),
         arguments.get("file"),
         arguments.get("limit", 30),
     )
-    output = (
-        _budget_repo_map(result, budget)
-        if mode == "map" and not paused()
-        else _compress(result, budget, source="code-query")
-    )
+    if mode == "map":
+        map_result = index._query_repo_map(*query_args)
+        result = map_result.render()
+        output = result if paused() else _budget_repo_map(map_result, budget)
+    else:
+        result = index.query(mode, *query_args)
+        output = _compress(result, budget, source="code-query")
     return _record(result, output, operation="code", project=arguments["root"])
 
 
