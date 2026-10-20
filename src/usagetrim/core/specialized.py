@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
 import shlex
+import sqlite3
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import PurePath
@@ -15,7 +17,10 @@ from usagetrim.core.json_slimmer import (
     slim_json,
     slim_json_data,
 )
+from usagetrim.core.redactor import redact_secrets
+from usagetrim.core.safe_filter import recovery_notice
 from usagetrim.core.spill import spill_large_output
+from usagetrim.metrics.tokenizer import count_tokens
 
 _WEB_VOID_TAGS = {
     "area",
@@ -1853,6 +1858,571 @@ def _is_cloud_log_command(command: str) -> bool:
     return index < len(words) and words[index] == groups[tool]
 
 
+@dataclass
+class _TraceSpan:
+    trace_id: str
+    span_id: str
+    parent_id: str | None
+    name: str
+    service: str
+    kind: str
+    start_ns: int
+    duration_ns: int
+    error: bool
+    attributes: list
+    events: list
+    links: list
+    warnings: list
+    original_record: dict
+    context: dict
+    input_order: int
+
+
+def _trace_json(value: object) -> str:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+
+
+def _trace_integer(value: object) -> int:
+    if type(value) is int:
+        number = value
+    elif isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+        number = int(value)
+    else:
+        raise ValueError("Invalid trace timestamp or duration")
+    if number < 0:
+        raise ValueError("Negative trace timestamp or duration")
+    return number
+
+
+def _trace_id(value: object, *, span: bool = False) -> str:
+    lengths = (16,) if span else (16, 32)
+    if (
+        not isinstance(value, str)
+        or len(value) not in lengths
+        or not re.fullmatch(r"[0-9a-fA-F]+", value)
+        or not value.strip("0")
+    ):
+        raise ValueError("Invalid trace identifier")
+    return value.lower()
+
+
+def _trace_any_value(value: object) -> object:
+    if not isinstance(value, dict) or len(value) != 1:
+        raise ValueError("Invalid OTLP attribute value")
+    key, decoded = next(iter(value.items()))
+    valid = False
+    if key in {"stringValue", "bytesValue"}:
+        valid = isinstance(decoded, str)
+    elif key == "boolValue":
+        valid = type(decoded) is bool
+    elif key == "intValue":
+        valid = type(decoded) is int or (
+            isinstance(decoded, str) and bool(re.fullmatch(r"-?[0-9]+", decoded))
+        )
+    elif key == "doubleValue":
+        valid = type(decoded) in (int, float) and math.isfinite(decoded)
+    elif key == "arrayValue" and isinstance(decoded, dict) and set(decoded) <= {"values"}:
+        items = decoded.get("values", [])
+        if isinstance(items, list):
+            for item in items:
+                _trace_any_value(item)
+            valid = True
+    elif key == "kvlistValue" and isinstance(decoded, dict) and set(decoded) <= {"values"}:
+        _trace_attributes(decoded.get("values", []), otlp=True)
+        valid = True
+    if not valid:
+        raise ValueError("Unsupported OTLP attribute value")
+    return decoded
+
+
+def _trace_attributes(value: object, *, otlp: bool) -> tuple[list, dict]:
+    if not isinstance(value, list):
+        raise ValueError("Invalid trace attributes")
+    values = {}
+    for item in value:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("key"), str)
+            or "value" not in item
+        ):
+            raise ValueError("Invalid trace attribute")
+        if item["key"] in values:
+            raise ValueError("Duplicate trace attribute")
+        decoded = item["value"]
+        if otlp:
+            decoded = _trace_any_value(decoded)
+        else:
+            expected = {
+                "string": str,
+                "bool": bool,
+                "int64": int,
+                "float64": float,
+                "binary": str,
+            }.get(item.get("type"))
+            if expected is float:
+                valid = type(decoded) in (int, float) and math.isfinite(decoded)
+            else:
+                valid = expected is not None and type(decoded) is expected
+            if not valid:
+                raise ValueError("Invalid Jaeger tag type")
+        values[item["key"]] = decoded
+    return value, values
+
+
+def _trace_error(values: dict) -> bool:
+    return (
+        values.get("error") is True
+        or values.get("error") == "true"
+        or any(
+            key.startswith("exception.")
+            or key in {"error.type", "error.message", "error.object", "error.kind"}
+            for key in values
+        )
+        or values.get("event") in ("error", "exception")
+        or values.get("otel.status_code") in ("ERROR", "STATUS_CODE_ERROR", 2)
+    )
+
+
+def _normalize_trace_spans(document: dict, format_name: str) -> tuple[list[_TraceSpan], dict]:
+    spans = []
+    metadata = {}
+
+    def add(
+        record,
+        trace,
+        service,
+        parent,
+        start,
+        duration,
+        attributes,
+        values,
+        events,
+        links,
+        warnings,
+        context,
+        error,
+    ):
+        if not isinstance(record.get("name" if format_name == "otlp" else "operationName"), str):
+            raise ValueError("Invalid span name")
+        if not all(isinstance(items, list) for items in (events, links, warnings)):
+            raise ValueError("Invalid span diagnostics")
+        spans.append(
+            _TraceSpan(
+                trace,
+                _trace_id(record.get("spanId" if format_name == "otlp" else "spanID"), span=True),
+                parent,
+                record["name" if format_name == "otlp" else "operationName"],
+                service,
+                str(record.get("kind", values.get("span.kind", ""))),
+                start,
+                duration,
+                error or _trace_error(values),
+                attributes,
+                events,
+                links,
+                warnings,
+                record,
+                context,
+                len(spans),
+            )
+        )
+        if len(spans) > 10000:
+            raise ValueError("Trace export exceeds span limit")
+
+    if format_name == "jaeger":
+        traces = document.get("data", [document])
+        if not isinstance(traces, list) or not traces or document.get("errors"):
+            raise ValueError("Invalid Jaeger export")
+        if "data" in document:
+            if document.keys() - {"data", "total", "limit", "offset", "errors"}:
+                raise ValueError("Unknown Jaeger export metadata")
+            metadata = {
+                key: value for key, value in document.items() if key != "data" and value is not None
+            }
+        for trace in traces:
+            if not isinstance(trace, dict) or trace.keys() - {
+                "traceID",
+                "spans",
+                "processes",
+                "warnings",
+            }:
+                raise ValueError("Invalid Jaeger trace")
+            trace_id = _trace_id(trace.get("traceID"))
+            processes = trace.get("processes", {})
+            if (
+                not isinstance(processes, dict)
+                or not isinstance(trace.get("spans"), list)
+                or trace.get("warnings")
+            ):
+                raise ValueError("Unsupported Jaeger trace metadata")
+            for record in trace["spans"]:
+                if not isinstance(record, dict) or _trace_id(record.get("traceID")) != trace_id:
+                    raise ValueError("Mismatched Jaeger trace")
+                attributes, values = _trace_attributes(record.get("tags", []), otlp=False)
+                process_id = record.get("processID")
+                process = processes.get(process_id, {}) if isinstance(process_id, str) else {}
+                if process_id is not None and process_id not in processes:
+                    raise ValueError("Missing Jaeger process")
+                if not isinstance(process, dict) or not isinstance(
+                    process.get("serviceName", "unknown"), str
+                ):
+                    raise ValueError("Invalid Jaeger service")
+                _trace_attributes(process.get("tags", []), otlp=False)
+                refs = record.get("references", [])
+                if not isinstance(refs, list):
+                    raise ValueError("Invalid Jaeger references")
+                parents = set()
+                links = []
+                for reference in refs:
+                    if not isinstance(reference, dict) or reference.get("refType") not in {
+                        "CHILD_OF",
+                        "FOLLOWS_FROM",
+                    }:
+                        raise ValueError("Unsupported Jaeger reference")
+                    reference_trace = _trace_id(reference.get("traceID"))
+                    reference_span = _trace_id(reference.get("spanID"), span=True)
+                    if reference["refType"] == "CHILD_OF":
+                        if reference_trace != trace_id:
+                            raise ValueError("Cross-trace parent")
+                        parents.add(reference_span)
+                    else:
+                        links.append(reference)
+                if len(parents) > 1:
+                    raise ValueError("Conflicting Jaeger parents")
+                events = record.get("logs", [])
+                if not isinstance(events, list):
+                    raise ValueError("Invalid Jaeger logs")
+                error = False
+                for event in events:
+                    if not isinstance(event, dict):
+                        raise ValueError("Invalid Jaeger log")
+                    if "timestamp" in event:
+                        _trace_integer(event["timestamp"])
+                    _, fields = _trace_attributes(event.get("fields", []), otlp=False)
+                    error |= _trace_error(fields)
+                add(
+                    record,
+                    trace_id,
+                    process.get("serviceName", "unknown"),
+                    next(iter(parents), None),
+                    _trace_integer(record.get("startTime")) * 1000,
+                    _trace_integer(record.get("duration")) * 1000,
+                    attributes,
+                    values,
+                    events,
+                    links,
+                    (record.get("warnings") if record.get("warnings") is not None else []),
+                    {"process": process},
+                    error,
+                )
+    else:
+        if document.keys() - {"resourceSpans"} or not isinstance(document["resourceSpans"], list):
+            raise ValueError("Invalid OTLP export")
+        for resource_spans in document["resourceSpans"]:
+            if not isinstance(resource_spans, dict) or not isinstance(
+                resource_spans.get("resource", {}), dict
+            ):
+                raise ValueError("Invalid OTLP resource")
+            resource = resource_spans.get("resource", {})
+            _, resource_values = _trace_attributes(resource.get("attributes", []), otlp=True)
+            service = resource_values.get("service.name", "unknown")
+            if not isinstance(service, str) or not isinstance(
+                resource_spans.get("scopeSpans"), list
+            ):
+                raise ValueError("Invalid OTLP resource spans")
+            for scope in resource_spans["scopeSpans"]:
+                if not isinstance(scope, dict) or not isinstance(scope.get("spans"), list):
+                    raise ValueError("Invalid OTLP scope")
+                for record in scope["spans"]:
+                    if not isinstance(record, dict):
+                        raise ValueError("Invalid OTLP span")
+                    trace_id = _trace_id(record.get("traceId"))
+                    if len(trace_id) != 32:
+                        raise ValueError("OTLP trace ID must be 16 bytes")
+                    kind = record.get("kind", 0)
+                    if type(kind) is not int or not 0 <= kind <= 5:
+                        raise ValueError("Unsupported OTLP span kind")
+                    parent = record.get("parentSpanId")
+                    parent = _trace_id(parent, span=True) if parent not in (None, "") else None
+                    start = _trace_integer(record.get("startTimeUnixNano"))
+                    end = _trace_integer(record.get("endTimeUnixNano"))
+                    if end < start:
+                        raise ValueError("Negative OTLP duration")
+                    attributes, values = _trace_attributes(record.get("attributes", []), otlp=True)
+                    status = record.get("status", {})
+                    if (
+                        not isinstance(status, dict)
+                        or type(status.get("code", 0)) not in (int, str)
+                        or status.get("code", 0)
+                        not in {
+                            0,
+                            1,
+                            2,
+                            "UNSET",
+                            "OK",
+                            "ERROR",
+                            "STATUS_CODE_UNSET",
+                            "STATUS_CODE_OK",
+                            "STATUS_CODE_ERROR",
+                        }
+                    ):
+                        raise ValueError("Invalid OTLP status")
+                    events = record.get("events", [])
+                    if not isinstance(events, list) or any(
+                        not isinstance(event, dict) for event in events
+                    ):
+                        raise ValueError("Invalid OTLP events")
+                    error = status.get("code") in {2, "ERROR", "STATUS_CODE_ERROR"}
+                    for event in events:
+                        if not isinstance(event.get("name"), str):
+                            raise ValueError("Invalid OTLP event name")
+                        if "timeUnixNano" in event:
+                            _trace_integer(event["timeUnixNano"])
+                        _, event_values = _trace_attributes(event.get("attributes", []), otlp=True)
+                        error |= event.get("name") == "exception" or _trace_error(event_values)
+                    links = record.get("links", [])
+                    if not isinstance(links, list):
+                        raise ValueError("Invalid OTLP links")
+                    for link in links:
+                        if not isinstance(link, dict):
+                            raise ValueError("Invalid OTLP link")
+                        _trace_id(link.get("traceId"))
+                        _trace_id(link.get("spanId"), span=True)
+                        _trace_attributes(link.get("attributes", []), otlp=True)
+                    add(
+                        record,
+                        trace_id,
+                        service,
+                        parent,
+                        start,
+                        end - start,
+                        attributes,
+                        values,
+                        events,
+                        record.get("links", []),
+                        record.get("warnings", []),
+                        {
+                            "resource": resource,
+                            "scope": {key: value for key, value in scope.items() if key != "spans"},
+                            "resourceMetadata": {
+                                key: value
+                                for key, value in resource_spans.items()
+                                if key not in {"resource", "scopeSpans"}
+                            },
+                        },
+                        error,
+                    )
+    if not spans:
+        raise ValueError("Empty trace export")
+    return spans, metadata
+
+
+def _trace_span_metadata(span: _TraceSpan) -> dict:
+    if "traceID" in span.original_record:
+        omitted = {
+            "traceID",
+            "spanID",
+            "operationName",
+            "startTime",
+            "duration",
+            "processID",
+            "tags",
+            "logs",
+            "references",
+            "warnings",
+        }
+    else:
+        omitted = {
+            "traceId",
+            "spanId",
+            "parentSpanId",
+            "name",
+            "kind",
+            "startTimeUnixNano",
+            "endTimeUnixNano",
+            "attributes",
+            "events",
+            "links",
+            "warnings",
+        }
+    return {key: value for key, value in span.original_record.items() if key not in omitted}
+
+
+def _render_trace_spans(spans: list[_TraceSpan], metadata: dict) -> str:
+    traces = {}
+    for span in spans:
+        trace = traces.setdefault(span.trace_id, {})
+        if span.span_id in trace:
+            raise ValueError("Duplicate span ID")
+        trace[span.span_id] = span
+    lines = ["Export metadata " + _trace_json(metadata)] if metadata else []
+
+    def milliseconds(nanoseconds):
+        whole, fraction = divmod(nanoseconds, 1000000)
+        return str(whole) + ("." + f"{fraction:06d}".rstrip("0") if fraction else "") + "ms"
+
+    for trace_id, trace in traces.items():
+        complete = set()
+        for span in trace.values():
+            visiting = set()
+            current = span.span_id
+            while current in trace and current not in complete:
+                if current in visiting:
+                    raise ValueError("Cycle in span graph")
+                visiting.add(current)
+                current = trace[current].parent_id
+            complete.update(visiting)
+        start = min(span.start_ns for span in trace.values())
+        duration = max(span.start_ns + span.duration_ns for span in trace.values()) - start
+        lines.append(f"Trace {trace_id} — observed {milliseconds(duration)}")
+        children = {}
+        roots = []
+        for span in trace.values():
+            if span.parent_id in trace:
+                children.setdefault(span.parent_id, []).append(span)
+            else:
+                roots.append(span)
+
+        def slow(span):
+            return 100 * span.duration_ns > 15 * duration
+
+        def group_key(span):
+            if (
+                span.parent_id is None
+                or span.parent_id not in trace
+                or span.error
+                or slow(span)
+                or span.events
+                or span.links
+                or span.warnings
+                or span.span_id in children
+            ):
+                return None
+            return (
+                span.service,
+                span.kind,
+                span.name,
+                _trace_json(sorted(span.attributes, key=_trace_json)),
+                _trace_json(span.context),
+                _trace_json(_trace_span_metadata(span)),
+            )
+
+        def ordered(items):
+            return sorted(items, key=lambda span: (span.start_ns, span.input_order))
+
+        stack = [(ordered(roots), 0, 0)]
+        while stack:
+            siblings, index, depth = stack.pop()
+            if index >= len(siblings):
+                continue
+            span = siblings[index]
+            key = group_key(span)
+            count = 1
+            if key is not None:
+                while index + count < len(siblings) and group_key(siblings[index + count]) == key:
+                    count += 1
+            prefix = "  " * depth
+            if count > 1:
+                total = sum(item.duration_ns for item in siblings[index : index + count])
+                lines.append(
+                    prefix
+                    + f"[... {count} × {span.service} {span.name} folded; summed span duration={milliseconds(total)}; attributes={_trace_json(span.attributes)}; metadata={_trace_json(_trace_span_metadata(span))}; context={_trace_json(span.context)} ...]"
+                )
+            else:
+                flags = []
+                if span.parent_id is None:
+                    flags.append("ROOT")
+                elif span.parent_id not in trace:
+                    flags.append(f"ORPHAN parent={span.parent_id}")
+                if span.error:
+                    flags.append("ERROR")
+                if slow(span):
+                    flags.append("SLOW")
+                lines.append(
+                    prefix
+                    + f"{span.service} {_trace_json(span.name)} {milliseconds(span.duration_ns)}"
+                    + (" " + " ".join(flags) if flags else "")
+                )
+                if span.error or slow(span):
+                    details = {"span": span.original_record, **span.context}
+                else:
+                    details = {
+                        "attributes": span.attributes,
+                        "events": span.events,
+                        "links": span.links,
+                        "warnings": span.warnings,
+                        "metadata": _trace_span_metadata(span),
+                        **span.context,
+                    }
+                    details = {key: value for key, value in details.items() if value}
+                if details:
+                    lines.append(prefix + "  " + _trace_json(details))
+            stack.append((siblings, index + count, depth))
+            if count == 1 and span.span_id in children:
+                stack.append((ordered(children[span.span_id]), 0, depth + 1))
+    return "\n".join(lines)
+
+
+def _trace_payload_format(document: object) -> str | None:
+    if not isinstance(document, dict):
+        return None
+    if "resourceSpans" in document:
+        return "otlp"
+    if {"traceID", "spans"} <= document.keys():
+        return "jaeger"
+    data = document.get("data")
+    if isinstance(data, list) and any(
+        isinstance(trace, dict) and {"traceID", "spans"} <= trace.keys() for trace in data
+    ):
+        return "jaeger"
+    return None
+
+
+def _trace_json_object(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate trace JSON field")
+        result[key] = value
+    return result
+
+
+def _compact_trace_payload(raw_output: str) -> str | None:
+    """None means unrelated JSON; recognized unsafe exports must not be sampled."""
+    try:
+        document = json.loads(raw_output)
+    except (ValueError, RecursionError):
+        return None
+    format_name = _trace_payload_format(document)
+    if format_name is None:
+        return None
+    try:
+        document = json.loads(raw_output, object_pairs_hook=_trace_json_object)
+        spans, metadata = _normalize_trace_spans(document, format_name)
+        compacted = redact_secrets(_render_trace_spans(spans, metadata))
+    except (ValueError, TypeError, RecursionError, OverflowError):
+        return raw_output
+    # Match the existing content-addressed cache ID without creating an entry.
+    safe_original = redact_secrets(raw_output)
+    ref_id = "tc_" + hashlib.sha256(safe_original.encode("utf-8")).hexdigest()[:16]
+    candidate = compacted + "\n" + recovery_notice(ref_id)
+    if count_tokens(candidate).openai >= count_tokens(raw_output).openai:
+        return raw_output
+    try:
+        stored_ref = ContextCache().store(raw_output, source="otel-trace")
+    except (OSError, sqlite3.Error):
+        return raw_output
+    return compacted + "\n" + recovery_notice(stored_ref)
+
+
+def filter_otel_trace(raw_trace_json: str) -> str:
+    """Render supported Jaeger/OTLP exports; preserve unsafe or unrelated input."""
+    result = _compact_trace_payload(raw_trace_json)
+    return raw_trace_json if result is None else result
+
+
 def filter_json_output(raw_output: str, command: str = "") -> str | None:
     """Automatically slim large or verbose JSON output from commands.
 
@@ -3132,6 +3702,9 @@ def auto_specialize_command_output(command: str, raw_output: str) -> str | None:
         return gh_compact
     if _is_cloud_log_command(command):
         return filter_cloud_logs(raw_output)
+    trace_output = _compact_trace_payload(raw_output)
+    if trace_output is not None:
+        return trace_output
     if any(
         tool in cmd_lower for tool in ("playwright", "puppeteer", "stagehand")
     ) and raw_output.lstrip().lower().startswith(("<!doctype html", "<html", "<body")):
