@@ -788,7 +788,14 @@ def test_all_budget_renderers_keep_structural_receipt(structural_mixed_diff, ren
     _, files = module._parse_diff(structural_mixed_diff, formatting_only_paths={"src/formatted.py"})
     file = files[0]
     assert file.formatting_only
-    assert getattr(module, renderer)(file, *args) == module._render_formatting_only(file)
+    output = getattr(module, renderer)(file, *args)
+    if renderer == "_render_compact_receipt":
+        assert output == "diff --git a/src/formatted.py b/src/formatted.py (formatting-only)"
+        assert (
+            count_tokens(output).openai < count_tokens(module._render_formatting_only(file)).openai
+        )
+    else:
+        assert output == module._render_formatting_only(file)
 
 
 @pytest.mark.parametrize(
@@ -988,3 +995,85 @@ def test_structural_changed_count_includes_body_lines_resembling_headers():
         source_diff(old, new, "example.py"), formatting_only_paths={"example.py"}
     )
     assert "2 formatting-only changed lines" in output
+
+
+_SIGNIFICANT_DIRECTIVE_CASES = [
+    (
+        "constraint.go",
+        "// +build never\n\npackage sample\n\nfunc Value() int { return 1 }\n",
+        "// +build never\npackage sample\n\nfunc Value() int { return 1 }\n",
+    ),
+    (
+        "encoding.py",
+        '# coding: latin-1\n\nvalue = "é"\n',
+        '\n\n# coding: latin-1\nvalue = "é"\n',
+    ),
+    (
+        "modern_constraint.go",
+        "//go:build never\n\npackage sample\n\nfunc Value() int { return 1 }\n",
+        "package sample\n\n//go:build never\nfunc Value() int { return 1 }\n",
+    ),
+]
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("path,old,new", _SIGNIFICANT_DIRECTIVE_CASES)
+def test_significant_directive_layout_changes_are_not_structurally_folded(
+    structural_repo, path, old, new, staged
+):
+    root, git = structural_repo
+    (root / path).write_text(old, encoding="utf-8")
+    git("add", path)
+    git("commit", "-qm", "Initial directive layout")
+    (root / path).write_text(new, encoding="utf-8")
+    if staged:
+        git("add", path)
+    raw = git("diff", *(["--cached"] if staged else []))
+    assert raw
+    assert structurally_equivalent(old, new, path) is None
+    assert structurally_equivalent(new, old, path) is None
+    paths = classify_git_diff(raw, cwd=root, staged=staged)
+    assert path not in paths
+    output = slim_git_diff(raw, formatting_only_paths=paths)
+    assert output == slim_git_diff(raw)
+    assert "formatting-only" not in output
+
+
+def test_python_encoding_cookie_relocation_changes_detected_encoding():
+    import io
+    import tokenize
+
+    _, old, new = _SIGNIFICANT_DIRECTIVE_CASES[1]
+    assert tokenize.detect_encoding(io.BytesIO(old.encode("utf-8")).readline)[0] == "iso-8859-1"
+    assert tokenize.detect_encoding(io.BytesIO(new.encode("utf-8")).readline)[0] == "utf-8"
+    assert structurally_equivalent(old, new, "encoding.py") is None
+
+
+@pytest.mark.parametrize("path,old,new", _SIGNIFICANT_DIRECTIVE_CASES)
+def test_significant_directive_files_use_conservative_fallback_even_when_unchanged(path, old, new):
+    assert structurally_equivalent(old, old, path) is None
+    assert structurally_equivalent(new, new, path) is None
+
+
+def test_tight_budget_keeps_three_formatting_paths_and_genuine_logic(structural_repo):
+    root, git = structural_repo
+    names = ("a.py", "b.py", "c.py", "z_logic.py")
+    for name in names:
+        (root / name).write_text("value = 1\n", encoding="utf-8")
+    git("add", *names)
+    git("commit", "-qm", "Initial four-file budget fixture")
+    for name in names[:3]:
+        (root / name).write_text("value=1\n", encoding="utf-8")
+    (root / names[3]).write_text("value = 2\n", encoding="utf-8")
+    raw = git("diff")
+    paths = classify_git_diff(raw, cwd=root)
+    assert paths == set(names[:3])
+    output = budgeted_diff_slice(raw, budget_tokens=140, formatting_only_paths=paths)
+    assert count_tokens(output).openai <= 140
+    positions = [output.index(f"diff --git a/{name} b/{name}") for name in names]
+    assert positions == sorted(positions)
+    for name in names[:3]:
+        assert f"diff --git a/{name} b/{name} (formatting-only)" in output
+    assert "+value=1" not in output
+    assert "-value = 1" in output and "+value = 2" in output
+    assert "remaining files folded" not in output

@@ -33,8 +33,20 @@ _LITERAL_KINDS = {
 }
 
 
+_SIGNIFICANT_DIRECTIVES = {
+    # Encoding cookies depend on the first two physical lines and preceding prolog.
+    "python": re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*[-_.a-zA-Z0-9]+", re.MULTILINE),
+    # Legacy constraints require a blank separator; modern constraints also have placement rules.
+    "go": re.compile(r"^[ \t]*//[ \t]*(?:\+build\b|go:build\b)", re.MULTILINE),
+}
+
+
 def _structural_fingerprint(source: str, language: str) -> tuple | None:
     """Retain concrete syntax and opaque text; reject incomplete parser coverage."""
+    directive = _SIGNIFICANT_DIRECTIVES.get(language)
+    if directive is not None and directive.search(source):
+        # Do not infer directive semantics from an AST that discards prolog layout.
+        return None
     try:
         if language == "python":
             ast.parse(source)
@@ -634,7 +646,7 @@ def _render_window(file_diff: FileDiff, num_hunks: int) -> str:
 
 def _render_compact_receipt(file_diff: FileDiff) -> str:
     if file_diff.formatting_only:
-        return _render_formatting_only(file_diff)
+        return f"diff --git a/{file_diff.path} b/{file_diff.path} (formatting-only)"
     return f"diff --git a/{file_diff.path} b/{file_diff.path} (+{file_diff.additions}, -{file_diff.deletions} folded)"
 
 
@@ -811,7 +823,8 @@ def budgeted_diff_slice(
     full_tokens: dict[int, int] = {}
 
     for f in file_diffs:
-        f_text = _render_folded(f)
+        # Reserve only a path receipt for formatting, leaving detail space for logic.
+        f_text = _render_compact_receipt(f) if f.formatting_only else _render_folded(f)
         folded_texts[f.original_index] = f_text
         folded_tokens[f.original_index] = count_tokens(f_text).openai
 
@@ -823,7 +836,7 @@ def budgeted_diff_slice(
     min_folded_cost = preamble_tok + sum(folded_tokens.values())
 
     file_modes: dict[int, tuple[str, int | None]] = {
-        f.original_index: ("folded", None) for f in file_diffs
+        f.original_index: ("compact" if f.formatting_only else "folded", None) for f in file_diffs
     }
 
     if min_folded_cost > target_budget:
