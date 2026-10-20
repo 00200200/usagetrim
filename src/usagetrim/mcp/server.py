@@ -709,10 +709,16 @@ def _budget_repo_map(full_result: str, budget: int) -> str:
     lines = safe_result.splitlines()
     entries, notices = [], []
     for line in lines[1:]:
-        if re.fullmatch(r".+:\d+-\d+ .+ \| .*", line):
+        if line in {
+            "No matches.",
+            "[More results omitted; narrow query/file or raise limit (max 200).]",
+        } or re.fullmatch(r"\[Incomplete index: .*\]", line):
+            notices.append(line)
+        elif re.match(r".+:\d+-\d+ ", line) or not entries:
             entries.append(line)
         else:
-            notices.append(line)
+            # Qualified computed names can span lines before the signature separator.
+            entries[-1] += "\n" + line
 
     def render(selected):
         return "\n".join([lines[0], *selected, *notices]) + "\n" + notice

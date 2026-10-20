@@ -590,6 +590,46 @@ def test_mcp_map_budget_preserves_entries_rank_recovery_and_raw_telemetry(
     assert recorded == [(full, output)]
 
 
+@pytest.mark.parametrize("query", ["", "Symbol.iterator"])
+def test_mcp_map_budget_keeps_multiline_computed_methods_atomic(tmp_path, query):
+    source = "\n".join(
+        f"class Collection{number} {{\n"
+        "  [\n"
+        "    Symbol.iterator\n"
+        "  ]() { return [1, 2, 3][Symbol.iterator](); }\n"
+        "}"
+        for number in range(5)
+    )
+    (tmp_path / "iterators.ts").write_text(source, encoding="utf-8")
+    index = CodeIndex(tmp_path)
+    index.sync()
+    full = index.query(mode="map", query=query)
+    symbols, _ = parse_source(source, "typescript")
+    entries = [
+        f"iterators.ts:{symbol.line}-{symbol.end_line} {symbol.qualified} | {symbol.signature}"
+        for symbol in symbols
+        if query.lower() in symbol.qualified.lower()
+    ]
+    header = full.splitlines()[0]
+    assert full == "\n".join([header, *entries])
+    assert sum("\n" in entry for entry in entries) == 5
+    assert count_tokens(full).claude > 128
+
+    output = server.handle_usagetrim_code(
+        {"root": str(tmp_path), "mode": "map", "query": query, "max_tokens": 128}
+    )
+    assert count_tokens(output).claude <= 128
+    ref = re.search(r"tc_[a-f0-9]+", output).group()
+    selected = [entry for entry in entries if entry in output]
+    assert any("\n" in entry for entry in selected)
+    assert len(selected) < len(entries)
+    # Exact reconstruction rules out orphaned continuations, partial entries or reordering.
+    assert output == "\n".join([header, *selected]) + "\n" + server.recovery_notice(ref)
+    recovered = ContextCache().retrieve(ref)
+    assert recovered == full
+    assert all(entry in recovered for entry in entries if entry not in selected)
+
+
 def test_mcp_map_that_fits_is_unchanged_without_cache(large_repo_map, monkeypatch):
     full = large_repo_map.query(mode="map", limit=100)
 
