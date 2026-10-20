@@ -152,7 +152,21 @@ def test_compose_ambiguous_exit_preserves_each_candidate_history_in_order():
     assert "\n" not in result.replace("\r\n", "")
 
 
-def test_compose_exact_exit_does_not_protect_unrelated_service_history():
+@pytest.mark.parametrize("separator", ["_", "-"])
+def test_compose_exit_name_collision_preserves_both_service_histories(separator):
+    services = (f"api{separator}1", f"demo{separator}api{separator}1")
+    lines = []
+    for i in range(15):
+        for service in services:
+            lines.append(
+                f'{service} | 127.0.0.1 - - [27/Sep/2026:12:00:{i:02} +0000] "GET /health HTTP/1.1" 200 4'
+            )
+    exit_line = f"{services[1]} exited with code 137"
+    result = specialized.filter_docker_compose("\n".join([*lines, exit_line]) + "\n")
+    assert "\n".join([*lines[-20:], exit_line]) + "\n" in result
+
+
+def test_compose_exact_exit_preserves_other_possible_custom_container_history():
     lines = []
     for i in range(15):
         for service in ("api_1", "worker_1"):
@@ -163,4 +177,6 @@ def test_compose_exact_exit_does_not_protect_unrelated_service_history():
     api_lines = [line for line in lines if line.startswith("api_1")]
     for line in api_lines[-10:]:
         assert line in result
-    assert result.count("worker_1 | 127.0.0.1") == 1
+    worker_lines = [line for line in lines if line.startswith("worker_1")]
+    for line in worker_lines[-10:]:
+        assert line in result

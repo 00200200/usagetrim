@@ -884,10 +884,10 @@ def _is_docker_compose_log_command(command: str) -> bool:
 def filter_docker_compose(raw_output: str) -> str:
     """Fold explicit successful routine logs, preserving order and crash context.
 
-    Unknown lines and errors are never sampled. Keep the last ten prefixed
-    lines of each exiting service, including routine lines, verbatim.
-    If an exit names a container rather than a known log prefix, preserve
-    every candidate history instead of guessing the service mapping.
+    Unknown lines and errors are never sampled. Before every exit, keep the
+    last ten prefixed lines of every observed service, including routine lines.
+    Even an exact exit-name match can belong to a different service's container;
+    logs alone do not establish the project/custom-container naming map.
     """
     from collections import deque
 
@@ -903,13 +903,10 @@ def filter_docker_compose(raw_output: str) -> str:
             history.setdefault(record[0], deque(maxlen=10)).append(index)
         exit_match = _COMPOSE_EXIT.match(line)
         if exit_match:
-            if exit_match[1] in history:
-                protected.update(history[exit_match[1]])
-            else:
-                # Compose project prefixes and custom container names can differ
-                # from log prefixes. Ambiguity must not discard crash context.
-                for candidate in history.values():
-                    protected.update(candidate)
+            # Do not infer identity from an exact or suffix match: project and
+            # custom container names can collide with another service's prefix.
+            for candidate in history.values():
+                protected.update(candidate)
     groups: dict[str, tuple[str, list[int]]] = {}
     replacements: dict[int, str] = {}
 
