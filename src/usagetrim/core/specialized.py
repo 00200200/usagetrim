@@ -886,6 +886,8 @@ def filter_docker_compose(raw_output: str) -> str:
 
     Unknown lines and errors are never sampled. Keep the last ten prefixed
     lines of each exiting service, including routine lines, verbatim.
+    If an exit names a container rather than a known log prefix, preserve
+    every candidate history instead of guessing the service mapping.
     """
     from collections import deque
 
@@ -901,7 +903,13 @@ def filter_docker_compose(raw_output: str) -> str:
             history.setdefault(record[0], deque(maxlen=10)).append(index)
         exit_match = _COMPOSE_EXIT.match(line)
         if exit_match:
-            protected.update(history.get(exit_match[1], ()))
+            if exit_match[1] in history:
+                protected.update(history[exit_match[1]])
+            else:
+                # Compose project prefixes and custom container names can differ
+                # from log prefixes. Ambiguity must not discard crash context.
+                for candidate in history.values():
+                    protected.update(candidate)
     groups: dict[str, tuple[str, list[int]]] = {}
     replacements: dict[int, str] = {}
 

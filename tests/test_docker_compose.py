@@ -120,3 +120,47 @@ def test_compose_keeps_other_service_errors_in_original_order():
 def test_compose_does_not_treat_a_quoted_health_request_in_an_exception_as_success():
     raw = 'api-1 | ValueError: "GET /ping HTTP/1.1" 200 4\n' * 4
     assert specialized.filter_docker_compose(raw) == raw
+
+
+@pytest.mark.parametrize(
+    ("service", "container"),
+    [("api_1", "demo_api_1"), ("api-1", "demo-api-1"), ("api", "custom-container")],
+)
+def test_compose_preserves_context_when_exit_container_differs(service, container):
+    lines = [
+        f'{service} | 127.0.0.1 - - [27/Sep/2026:12:00:{i:02} +0000] "GET /health HTTP/1.1" 200 4'
+        for i in range(15)
+    ]
+    exit_line = f"{container} exited with code 137"
+    raw = "\n".join([*lines, exit_line]) + "\n"
+    result = specialized.filter_docker_compose(raw)
+    assert "\n".join([*lines[-10:], exit_line]) + "\n" in result
+    assert len(result) < len(raw)
+    assert specialized.filter_docker_compose(result) == result
+
+
+def test_compose_ambiguous_exit_preserves_each_candidate_history_in_order():
+    lines = []
+    for i in range(15):
+        for service in ("api_1", "worker_1"):
+            lines.append(
+                f'{service} | 127.0.0.1 - - [27/Sep/2026:12:00:{i:02} +0000] "GET /health HTTP/1.1" 200 4'
+            )
+    exit_line = "custom-container exited with code 137"
+    result = specialized.filter_docker_compose("\r\n".join([*lines, exit_line]) + "\r\n")
+    assert "\r\n".join([*lines[-20:], exit_line]) + "\r\n" in result
+    assert "\n" not in result.replace("\r\n", "")
+
+
+def test_compose_exact_exit_does_not_protect_unrelated_service_history():
+    lines = []
+    for i in range(15):
+        for service in ("api_1", "worker_1"):
+            lines.append(
+                f'{service} | 127.0.0.1 - - [27/Sep/2026:12:00:{i:02} +0000] "GET /health HTTP/1.1" 200 4'
+            )
+    result = specialized.filter_docker_compose("\n".join([*lines, "api_1 exited with code 137"]))
+    api_lines = [line for line in lines if line.startswith("api_1")]
+    for line in api_lines[-10:]:
+        assert line in result
+    assert result.count("worker_1 | 127.0.0.1") == 1
