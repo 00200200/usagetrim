@@ -48,6 +48,11 @@ TOOLS_DEFINITIONS = [
                     "type": "string",
                     "description": "Session-specific task ID from the hook, or an explicit separate task ID.",
                 },
+                "retention": {
+                    "type": "string",
+                    "enum": ["permanent", "ephemeral"],
+                    "description": "For save: new tasks default to ephemeral; permanent excludes the task from TTL cleanup. Omit to preserve an existing task's class.",
+                },
                 "expected_revision": {"type": "integer"},
                 "revision": {
                     "type": "integer",
@@ -570,6 +575,7 @@ _COMPACT_PROP_DESCRIPTIONS = {
     "symbol": "Target symbol name (e.g. Class.method).",
     "expected_revision": "Revision expected before save.",
     "revision": "Specific revision to read.",
+    "retention": "Task retention: ephemeral or permanent (save only).",
     "action": "Action: save, read, list, forget.",
     "task": "Task ID.",
     "checkpoint": "Checkpoint milestone data.",
