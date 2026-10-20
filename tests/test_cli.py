@@ -698,6 +698,7 @@ def test_cli_rules_optimize(tmp_path):
     assert bak_file.exists()
     assert "You are an expert" in bak_file.read_text()
     assert "You are an expert" not in target.read_text()
+    assert "Current Date: 2026-09-22" in target.read_text()
     assert "Dynamic Runtime Context" in target.read_text()
 
 
@@ -865,3 +866,230 @@ def test_cli_malformed_source_keeps_existing_diff_behavior(structural_cli_repo):
     result = runner.invoke(app, ["diff"])
     assert result.exit_code == 0
     assert result.stdout.rstrip("\n") == slim_git_diff(raw).rstrip("\n")
+
+
+@pytest.mark.parametrize(
+    "client,relative,title",
+    [
+        ("claude", "CLAUDE.md", "Claude"),
+        ("codex", "AGENTS.md", "Codex"),
+        ("cursor", ".cursorrules", "Cursor"),
+        ("copilot", ".github/copilot-instructions.md", "Copilot"),
+    ],
+)
+def test_rules_init_client_defaults_and_refuses_overwrite(
+    tmp_path, monkeypatch, client, relative, title
+):
+    monkeypatch.chdir(tmp_path)
+    first = runner.invoke(app, ["rules", "--init", "--client", client])
+    assert first.exit_code == 0
+    target = tmp_path / relative
+    original = target.read_bytes()
+    assert original.startswith(f"# UsageTrim {title} Rules".encode())
+    second = runner.invoke(app, ["rules", "--init", "--client", client])
+    assert second.exit_code == 2
+    assert target.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--init", "--optimize"],
+        ["--init", "--check"],
+        ["--optimize", "--check"],
+        ["--write"],
+        ["--init", "--write"],
+        ["--check", "--write"],
+        ["--client", "unknown"],
+        ["--stats"],
+    ],
+)
+def test_rules_cli_rejects_invalid_options_without_writing(tmp_path, options):
+    target = tmp_path / "rules.md"
+    result = runner.invoke(app, ["rules", *options, "-f", str(target)])
+    assert result.exit_code == 2
+    assert not target.exists()
+    assert not list(tmp_path.iterdir())
+
+
+def test_rules_check_exit_codes_no_payload_and_advisory_stability(tmp_path):
+    target = tmp_path / "AGENTS.md"
+    target.write_bytes(b"# Rules\r\n- If current time is unknown, never deploy.\r\n")
+    original = target.read_bytes()
+    needed = runner.invoke(app, ["rules", "--check", "-f", str(target)])
+    assert needed.exit_code == 1
+    assert "Optimization needed." in needed.output
+    assert "never deploy" not in needed.output
+    assert target.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [target]
+    target.write_bytes(original.replace(b"\r\n", b"\n"))
+    canonical = runner.invoke(app, ["rules", "--check", "--stats", "-f", str(target)])
+    assert canonical.exit_code == 0
+    assert "Canonical." in canonical.output
+    assert "delta (before-after) +0" in canonical.output
+    missing = runner.invoke(app, ["rules", "--check", "-f", str(tmp_path / "missing")])
+    assert missing.exit_code == 2
+
+
+@pytest.mark.parametrize("options", [["--check"], ["--optimize"], ["--optimize", "--write"]])
+def test_rules_invalid_utf8_never_changes_storage(tmp_path, options):
+    target = tmp_path / "rules.md"
+    original = b"# Rules\n\xff NEVER remove\n"
+    target.write_bytes(original)
+    result = runner.invoke(app, ["rules", *options, "-f", str(target)])
+    assert result.exit_code == 2
+    assert target.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [target]
+
+
+def test_rules_preview_stdout_only_document_and_stats_on_stderr(tmp_path):
+    target = tmp_path / "rules.md"
+    original = "Hello Claude!\n- Run `uv run pytest`.\n"
+    target.write_text(original, encoding="utf-8")
+    result = runner.invoke(app, ["rules", "--optimize", "--stats", "-f", str(target)])
+    assert result.exit_code == 0
+    assert result.stdout == "- Run `uv run pytest`.\n"
+    assert "local OpenAI tokens" in result.stderr
+    assert "delta (before-after)" in result.stderr
+    assert "estimated baseline input-cost delta" in result.stderr
+    assert target.read_text() == original
+
+
+def test_rules_write_backup_exact_bytes_modes_and_no_overwrite(tmp_path):
+    target = tmp_path / "rules.md"
+    original = "Hello Claude!\r\n- Preserve Żółć.  \r\n".encode()
+    target.write_bytes(original)
+    target.chmod(0o640)
+    result = runner.invoke(app, ["rules", "--optimize", "--write", "-f", str(target)])
+    assert result.exit_code == 0
+    assert target.read_bytes() == "- Preserve Żółć.  \n".encode()
+    assert target.stat().st_mode & 0o777 == 0o640
+    backup = tmp_path / "rules.md.bak"
+    assert backup.read_bytes() == original
+    optimized = target.read_bytes()
+    again = runner.invoke(app, ["rules", "--optimize", "--write", "-f", str(target)])
+    assert again.exit_code == 2
+    assert target.read_bytes() == optimized
+    assert backup.read_bytes() == original
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["rules.md", "rules.md.bak"]
+
+
+def test_rules_atomic_replace_failure_cleans_backup_and_allows_retry(tmp_path, monkeypatch):
+    import usagetrim.cli as cli
+
+    target = tmp_path / "rules.md"
+    original = b"Hello Claude!\n- Never deploy.\n"
+    target.write_bytes(original)
+    backup = tmp_path / "rules.md.bak"
+
+    def unavailable(*args):
+        raise OSError("simulated replace failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.os, "replace", unavailable)
+        result = runner.invoke(app, ["rules", "--optimize", "--write", "-f", str(target)])
+    assert result.exit_code == 2
+    assert "simulated replace failure" in result.output
+    assert target.read_bytes() == original
+    assert not backup.exists()
+    assert not list(tmp_path.glob(".usagetrim-rules-*"))
+    retry = runner.invoke(app, ["rules", "--optimize", "--write", "-f", str(target)])
+    assert retry.exit_code == 0
+    assert target.read_bytes() == b"- Never deploy.\n"
+    assert backup.read_bytes() == original
+    assert not list(tmp_path.glob(".usagetrim-rules-*"))
+
+
+def test_rules_write_and_init_reject_symlink(tmp_path):
+    original = tmp_path / "original.md"
+    original.write_bytes(b"Hello Claude!\n- Run tests.\n")
+    link = tmp_path / "rules.md"
+    try:
+        link.symlink_to(original)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    for options in (["--optimize", "--write"], ["--init"]):
+        result = runner.invoke(app, ["rules", *options, "-f", str(link)])
+        assert result.exit_code == 2
+        assert link.is_symlink()
+        assert original.read_bytes() == b"Hello Claude!\n- Run tests.\n"
+    assert not (tmp_path / "rules.md.bak").exists()
+
+
+@pytest.mark.parametrize("failure", ["write", "fsync"])
+def test_rules_failed_backup_write_cleans_transaction_and_can_retry(tmp_path, monkeypatch, failure):
+    import usagetrim.cli as cli
+
+    target = tmp_path / "rules.md"
+    original = b"Hello Claude!\n- Never deploy.\n"
+    target.write_bytes(original)
+    backup = tmp_path / "rules.md.bak"
+    real_fdopen = cli.os.fdopen
+    real_fsync = cli.os.fsync
+
+    class BrokenBackup:
+        def __init__(self, descriptor, mode):
+            self.stream = real_fdopen(descriptor, mode)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def write(self, data):
+            self.stream.write(data[:1])
+            raise OSError("backup write failed")
+
+    calls = 0
+
+    def failing_fsync(descriptor):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("backup fsync failed")
+        return real_fsync(descriptor)
+
+    with monkeypatch.context() as patch:
+        if failure == "write":
+            patch.setattr(cli.os, "fdopen", BrokenBackup)
+        else:
+            patch.setattr(cli.os, "fsync", failing_fsync)
+        result = runner.invoke(app, ["rules", "--optimize", "--write", "-f", str(target)])
+    assert result.exit_code == 2
+    assert f"backup {failure} failed" in result.output
+    assert target.read_bytes() == original
+    assert not backup.exists()
+    assert not list(tmp_path.glob(".usagetrim-rules-*"))
+    retry = runner.invoke(app, ["rules", "--optimize", "--write", "-f", str(target)])
+    assert retry.exit_code == 0
+    assert target.read_bytes() == b"- Never deploy.\n"
+    assert backup.read_bytes() == original
+
+
+def test_rules_cleanup_failure_does_not_mask_original_exception(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    import usagetrim.cli as cli
+
+    target = tmp_path / "rules.md"
+    original = b"Hello Claude!\n- Never deploy.\n"
+    target.write_bytes(original)
+    real_unlink = Path.unlink
+
+    def unavailable(*args):
+        raise OSError("original replace failure")
+
+    def failed_backup_unlink(path, *args, **kwargs):
+        if path.name == "rules.md.bak":
+            raise OSError("secondary cleanup failure")
+        return real_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.os, "replace", unavailable)
+        patch.setattr(Path, "unlink", failed_backup_unlink)
+        result = runner.invoke(app, ["rules", "--optimize", "--write", "-f", str(target)])
+    assert result.exit_code == 2
+    assert "original replace failure" in result.output
+    assert "secondary cleanup failure" not in result.output
+    assert target.read_bytes() == original

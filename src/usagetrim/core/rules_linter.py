@@ -67,37 +67,46 @@ def lint_rule_content(content: str, file_name: str = "rules") -> LintResult:
     lines = content.splitlines()
     issues: list[RuleIssue] = []
     is_cache_friendly = True
-
-    in_dynamic_block = False
-    for idx, line in enumerate(lines, 1):
-        if "Dynamic Runtime Context" in line or "dynamic context" in line.lower():
-            in_dynamic_block = True
+    for block in _scan_rules(content):
+        if block.kind == "protected" or (block.kind == "dynamic" and _safe_dynamic(block)):
             continue
-        if in_dynamic_block:
-            continue
-
-        for pat, desc in CACHE_BUSTING_PATTERNS:
-            if pat.search(line):
+        if block.kind == "dynamic":
+            issues.append(
+                RuleIssue(
+                    block.line,
+                    "dynamic-instruction",
+                    "Dynamic context contains instructions or uncertain data; kept in place.",
+                    block.lines[0],
+                )
+            )
+            is_cache_friendly = False
+        for offset, line in enumerate(block.lines):
+            for pat, desc in CACHE_BUSTING_PATTERNS:
+                if pat.search(line):
+                    issues.append(
+                        RuleIssue(block.line + offset, "cache-busting", desc, line.strip()[:60])
+                    )
+                    is_cache_friendly = False
+            if re.search(
+                r"(?:^|\s)(?:/[^\s]+|[A-Za-z]:\\[^\s]+)|\b(?:version|build[_ -]?id|generated date|session[_ ]?id)\s*[:=]",
+                line,
+                re.I,
+            ):
                 issues.append(
                     RuleIssue(
-                        line_num=idx,
-                        rule_name="cache-busting",
-                        message=desc,
-                        snippet=line.strip()[:60],
+                        block.line + offset,
+                        "volatile-advisory",
+                        "Potential environment/version data: verify scope; not moved automatically.",
+                        line.strip()[:60],
                     )
                 )
-                is_cache_friendly = False
-
-        for pat, desc in VERBOSE_BOILERPLATE_PATTERNS:
-            if pat.search(line):
-                issues.append(
-                    RuleIssue(
-                        line_num=idx,
-                        rule_name="verbose-boilerplate",
-                        message=desc,
-                        snippet=line.strip()[:60],
+            for pat, desc in VERBOSE_BOILERPLATE_PATTERNS:
+                if pat.search(line):
+                    issues.append(
+                        RuleIssue(
+                            block.line + offset, "verbose-boilerplate", desc, line.strip()[:60]
+                        )
                     )
-                )
 
     # Check consecutive empty lines
     consecutive_empty = 0
@@ -116,15 +125,15 @@ def lint_rule_content(content: str, file_name: str = "rules") -> LintResult:
         else:
             consecutive_empty = 0
 
-    tokens = count_tokens(content).avg
+    tokens = count_tokens(content).openai
     exceeds_threshold = tokens >= PROMPT_CACHE_MIN_TOKENS
     tokens_to_threshold = max(0, PROMPT_CACHE_MIN_TOKENS - tokens)
     if exceeds_threshold:
-        advice = "Exceeds 1,024-token prompt cache threshold (eligible for standalone Anthropic/OpenAI prompt cache hits)."
+        advice = "Exceeds the 1,024-token reference threshold for a standalone prefix. Provider/model eligibility and cache hits are not guaranteed."
     else:
         advice = (
-            f"Below 1,024-token standalone threshold ({tokens_to_threshold} to boundary). "
-            "When combined with usagetrim MCP desktop profile (~2,000 tool tokens), conversation automatically activates prompt caching."
+            f"Below the 1,024-token standalone reference threshold ({tokens_to_threshold} to boundary). "
+            "Additional tools such as the usagetrim MCP desktop profile change prefix size; actual caching depends on the provider/model."
         )
 
     return LintResult(
@@ -139,139 +148,304 @@ def lint_rule_content(content: str, file_name: str = "rules") -> LintResult:
     )
 
 
-def minify_rules(content: str) -> str:
-    """Minify rule markdown while preserving all instructions and formatting semantics."""
-    lines = content.splitlines()
-    minified_lines: list[str] = []
+@dataclass
+class _RuleBlock:
+    kind: str
+    lines: list[str]
+    line: int
 
-    for line in lines:
-        stripped = line.strip()
-        # Collapse multiple spaces
-        if stripped:
-            # Preserve indentation level for markdown lists
-            indent = len(line) - len(line.lstrip())
-            norm_indent = " " * (indent if indent <= 4 else 2)
-            # Remove trailing comments
-            clean_line = re.sub(r"\s*<!--.*?-->\s*", "", stripped)
-            if clean_line:
-                minified_lines.append(norm_indent + clean_line)
+
+def _scan_rules(content: str) -> list[_RuleBlock]:
+    """Conservative block scanner; uncertain Markdown remains opaque."""
+    lines = content.replace("\r\n", "\n").split("\n")
+    blocks = []
+    index = 0
+    while index < len(lines):
+        start = index
+        line = lines[index]
+        fence = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if index == 0 and line.lstrip("\ufeff") == "---":
+            index += 1
+            while index < len(lines) and lines[index] not in {"---", "..."}:
+                index += 1
+            index = min(index + 1, len(lines))
+            kind = "protected"
+        elif fence:
+            token = fence[1]
+            index += 1
+            while index < len(lines):
+                closing = re.fullmatch(
+                    r" {0,3}" + re.escape(token[0]) + "{" + str(len(token)) + r",}[ \t]*",
+                    lines[index],
+                )
+                index += 1
+                if closing:
+                    break
+            kind = "protected"
+        elif re.fullmatch(
+            r"(?:#{1,6}\s+)?Dynamic Runtime Context\s*:?\s*|<!-- Dynamic Runtime Context \(isolated for prompt caching\) -->",
+            line,
+            re.I,
+        ):
+            heading = re.match(r"^(#+) ", line)
+            level = len(heading[1]) if heading else 6
+            index += 1
+            while index < len(lines):
+                next_heading = re.match(r"^(#{1,6})\s+", lines[index])
+                if next_heading and len(next_heading[1]) <= level:
+                    break
+                index += 1
+            kind = "dynamic"
+        elif (
+            index + 1 < len(lines)
+            and line.strip()
+            and re.fullmatch(r" {0,3}(?:=+|-+)[ \t]*", lines[index + 1])
+        ):
+            index += 2
+            kind = "protected"  # Setext heading: retain its complete two-line form.
+        elif "<!--" in line:
+            index += 1
+            if "-->" not in line.split("<!--", 1)[1]:
+                while index < len(lines):
+                    end = "-->" in lines[index]
+                    index += 1
+                    if end:
+                        break
+            kind = "protected"
         else:
-            if minified_lines and minified_lines[-1] != "":
-                minified_lines.append("")
+            index += 1
+            if not line.strip():
+                kind = "blank"
+            elif re.match(r"^#{1,6}\s", line):
+                kind = "heading"
+            elif re.match(r"^\s*(?:[-+*]|\d+[.)])\s", line):
+                kind = "list"
+            elif line.startswith(("    ", "\t")):
+                kind = "protected"
+                while index < len(lines) and (
+                    not lines[index].strip() or lines[index].startswith(("    ", "\t"))
+                ):
+                    index += 1
+            else:
+                kind = "prose"
+        blocks.append(_RuleBlock(kind, lines[start:index], start + 1))
+    return blocks
 
-    return "\n".join(minified_lines).strip()
+
+def _safe_dynamic(block: _RuleBlock) -> bool:
+    found = False
+    for line in block.lines[1:]:
+        if not line.strip():
+            continue
+        if re.search(
+            r"\b(?:do not|don't|never|must|should|may|if|unless|except|only when)\b", line, re.I
+        ):
+            return False
+        match = re.fullmatch(r"\s*(?:> ?)?([A-Za-z_ ]+)\s*[:=]\s*(.+?)\s*", line)
+        if not match:
+            return False
+        key = match[1].strip().lower().replace("_", " ")
+        value = match[2]
+        if value.startswith(('"', "'")):
+            if len(value) < 2 or value[-1] != value[0]:
+                return False
+            value = value[1:-1]
+        if key in {"current date", "current time", "timestamp", "generated date"}:
+            valid = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[T ][0-9:.+Z-]+)?", value))
+        elif key in {"session id", "request id", "build id", "version"}:
+            valid = bool(re.fullmatch(r"[A-Za-z0-9_.-]+", value))
+        elif key in {"workspace", "project root", "machine path"}:
+            valid = bool(re.fullmatch(r"(?:/|[A-Za-z]:\\)[A-Za-z0-9_./\\:-]+", value))
+        else:
+            return False
+        if not valid:
+            return False
+        found = True
+    return found
+
+
+_DYNAMIC_MARKER = "<!-- Dynamic Runtime Context (isolated for prompt caching) -->"
+_STANDALONE_METADATA = re.compile(
+    r"(?:Current Date|Current Time|Timestamp|Generated Date|Session(?: ID|_id)|Request(?: ID|_id))\s*[:=]\s*.+",
+    re.I,
+)
+
+
+def _standalone_metadata(block: _RuleBlock) -> bool:
+    line = block.lines[0]
+    return (
+        block.kind == "prose"
+        and line == line.lstrip()
+        and not line.endswith("  ")
+        and bool(_STANDALONE_METADATA.fullmatch(line))
+        and _safe_dynamic(_RuleBlock("dynamic", [_DYNAMIC_MARKER, line], block.line))
+    )
+
+
+# Full-line greetings/personas only, with a closed vocabulary and no action clause.
+_PERSONA = re.compile(
+    r"You are (?:a|an) (?:(?:helpful|expert|world-class|senior) )?(?:(?:coding|software|AI) )?assistant(?: expert)?\.",
+    re.I,
+)
+_FILLER = {
+    "Hello Claude!",
+    "Hello Codex!",
+    "Welcome to the project.",
+    "Please make sure to always remember to never forget this.",
+    "As an AI language model, you are a helpful assistant.",
+}
+
+
+def _boilerplate(line: str) -> bool:
+    sentences = re.split(r"(?<=[.!])\s+", line.strip())
+    return bool(sentences) and all(
+        part in _FILLER or _PERSONA.fullmatch(part) for part in sentences
+    )
+
+
+def _canonical_rules(content: str, *, optimize: bool) -> str:
+    blocks = _scan_rules(content)
+    output = []
+    dynamic = []
+    dynamic_marker = None
+    in_list = False
+    previous_rule = None
+    section = 0
+    next_content = [None] * len(blocks)
+    following = None
+    for index in range(len(blocks) - 1, -1, -1):
+        next_content[index] = following
+        if blocks[index].kind != "blank":
+            following = blocks[index]
+    for index, block in enumerate(blocks):
+        if block.kind in {"blank", "heading"}:
+            in_list = False
+        elif block.kind == "list":
+            in_list = True
+        if optimize and not in_list and _standalone_metadata(block):
+            dynamic.append(block.lines[0].rstrip(" \t"))
+            previous_rule = None
+            continue
+        if block.kind == "dynamic" and _safe_dynamic(block) and optimize:
+            dynamic_marker = dynamic_marker or block.lines[0]
+            dynamic.extend(line for line in block.lines[1:] if line.strip())
+            previous_rule = None
+            continue
+        if block.kind in {"protected", "dynamic"}:
+            output.extend(block.lines)
+            previous_rule = None
+            continue
+        line = block.lines[0]
+        # Two spaces are Markdown's semantic hard break; otherwise trim padding.
+        hard_break = line.endswith("  ") and bool(line.strip())
+        if not hard_break:
+            line = line.rstrip(" \t")
+        if block.kind == "heading":
+            section += 1
+        if optimize and block.kind == "prose" and not hard_break and _boilerplate(line):
+            continue
+        if block.kind == "blank":
+            previous_rule = None
+            if output and output[-1] != "":
+                output.append("")
+            continue
+        # Only adjacent, childless simple bullets share an unambiguous scope.
+        nested = False
+        indent = len(line) - len(line.lstrip(" \t"))
+        following = next_content[index]
+        if following is not None:
+            next_line = following.lines[0]
+            nested = (
+                bool(next_line.strip()) and len(next_line) - len(next_line.lstrip(" \t")) > indent
+            )
+        simple = (
+            block.kind == "list"
+            and indent == 0
+            and bool(re.match(r"^\s*[-+*]\s", line))
+            and not nested
+            and not hard_break
+            and not re.search(r"[`<>]|https?://", line)
+        )
+        rule_text = line[indent:]
+        if re.fullmatch(r"[-+*] [A-Za-z ,.!?;:-]+", rule_text):
+            rule_text = re.sub(r"[ \t]+", " ", rule_text)
+        key = (section, line[:indent], rule_text) if simple else None
+        if optimize and key is not None and key == previous_rule:
+            continue
+        previous_rule = key
+        output.append(line)
+    # Strip only empty outer lines, never indentation or protected line content.
+    while output and output[0] == "":
+        output.pop(0)
+    while output and output[-1] == "":
+        output.pop()
+    if dynamic:
+        if output:
+            output.append("")
+        output.append("\n".join([dynamic_marker or _DYNAMIC_MARKER, *dynamic]))
+    return "\n".join(output).rstrip("\n") + "\n"
+
+
+def minify_rules(content: str) -> str:
+    """Normalize safe whitespace without changing instructions or opaque blocks."""
+    return _canonical_rules(content, optimize=False)
+
+
+CLIENT_RULE_PATHS = {
+    "claude": "CLAUDE.md",
+    "codex": "AGENTS.md",
+    "cursor": ".cursorrules",
+    "copilot": ".github/copilot-instructions.md",
+}
+
+
+def _rules_client(client: str) -> str:
+    if not isinstance(client, str):
+        raise ValueError("client must be claude, codex, cursor or copilot")
+    client = client.lower()
+    if client == "codex-desktop":
+        client = "codex"
+    if client not in CLIENT_RULE_PATHS:
+        raise ValueError("client must be claude, codex, cursor or copilot")
+    return client
 
 
 def generate_desktop_rules(client: str = "claude") -> str:
-    """Generate concise, cache-friendly instructions for CLAUDE.md or AGENTS.md."""
-    if client.lower() in {"codex", "codex-desktop"}:
-        return (
-            "# UsageTrim Codex Rules\n"
-            "- Targeted inspection: use `usagetrim_code` (outline, symbols, callers) and `usagetrim_read` (symbols/ranges) instead of dumping full files.\n"
-            "- Precise changes: use `usagetrim_edit_symbol` for hash-guarded atomic updates.\n"
-            "- Shell execution: use `usagetrim_exec` or run `usagetrim run -- <cmd>` in terminal to fold build/test noise.\n"
-            "- Recovery: if folded diagnostics or logs are needed, call `usagetrim_retrieve(ref_id=...)`.\n"
-            "- Task memory: save milestone checkpoints with `usagetrim_context`.\n"
-        )
+    client = _rules_client(client)
+    intro = {
+        "cursor": "- Scope: project instructions for Cursor Agent.\n",
+        "copilot": "- Scope: repository instructions for GitHub Copilot.\n",
+    }.get(client, "")
     return (
-        "# UsageTrim Claude Rules\n"
-        "- Targeted inspection: use `usagetrim_code` (symbols, callers, outline) and `usagetrim_read` (targeted symbol/lines) rather than dumping full files.\n"
-        "- Precise changes: use `usagetrim_edit_symbol` for hash-guarded symbol replacements.\n"
-        "- Command output: use `usagetrim_exec` to collapse routine test and build noise.\n"
-        "- Context recovery: use `usagetrim_retrieve(ref_id=...)` to retrieve full uncompacted outputs.\n"
-        "- Task milestones: save checkpoints with `usagetrim_context`.\n"
+        f"# UsageTrim { {'claude': 'Claude', 'codex': 'Codex', 'cursor': 'Cursor', 'copilot': 'Copilot'}[client] } Rules\n"
+        + intro
+        + "- Targeted inspection: use `usagetrim_code` (outline, symbols, callers) and `usagetrim_read` (symbols/ranges) instead of dumping full files.\n"
+        "- Precise changes: use `usagetrim_edit_symbol` for hash-guarded atomic updates.\n"
+        "- Shell execution: use `usagetrim_exec` or run `usagetrim run -- <cmd>` in terminal to fold build/test noise.\n"
+        "- Recovery: if folded diagnostics or logs are needed, call `usagetrim_retrieve(ref_id=...)`.\n"
+        "- Task memory: save milestone checkpoints with `usagetrim_context`.\n"
     )
 
 
 def optimize_rules(content: str) -> dict[str, Any]:
-    """Optimize rules for Claude Desktop (CLAUDE.md) and Codex (AGENTS.md).
+    """Conservative offline optimization; uncertain instructions remain unchanged."""
+    from usagetrim.metrics.pricing import estimate_savings
 
-    1. Prunes conversational pleasantries and zero-signal boilerplate.
-    2. Moves volatile cache-busting tokens (timestamps, ISO dates, session IDs) from prefix
-       to a dedicated suffix block so Anthropic and OpenAI prompt caching can hit.
-    3. Minifies comments, excess whitespace, and formatting padding.
-    """
-    orig_tokens = count_tokens(content).avg
-    lines = content.splitlines()
-
-    static_lines: list[str] = []
-    dynamic_lines: list[str] = []
-
-    simplifications = [
-        (
-            re.compile(
-                r"\bYou are (?:a|an)\s+(?:helpful|world-class|expert|senior)?\s*(?:coding\s+|software\s+|AI\s+)?assistant[^\n.]*[\.]?\s*",
-                re.IGNORECASE,
-            ),
-            "",
-        ),
-        (
-            re.compile(
-                r"\bPlease make sure to always remember to never forget[^\n.]*[\.]?\s*",
-                re.IGNORECASE,
-            ),
-            "",
-        ),
-        (re.compile(r"\bPlease (?:ensure|make sure) (?:that you |to )?", re.IGNORECASE), ""),
-        (re.compile(r"\bFeel free to\b", re.IGNORECASE), "You may"),
-        (re.compile(r"\bKeep in mind that\b", re.IGNORECASE), "Note:"),
-        (re.compile(r"\bAs an AI (?:language model|assistant)[^,.]*[,.]", re.IGNORECASE), ""),
-    ]
-
-    for line in lines:
-        stripped = line.strip()
-        clean = re.sub(r"<!--.*?-->", "", stripped).strip()
-        if not clean:
-            if static_lines and static_lines[-1] != "":
-                static_lines.append("")
-            continue
-
-        for pat, repl in simplifications:
-            clean = pat.sub(repl, clean).strip()
-
-        if not clean:
-            continue
-
-        is_dynamic = False
-        for pat, _ in CACHE_BUSTING_PATTERNS:
-            if pat.search(clean):
-                is_dynamic = True
-                break
-
-        if is_dynamic:
-            dynamic_lines.append(clean)
-        else:
-            indent = len(line) - len(line.lstrip())
-            norm_indent = " " * min(indent, 4)
-            static_lines.append(norm_indent + clean)
-
-    optimized_parts = []
-    static_text = "\n".join(static_lines).strip()
-    if static_text:
-        optimized_parts.append(static_text)
-
-    if dynamic_lines:
-        dynamic_block = (
-            "\n<!-- Dynamic Runtime Context (isolated for prompt caching) -->\n"
-            + "\n".join(f"> {line}" for line in dynamic_lines)
-        )
-        optimized_parts.append(dynamic_block)
-
-    optimized_content = "\n".join(optimized_parts).strip() + "\n"
-    opt_tokens = count_tokens(optimized_content).avg
-    saved_tokens = max(0, orig_tokens - opt_tokens)
-    savings_pct = round((saved_tokens / orig_tokens * 100), 1) if orig_tokens > 0 else 0.0
-
-    lint_res = lint_rule_content(optimized_content)
-
+    optimized = _canonical_rules(content, optimize=True)
+    before, after = count_tokens(content), count_tokens(optimized)
+    delta = before.openai - after.openai
+    costs = estimate_savings(before.claude - after.claude, delta, before.gemini - after.gemini)
+    lint = lint_rule_content(optimized)
     return {
-        "original_tokens": orig_tokens,
-        "optimized_tokens": opt_tokens,
-        "saved_tokens": saved_tokens,
-        "savings_pct": savings_pct,
-        "optimized_content": optimized_content,
-        "is_cache_friendly": lint_res.is_cache_friendly,
-        "exceeds_cache_threshold": lint_res.exceeds_cache_threshold,
-        "tokens_to_cache_threshold": lint_res.tokens_to_cache_threshold,
-        "cache_advice": lint_res.cache_advice,
+        "original_tokens": before.openai,
+        "optimized_tokens": after.openai,
+        "saved_tokens": max(0, delta),
+        "token_delta": delta,
+        "savings_pct": round(100 * delta / before.openai, 1) if before.openai else 0.0,
+        "optimized_content": optimized,
+        "estimated_baseline_input_cost_delta": costs.avg_saved_usd,
+        "is_cache_friendly": lint.is_cache_friendly,
+        "exceeds_cache_threshold": lint.exceeds_cache_threshold,
+        "tokens_to_cache_threshold": lint.tokens_to_cache_threshold,
+        "cache_advice": lint.cache_advice,
     }
