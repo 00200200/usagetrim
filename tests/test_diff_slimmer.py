@@ -1,4 +1,15 @@
-from usagetrim.core.diff_slimmer import budgeted_diff_slice, score_file_importance, slim_git_diff
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from usagetrim.core.diff_slimmer import (
+    budgeted_diff_slice,
+    classify_git_diff,
+    score_file_importance,
+    slim_git_diff,
+    structurally_equivalent,
+)
 from usagetrim.metrics.tokenizer import count_tokens
 
 SAMPLE_DIFF = """diff --git a/src/main.py b/src/main.py
@@ -227,3 +238,842 @@ index 100000{i}..200000{i} 100644
 def test_budgeted_diff_slice_empty_and_whitespace():
     assert budgeted_diff_slice("") == ""
     assert budgeted_diff_slice("   \n\n\t  ") == ""
+
+
+_FORMATTING_PAIRS = [
+    (
+        "module.py",
+        "def calculate(a, b):\n    result = a + b\n    return result\n",
+        "\ndef calculate( a,b ):\n\n        result=a+b   \n        return result\n",
+    ),
+    (
+        "module.ts",
+        "function calculate(a: number, b: number) { return a + b; }\n",
+        "function calculate(\n a:number,\n b:number\n) {\n    return a+b;\n}\n",
+    ),
+    (
+        "module.go",
+        "package main\nfunc calculate(a int, b int) int { return a + b }\n",
+        "package main\n\nfunc calculate(a int,b int) int {\n\treturn a+b\n}\n",
+    ),
+    (
+        "module.rs",
+        "fn calculate(a: i32, b: i32) -> i32 { a + b }\n",
+        "fn calculate(\n    a:i32, b:i32\n) -> i32 {\n    a+b\n}\n",
+    ),
+]
+
+
+@pytest.mark.parametrize("path,old,new", _FORMATTING_PAIRS)
+def test_structural_formatting_equivalence_is_symmetric_and_deterministic(path, old, new):
+    assert old != new
+    for _ in range(3):
+        assert structurally_equivalent(old, new, path) is True
+        assert structurally_equivalent(new, old, Path(path)) is True
+        assert structurally_equivalent(old, old, path) is True
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ("x > 1", "x >= 1"),
+        ("1", "2"),
+        ('"a"', '"b"'),
+        ("foo()", "bar()"),
+        ("foo(x)", "foo(y)"),
+        ("def f():\n    return x + 1", "def f():\n    return x - 1"),
+        ("original = 1", "renamed = 1"),
+        ("def f(x):\n    pass", "def f(y):\n    pass"),
+        ("import first", "import second"),
+        ("@first\ndef f():\n    pass", "@second\ndef f():\n    pass"),
+        ('"a b"', '"ab"'),
+    ],
+)
+def test_structural_python_changes_are_not_equivalent(old, new):
+    assert structurally_equivalent(old, new, "module.py") is False
+
+
+@pytest.mark.parametrize(
+    "path,old,new",
+    [
+        ("module.ts", "const x = foo(1);", "const x = bar(1);"),
+        (
+            "module.go",
+            "package main\nfunc f() int { return 1 }",
+            "package main\nfunc f() int { return 2 }",
+        ),
+        ("module.rs", "fn f() -> i32 { 1 }", "fn f() -> i32 { 2 }"),
+        ("module.ts", "const x = `a b`;", "const x = `ab`;"),
+        ("module.go", "package main\nvar x = `a b`\n", "package main\nvar x = `ab`\n"),
+        ("module.rs", 'fn f() { let x = "a b"; }', 'fn f() { let x = "ab"; }'),
+    ],
+)
+def test_structural_other_language_changes_are_not_equivalent(path, old, new):
+    assert structurally_equivalent(old, new, path) is False
+
+
+def test_structural_python_indentation_changes_block_ownership():
+    old = "if ready:\n    run()\n    finish()\n"
+    new = "if ready:\n    run()\nfinish()\n"
+    assert structurally_equivalent(old, new, "module.py") is False
+
+
+@pytest.mark.parametrize(
+    "path,comment,code",
+    [
+        ("module.py", "# SECURITY: validate token", "value = 1\n"),
+        ("module.ts", "// SECURITY: validate token", "const value = 1;\n"),
+        ("module.go", "// SECURITY: validate token", "package main\n"),
+        ("module.rs", "// SECURITY: validate token", "fn main() {}\n"),
+        ("module.rs", "/* SECURITY: validate token */", "fn main() {}\n"),
+    ],
+)
+def test_structural_comments_preserve_full_text_and_presence(path, comment, code):
+    old = comment + "\n" + code
+    assert structurally_equivalent(old, old, path) is True
+    assert structurally_equivalent(old, old.replace("SECURITY: ", ""), path) is False
+    assert structurally_equivalent(old, code, path) is False
+    assert structurally_equivalent(code, old, path) is False
+
+
+@pytest.mark.parametrize(
+    "path,source",
+    [
+        ("module.py", "def f(:\n pass"),
+        ("module.ts", "function f(x:number) { return x + 1;"),
+        ("module.go", "package main\nfunc f() {"),
+        ("module.rs", "fn f() {"),
+    ],
+)
+def test_structural_malformed_input_never_compares_equal(path, source):
+    assert structurally_equivalent(source, source, path) is None
+    assert structurally_equivalent(source, "", path) is None
+    assert structurally_equivalent("", source, path) is None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'fn f() { println!("hello"); }',
+        "macro_rules! m { ($x:expr) => { $x + 1 }; }",
+    ],
+)
+def test_structural_rust_macros_use_conservative_fallback(source):
+    assert structurally_equivalent(source, source, "module.rs") is None
+    assert structurally_equivalent(source, source.replace(" + ", "+"), "module.rs") is None
+
+
+@pytest.mark.parametrize(
+    "path,source",
+    [
+        ("module.py", "x = 1"),
+        ("module.pyi", "x: int"),
+        ("module.ts", "const x = 1;"),
+        ("module.go", "package main"),
+        ("module.rs", "fn main() {}"),
+    ],
+)
+def test_structural_empty_sources(path, source):
+    assert structurally_equivalent("", "", path) is True
+    assert structurally_equivalent("", source, path) is False
+    assert structurally_equivalent(source, "", path) is False
+
+
+@pytest.mark.parametrize("path", ["module.txt", "module.tsx", "module.jsx", "module.js"])
+def test_structural_unsupported_language_falls_back(path):
+    assert structurally_equivalent("value", "value", path) is None
+
+
+def test_structural_oversized_or_invalid_text_falls_back():
+    oversized = "#" + "x" * (2 * 1024 * 1024)
+    for source in (oversized, "x = 1\0", "\ud800"):
+        assert structurally_equivalent(source, "", "module.py") is None
+        assert structurally_equivalent("", source, "module.py") is None
+
+
+def test_structural_go_ambiguous_empty_eof_token_falls_back():
+    source = "package main\nvar x = `a b`"
+    assert structurally_equivalent(source, source, "module.go") is None
+
+
+@pytest.mark.parametrize("path", ["module.py", "module.ts", "module.go", "module.rs"])
+def test_structural_whitespace_only_sources(path):
+    assert structurally_equivalent("", " \n\t", path) is True
+
+
+@pytest.mark.parametrize(
+    "path,old,new",
+    [
+        ("module.py", 'text = "żółć 雪"\n', 'text="żółć 雪"\n'),
+        ("module.ts", 'const text = "żółć 雪";', 'const text="żółć 雪";'),
+        ("module.rs", 'fn f() { let text = "żółć 雪"; }', 'fn f(){let text="żółć 雪";}'),
+    ],
+)
+def test_structural_unicode_literal_text_is_preserved(path, old, new):
+    assert structurally_equivalent(old, new, path) is True
+    assert structurally_equivalent(old, new.replace("雪", "雨"), path) is False
+
+
+@pytest.fixture
+def structural_repo(tmp_path):
+    def git(*args):
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Structural Test",
+                "-c",
+                "user.email=test@example.invalid",
+                *args,
+            ],
+            cwd=tmp_path,
+            capture_output=True,
+            check=True,
+        )
+        return result.stdout.decode("utf-8", errors="replace")
+
+    git("init", "-q", "--initial-branch=main")
+    (tmp_path / "check.py").write_bytes(b"def check(x):\n    return x > 5\n")
+    git("add", "check.py")
+    git("commit", "-qm", "Initial source")
+    return tmp_path, git
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("logical", [False, True])
+def test_classify_git_diff_uses_correct_sources(structural_repo, staged, logical):
+    root, git = structural_repo
+    (root / "check.py").write_text(
+        "def check( x ):\n    return x" + (">=5" if logical else ">5") + "\n"
+    )
+    if staged:
+        git("add", "check.py")
+    raw = git("diff", *(["--cached"] if staged else []))
+    assert classify_git_diff(raw, cwd=root, staged=staged) == (set() if logical else {"check.py"})
+
+
+def test_classify_unstaged_uses_index_instead_of_head(structural_repo):
+    root, git = structural_repo
+    (root / "check.py").write_text("def check(x):\n    return x >= 5\n")
+    git("add", "check.py")
+    (root / "check.py").write_text("def check( x ):\n    return x>=5\n")
+    assert classify_git_diff(git("diff"), cwd=root) == {"check.py"}
+
+
+def test_classify_staged_ignores_later_worktree_content(structural_repo):
+    root, git = structural_repo
+    (root / "check.py").write_text("def check( x ):\n    return x>5\n")
+    git("add", "check.py")
+    raw = git("diff", "--cached")
+    (root / "check.py").write_text("def check(x):\n    return x >= 99\n")
+    assert classify_git_diff(raw, cwd=root, staged=True) == {"check.py"}
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_classify_snapshot_mismatch_falls_back(structural_repo, staged):
+    root, git = structural_repo
+    (root / "check.py").write_text("def check( x ):\n    return x>5\n")
+    if staged:
+        git("add", "check.py")
+    raw = git("diff", *(["--cached"] if staged else []))
+    (root / "check.py").write_text("def check( x ):\n    return x>99\n")
+    if staged:
+        git("add", "check.py")
+    assert classify_git_diff(raw, cwd=root, staged=staged) == set()
+
+
+def test_classify_old_index_snapshot_mismatch_falls_back(structural_repo):
+    root, git = structural_repo
+    (root / "check.py").write_text("def check( x ):\n    return x>5\n")
+    raw = git("diff")
+    git("add", "check.py")
+    assert classify_git_diff(raw, cwd=root) == set()
+
+
+def test_classify_resolves_repo_root_from_subdirectory(structural_repo):
+    root, git = structural_repo
+    sub = root / "sub"
+    sub.mkdir()
+    (root / "check.py").write_text("def check( x ):\n    return x>5\n")
+    assert classify_git_diff(git("diff"), cwd=sub) == {"check.py"}
+
+
+@pytest.mark.parametrize("change", ["added", "deleted", "rename", "binary", "mode"])
+def test_classify_nonordinary_changes_fall_back(structural_repo, change):
+    root, git = structural_repo
+    if change == "added":
+        (root / "new.py").write_text("x = 1\n")
+        git("add", "new.py")
+    elif change == "deleted":
+        git("rm", "check.py")
+    elif change == "rename":
+        git("mv", "check.py", "renamed.py")
+    elif change == "binary":
+        (root / "check.py").write_bytes(b"\0binary\0")
+        git("add", "check.py")
+    else:
+        git("config", "core.filemode", "true")
+        (root / "check.py").chmod(0o755)
+        git("add", "check.py")
+    raw = git("diff", "--cached", "--find-renames")
+    assert raw
+    assert classify_git_diff(raw, cwd=root, staged=True) == set()
+
+
+@pytest.mark.parametrize(
+    "path,extra", [("notes.txt", None), ("service.pb.go", None), ("check.py", [r"check\.py$"])]
+)
+def test_classify_skips_unsupported_generated_and_custom_ignores(
+    structural_repo, monkeypatch, path, extra
+):
+    import usagetrim.core.diff_slimmer as module
+
+    root, git = structural_repo
+    (root / path).write_text("x = 1\n")
+    git("add", path)
+    git("commit", "-qm", "Add excluded file")
+    (root / path).write_text("x=1\n")
+    raw = git("diff")
+
+    def unexpected_read(*args):
+        pytest.fail("Excluded source must not be fetched")
+
+    monkeypatch.setattr(module, "_git_bytes", unexpected_read)
+    assert classify_git_diff(raw, cwd=root, extra_patterns=extra) == set()
+
+
+def test_classify_malformed_source_falls_back(structural_repo):
+    root, git = structural_repo
+    (root / "check.py").write_text("def check(:\n pass")
+    assert classify_git_diff(git("diff"), cwd=root) == set()
+
+
+def test_classify_size_limit_precedes_ast(structural_repo, monkeypatch):
+    import usagetrim.core.diff_slimmer as module
+
+    root, git = structural_repo
+    (root / "check.py").write_text("def check( x ):\n    return x>5\n")
+    raw = git("diff")
+    monkeypatch.setattr(module, "_MAX_STRUCTURAL_SOURCE_BYTES", 10)
+    assert classify_git_diff(raw, cwd=root) == set()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "quoted",
+        "copy",
+        "missing-index",
+        "zero-hash",
+        "invalid-hash",
+        "combined",
+        "duplicate",
+        "traversal",
+        "symlink",
+        "submodule",
+    ],
+)
+def test_classify_unsafe_headers_fall_back(structural_repo, mutation):
+    root, git = structural_repo
+    (root / "check.py").write_text("def check( x ):\n    return x>5\n")
+    raw = git("diff")
+    if mutation == "quoted":
+        raw = raw.replace("a/check.py", '"a/check.py"').replace("b/check.py", '"b/check.py"')
+    elif mutation == "copy":
+        raw = raw.replace(
+            "index ", "similarity index 99%\ncopy from original.py\ncopy to check.py\nindex ", 1
+        )
+    elif mutation == "missing-index":
+        raw = "\n".join(line for line in raw.splitlines() if not line.startswith("index "))
+    elif mutation in {"zero-hash", "invalid-hash"}:
+        raw = raw.replace(
+            raw.splitlines()[1].split()[1].split("..")[0],
+            "0000000" if mutation == "zero-hash" else "zzzzzzz",
+        )
+    elif mutation == "combined":
+        raw = raw.replace("diff --git", "diff --cc")
+    elif mutation == "duplicate":
+        raw += raw
+    elif mutation == "traversal":
+        raw = raw.replace("check.py", "../check.py")
+    else:
+        raw = raw.replace("100644", "120000" if mutation == "symlink" else "160000")
+    assert classify_git_diff(raw, cwd=root) == set()
+
+
+def test_classify_worktree_symlink_falls_back(structural_repo, tmp_path):
+    root, git = structural_repo
+    (root / "check.py").write_text("def check( x ):\n    return x>5\n")
+    raw = git("diff")
+    target = tmp_path.parent / f"{tmp_path.name}-external-source"
+    target.write_text("def check( x ):\n    return x>5\n")
+    (root / "check.py").unlink()
+    try:
+        (root / "check.py").symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks unavailable")
+    assert classify_git_diff(raw, cwd=root) == set()
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_classify_outside_repo_or_invalid_cwd_returns_empty(structural_repo, tmp_path, missing):
+    root, git = structural_repo
+    (root / "check.py").write_text("def check( x ):\n    return x>5\n")
+    raw = git("diff")
+    cwd = tmp_path / ("missing" if missing else "outside")
+    if not missing:
+        # Use a directory outside the repository, not an untracked subdirectory.
+        cwd = tmp_path.parent
+    assert classify_git_diff(raw, cwd=cwd) == set()
+
+
+def test_classify_sha256_repository_when_supported(tmp_path):
+    result = subprocess.run(
+        ["git", "init", "-q", "--object-format=sha256", str(tmp_path)], capture_output=True
+    )
+    if result.returncode:
+        pytest.skip("Git SHA-256 repositories unavailable")
+
+    def git(*args):
+        return subprocess.check_output(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", *args],
+            cwd=tmp_path,
+        ).decode()
+
+    (tmp_path / "check.py").write_text("x = 1\n")
+    git("add", "check.py")
+    git("commit", "-qm", "Initial")
+    (tmp_path / "check.py").write_text("x=1\n")
+    assert classify_git_diff(git("diff"), cwd=tmp_path) == {"check.py"}
+
+
+@pytest.mark.parametrize("full_index", [False, True])
+def test_classify_verifies_abbreviated_and_full_blob_ids(structural_repo, full_index):
+    root, git = structural_repo
+    (root / "check.py").write_text("def check( x ):\n    return x>5\n")
+    raw = git("diff", *(["--full-index"] if full_index else ["--abbrev=8"]))
+    assert classify_git_diff(raw, cwd=root) == {"check.py"}
+
+
+def test_classify_hash_mismatch_prevents_ast_parsing(structural_repo, monkeypatch):
+    import usagetrim.core.diff_slimmer as module
+
+    root, git = structural_repo
+    (root / "check.py").write_text("def check( x ):\n    return x>5\n")
+    raw = git("diff")
+    (root / "check.py").write_text("def check( x ):\n    return x>6\n")
+
+    def unexpected_parse(*args):
+        pytest.fail("Snapshot must be verified before parsing")
+
+    monkeypatch.setattr(module, "structurally_equivalent", unexpected_parse)
+    assert classify_git_diff(raw, cwd=root) == set()
+
+
+@pytest.mark.parametrize("payload", [b"def check(:\n pass", b"x = '\xff'\n"])
+def test_classify_invalid_old_source_falls_back(structural_repo, payload):
+    root, git = structural_repo
+    (root / "check.py").write_bytes(payload)
+    git("add", "check.py")
+    git("commit", "-qm", "Old source outside parser contract")
+    (root / "check.py").write_bytes(b"x = 1\n")
+    assert classify_git_diff(git("diff"), cwd=root) == set()
+
+
+def test_classify_worktree_transformation_mismatch_falls_back(structural_repo):
+    root, git = structural_repo
+    git("config", "core.autocrlf", "false")
+    (root / ".gitattributes").write_text("check.py text eol=lf\n")
+    git("add", ".gitattributes")
+    git("commit", "-qm", "Normalize source line endings")
+    (root / "check.py").write_bytes(b"def check( x ):\r\n    return x>5\r\n")
+    assert classify_git_diff(git("diff"), cwd=root) == set()
+
+
+def test_classify_skips_lockfiles_before_fetching_sources(structural_repo, monkeypatch):
+    import usagetrim.core.diff_slimmer as module
+
+    root, git = structural_repo
+    # A custom-generated Python filename can also match the existing lockfile matcher.
+    (root / "uv.lock.py").write_text("x = 1\n")
+    git("add", "uv.lock.py")
+    git("commit", "-qm", "Add lockfile-pattern source")
+    (root / "uv.lock.py").write_text("x=1\n")
+    raw = git("diff")
+    monkeypatch.setattr(module, "_git_bytes", lambda *args: pytest.fail("Lockfile must be skipped"))
+    assert classify_git_diff(raw, cwd=root) == set()
+
+
+def source_diff(old, new, path):
+    import difflib
+
+    return f"diff --git a/{path} b/{path}\nindex 1234567..89abcdef 100644\n" + "".join(
+        difflib.unified_diff(
+            old.splitlines(keepends=True),
+            new.splitlines(keepends=True),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+        )
+    )
+
+
+@pytest.fixture
+def structural_mixed_diff():
+    return source_diff("x = 1\n", "x=1\n", "src/formatted.py") + source_diff(
+        "valid = x > 5\n", "valid = x >= 5\n", "src/logic.py"
+    )
+
+
+@pytest.mark.parametrize("budget", [None, 400, 1000])
+def test_structural_receipt_preserves_other_file_logic(structural_mixed_diff, budget):
+    kwargs = {"formatting_only_paths": {"src/formatted.py"}}
+    if budget is None:
+        output = slim_git_diff(structural_mixed_diff, **kwargs)
+    else:
+        output = budgeted_diff_slice(structural_mixed_diff, budget_tokens=budget, **kwargs)
+        assert count_tokens(output).openai <= budget
+    assert "2 formatting-only changed lines" in output
+    assert "parser structure and token text unchanged" in output
+    assert "-x = 1" not in output and "+x=1" not in output
+    assert "-valid = x > 5" in output and "+valid = x >= 5" in output
+    for header in (
+        "diff --git a/src/formatted.py b/src/formatted.py",
+        "index 1234567..89abcdef 100644",
+        "--- a/src/formatted.py",
+        "+++ b/src/formatted.py",
+    ):
+        assert header in output
+
+
+@pytest.mark.parametrize("budget", [100, 400, 1000])
+def test_empty_or_unmatched_structural_paths_do_not_change_existing_output(
+    structural_mixed_diff, budget
+):
+    for paths in (set(), {"formatted.py"}, {"src/formatted.py.backup"}):
+        assert slim_git_diff(structural_mixed_diff, formatting_only_paths=paths) == slim_git_diff(
+            structural_mixed_diff
+        )
+        assert budgeted_diff_slice(
+            structural_mixed_diff, budget, formatting_only_paths=paths
+        ) == budgeted_diff_slice(structural_mixed_diff, budget)
+
+
+def test_structural_multiple_hunks_get_one_receipt_and_exact_changed_count():
+    old = "\n".join(f"value_{i} = {i}" for i in range(30)) + "\n"
+    new = old.replace("value_0 = 0", "value_0=0").replace("value_29 = 29", "value_29=29")
+    raw = source_diff(old, new, "src/formatted.py")
+    assert raw.count("@@ -") == 2
+    output = slim_git_diff(raw, formatting_only_paths={"src/formatted.py"}, max_context_lines=0)
+    assert output.count("formatting-only") == 1
+    assert "4 formatting-only changed lines" in output
+    assert "@@" not in output
+    assert not any(
+        line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+        for line in output.splitlines()
+    )
+
+
+@pytest.mark.parametrize(
+    "renderer,args",
+    [
+        ("_render_full", ()),
+        ("_render_window", (1,)),
+        ("_render_folded", ()),
+        ("_render_compact_receipt", ()),
+    ],
+)
+def test_all_budget_renderers_keep_structural_receipt(structural_mixed_diff, renderer, args):
+    import usagetrim.core.diff_slimmer as module
+
+    _, files = module._parse_diff(structural_mixed_diff, formatting_only_paths={"src/formatted.py"})
+    file = files[0]
+    assert file.formatting_only
+    output = getattr(module, renderer)(file, *args)
+    if renderer == "_render_compact_receipt":
+        assert output == "diff --git a/src/formatted.py b/src/formatted.py (formatting-only)"
+        assert (
+            count_tokens(output).openai < count_tokens(module._render_formatting_only(file)).openai
+        )
+    else:
+        assert output == module._render_formatting_only(file)
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        "old mode 100644\nnew mode 100755\n",
+        "new file mode 100644\n",
+        "deleted file mode 100644\n",
+        "rename from old.py\nrename to src/formatted.py\n",
+    ],
+)
+def test_structural_manual_paths_do_not_override_unusual_metadata(headers):
+    raw = source_diff("x = 1\n", "x=1\n", "src/formatted.py").replace(
+        "index ", headers + "index ", 1
+    )
+    paths = {"src/formatted.py"}
+    assert slim_git_diff(raw, formatting_only_paths=paths) == slim_git_diff(raw)
+    assert budgeted_diff_slice(raw, 1000, formatting_only_paths=paths) == budgeted_diff_slice(
+        raw, 1000
+    )
+    assert "formatting-only" not in slim_git_diff(raw, formatting_only_paths=paths)
+
+
+@pytest.mark.parametrize(
+    "path,patterns",
+    [("service.pb.go", None), ("uv.lock", None), ("src/formatted.py", [r"formatted\.py$"])],
+)
+def test_structural_paths_do_not_override_specialized_folding(path, patterns):
+    raw = source_diff("x = 1\n", "x=1\n", path)
+    assert slim_git_diff(
+        raw, extra_patterns=patterns, formatting_only_paths={path}
+    ) == slim_git_diff(raw, extra_patterns=patterns)
+    assert budgeted_diff_slice(
+        raw, extra_patterns=patterns, formatting_only_paths={path}
+    ) == budgeted_diff_slice(raw, extra_patterns=patterns)
+
+
+def test_comment_change_without_classification_remains_visible():
+    old = "# SECURITY: validate token\nx = 1\n"
+    new = "# validate token\nx = 1\n"
+    assert structurally_equivalent(old, new, "example.py") is False
+    output = slim_git_diff(source_diff(old, new, "example.py"), formatting_only_paths=set())
+    assert "-# SECURITY: validate token" in output and "+# validate token" in output
+
+
+_REFORMAT_SOURCE = """from collections import defaultdict
+
+
+def validate_order(order):
+    if not order.get("customer"):
+        raise ValueError("Customer is required")
+    if not order.get("items"):
+        raise ValueError("Order must contain items")
+    for item in order["items"]:
+        if item["quantity"] <= 0:
+            raise ValueError("Quantity must be positive")
+        if item["price"] < 0:
+            raise ValueError("Price must be nonnegative")
+    return order
+
+
+def subtotal(items):
+    total = 0
+    for item in items:
+        total += item["price"] * item["quantity"]
+    return total
+
+
+def discount_for(customer, total):
+    if customer.get("loyal") and total > 100:
+        return total * 0.1
+    if total > 500:
+        return 25
+    return 0
+
+
+def shipping_cost(address, total):
+    if total > 200:
+        return 0
+    if address["country"] == "local":
+        return 5
+    return 15
+
+
+def summarize_items(items):
+    quantities = defaultdict(int)
+    for item in items:
+        quantities[item["sku"]] += item["quantity"]
+    return dict(quantities)
+
+
+def prepare_invoice(order):
+    validate_order(order)
+    total = subtotal(order["items"])
+    discount = discount_for(order["customer"], total)
+    shipping = shipping_cost(order["address"], total)
+    invoice = {
+        "customer": order["customer"]["name"],
+        "items": summarize_items(order["items"]),
+        "subtotal": total,
+        "discount": discount,
+        "shipping": shipping,
+        "amount": total - discount + shipping,
+    }
+    return invoice
+
+
+def invoice_lines(invoice):
+    lines = ["Invoice for " + invoice["customer"]]
+    for sku, quantity in sorted(invoice["items"].items()):
+        lines.append(f"{sku}: {quantity}")
+    lines.append(f"Subtotal: {invoice['subtotal']}")
+    lines.append(f"Discount: {invoice['discount']}")
+    lines.append(f"Shipping: {invoice['shipping']}")
+    lines.append(f"Amount: {invoice['amount']}")
+    return lines
+
+
+def process_orders(orders):
+    invoices = []
+    failures = []
+    for order in orders:
+        try:
+            invoices.append(prepare_invoice(order))
+        except ValueError as error:
+            failures.append(str(error))
+    return invoices, failures
+"""
+
+
+def reformatted_source():
+    return (
+        "\n".join(
+            "  " * (len(line) - len(line.lstrip(" "))) + line.lstrip(" ")
+            for line in _REFORMAT_SOURCE.splitlines()
+        )
+        + "\n"
+    )
+
+
+def test_realistic_reformat_reduces_tokens_by_more_than_seventy_percent():
+    new = reformatted_source()
+    assert 80 <= len(_REFORMAT_SOURCE.splitlines()) <= 150
+    assert structurally_equivalent(_REFORMAT_SOURCE, new, "example.py") is True
+    raw = source_diff(_REFORMAT_SOURCE, new, "example.py")
+    output = slim_git_diff(raw, formatting_only_paths={"example.py"})
+    raw_tokens, output_tokens = count_tokens(raw).openai, count_tokens(output).openai
+    assert 100 * (raw_tokens - output_tokens) / raw_tokens > 70
+    assert "formatting-only" in output
+
+
+def test_large_mixed_reformat_and_logic_change_remains_visible():
+    new = reformatted_source().replace("total > 100", "total >= 100")
+    assert structurally_equivalent(_REFORMAT_SOURCE, new, "example.py") is False
+    raw = source_diff(_REFORMAT_SOURCE, new, "example.py")
+    output = slim_git_diff(raw)
+    assert '-    if customer.get("loyal") and total > 100:' in output
+    assert '+        if customer.get("loyal") and total >= 100:' in output
+    assert "formatting-only" not in output
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_real_git_classifier_to_structural_receipt_pipeline(structural_repo, staged):
+    root, git = structural_repo
+    (root / "check.py").write_text("def check( x ):\n    return x>5\n")
+    if staged:
+        git("add", "check.py")
+    raw = git("diff", *(["--cached"] if staged else []))
+    paths = classify_git_diff(raw, cwd=root, staged=staged)
+    assert paths == {"check.py"}
+    output = slim_git_diff(raw, formatting_only_paths=paths)
+    assert "formatting-only" in output and "@@" not in output
+    assert "-def check(x):" not in output and "+def check( x ):" not in output
+
+
+def test_budget_convergence_never_reexpands_structural_file():
+    formatting = source_diff(_REFORMAT_SOURCE, reformatted_source(), "example.py")
+    logic = source_diff(
+        "value = 1\n",
+        "value = 2\n" + "\n".join(f"result_{i} = calculate({i})" for i in range(100)) + "\n",
+        "logic.py",
+    )
+    for budget in (200, 350, 700):
+        output = budgeted_diff_slice(
+            formatting + logic, budget, formatting_only_paths={"example.py"}
+        )
+        assert count_tokens(output).openai <= budget
+        assert "formatting-only" in output
+        assert "a/example.py" in output and "a/logic.py" in output
+        assert "+        if customer" not in output
+
+
+def test_structural_changed_count_includes_body_lines_resembling_headers():
+    old, new = "--value\n", "- -value\n"
+    assert structurally_equivalent(old, new, "example.py") is True
+    output = slim_git_diff(
+        source_diff(old, new, "example.py"), formatting_only_paths={"example.py"}
+    )
+    assert "2 formatting-only changed lines" in output
+
+
+_SIGNIFICANT_DIRECTIVE_CASES = [
+    (
+        "constraint.go",
+        "// +build never\n\npackage sample\n\nfunc Value() int { return 1 }\n",
+        "// +build never\npackage sample\n\nfunc Value() int { return 1 }\n",
+    ),
+    (
+        "encoding.py",
+        '# coding: latin-1\n\nvalue = "é"\n',
+        '\n\n# coding: latin-1\nvalue = "é"\n',
+    ),
+    (
+        "modern_constraint.go",
+        "//go:build never\n\npackage sample\n\nfunc Value() int { return 1 }\n",
+        "package sample\n\n//go:build never\nfunc Value() int { return 1 }\n",
+    ),
+]
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("path,old,new", _SIGNIFICANT_DIRECTIVE_CASES)
+def test_significant_directive_layout_changes_are_not_structurally_folded(
+    structural_repo, path, old, new, staged
+):
+    root, git = structural_repo
+    (root / path).write_text(old, encoding="utf-8")
+    git("add", path)
+    git("commit", "-qm", "Initial directive layout")
+    (root / path).write_text(new, encoding="utf-8")
+    if staged:
+        git("add", path)
+    raw = git("diff", *(["--cached"] if staged else []))
+    assert raw
+    assert structurally_equivalent(old, new, path) is None
+    assert structurally_equivalent(new, old, path) is None
+    paths = classify_git_diff(raw, cwd=root, staged=staged)
+    assert path not in paths
+    output = slim_git_diff(raw, formatting_only_paths=paths)
+    assert output == slim_git_diff(raw)
+    assert "formatting-only" not in output
+
+
+def test_python_encoding_cookie_relocation_changes_detected_encoding():
+    import io
+    import tokenize
+
+    _, old, new = _SIGNIFICANT_DIRECTIVE_CASES[1]
+    assert tokenize.detect_encoding(io.BytesIO(old.encode("utf-8")).readline)[0] == "iso-8859-1"
+    assert tokenize.detect_encoding(io.BytesIO(new.encode("utf-8")).readline)[0] == "utf-8"
+    assert structurally_equivalent(old, new, "encoding.py") is None
+
+
+@pytest.mark.parametrize("path,old,new", _SIGNIFICANT_DIRECTIVE_CASES)
+def test_significant_directive_files_use_conservative_fallback_even_when_unchanged(path, old, new):
+    assert structurally_equivalent(old, old, path) is None
+    assert structurally_equivalent(new, new, path) is None
+
+
+def test_tight_budget_keeps_three_formatting_paths_and_genuine_logic(structural_repo):
+    root, git = structural_repo
+    names = ("a.py", "b.py", "c.py", "z_logic.py")
+    for name in names:
+        (root / name).write_text("value = 1\n", encoding="utf-8")
+    git("add", *names)
+    git("commit", "-qm", "Initial four-file budget fixture")
+    for name in names[:3]:
+        (root / name).write_text("value=1\n", encoding="utf-8")
+    (root / names[3]).write_text("value = 2\n", encoding="utf-8")
+    raw = git("diff")
+    paths = classify_git_diff(raw, cwd=root)
+    assert paths == set(names[:3])
+    output = budgeted_diff_slice(raw, budget_tokens=140, formatting_only_paths=paths)
+    assert count_tokens(output).openai <= 140
+    positions = [output.index(f"diff --git a/{name} b/{name}") for name in names]
+    assert positions == sorted(positions)
+    for name in names[:3]:
+        assert f"diff --git a/{name} b/{name} (formatting-only)" in output
+    assert "+value=1" not in output
+    assert "-value = 1" in output and "+value = 2" in output
+    assert "remaining files folded" not in output

@@ -15,7 +15,7 @@ from usagetrim.core.adaptive import compress_to_budget
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.cleaner import CleanerOptions, compact_terminal_output
 from usagetrim.core.companion_state import already_wrapped, client_name, paused
-from usagetrim.core.diff_slimmer import budgeted_diff_slice
+from usagetrim.core.diff_slimmer import budgeted_diff_slice, classify_git_diff
 from usagetrim.core.gain import build_gain_report
 from usagetrim.core.json_slimmer import slim_json
 from usagetrim.core.redactor import redact_secrets
@@ -900,16 +900,25 @@ def handle_usagetrim_diff(arguments: dict[str, Any]) -> str:
         raise ValueError(f"git diff failed ({res.returncode}): {res.stderr[:500]}")
     raw_diff = res.stdout
     ignore_patterns = arguments.get("ignore_patterns")
-    output = (
-        _compress(
-            budgeted_diff_slice(raw_diff, budget_tokens=budget, extra_patterns=ignore_patterns),
+    if not raw_diff:
+        output = "No git changes detected."
+    elif paused():
+        output = raw_diff
+    else:
+        formatting_only = classify_git_diff(
+            raw_diff, cwd=_cwd(arguments), staged=staged, extra_patterns=ignore_patterns
+        )
+        output = _compress(
+            budgeted_diff_slice(
+                raw_diff,
+                budget_tokens=budget,
+                extra_patterns=ignore_patterns,
+                formatting_only_paths=formatting_only,
+            ),
             budget,
             original_text=raw_diff,
             source="diff",
         )
-        if raw_diff
-        else "No git changes detected."
-    )
     return _record(raw_diff, output, operation="diff", project=_cwd(arguments))
 
 
