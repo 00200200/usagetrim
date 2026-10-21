@@ -153,16 +153,89 @@ class _RuleBlock:
     kind: str
     lines: list[str]
     line: int
+    scope: tuple[int, ...] = ()
+
+
+def _inline_code_end(lines: list[str], start: int) -> int | None:
+    """Protect matching backtick runs across lines; uncertainty protects to EOF."""
+    delimiter = None
+    for index in range(start, len(lines)):
+        line = lines[index]
+        for match in re.finditer(r"`+", line):
+            if delimiter is None:
+                prefix = line[: match.start()]
+                if (len(prefix) - len(prefix.rstrip("\\"))) % 2:
+                    continue
+                delimiter = len(match[0])
+            elif len(match[0]) == delimiter:
+                delimiter = None
+        if delimiter is None:
+            return index + 1 if index > start else None
+    return len(lines)
+
+
+def _rule_line(line: str) -> str:
+    # Markdown hard breaks are semantic, unlike ordinary trailing padding.
+    return line if line.endswith("  ") and line.strip() else line.rstrip(" \t")
+
+
+def _complete_list_items(blocks: list[_RuleBlock]) -> list[_RuleBlock]:
+    """Keep lazy prose, nested lists and opaque code attached to their item."""
+    result = []
+    index = 0
+    while index < len(blocks):
+        first = blocks[index]
+        if first.kind != "list":
+            result.append(first)
+            index += 1
+            continue
+        indent = len(first.lines[0]) - len(first.lines[0].lstrip())
+        end = index + 1
+        while end < len(blocks):
+            following = blocks[end]
+            line = following.lines[0]
+            next_indent = len(line) - len(line.lstrip())
+            if next_indent <= indent and (
+                following.kind == "heading" or following.scope != first.scope
+            ):
+                break
+            if following.kind == "list" and next_indent <= indent:
+                break
+            if following.kind == "blank":
+                lookahead = end + 1
+                while lookahead < len(blocks) and blocks[lookahead].kind == "blank":
+                    lookahead += 1
+                if lookahead == len(blocks):
+                    break
+                next_line = blocks[lookahead].lines[0]
+                if len(next_line) - len(next_line.lstrip()) <= indent:
+                    break
+            elif not blocks[end - 1].lines[-1].strip() and next_indent <= indent:
+                break
+            end += 1
+        lines = []
+        for part in blocks[index:end]:
+            lines.extend(
+                part.lines
+                if part.kind in {"protected", "dynamic"}
+                else [_rule_line(line) for line in part.lines]
+            )
+        result.append(_RuleBlock("list", lines, first.line, first.scope))
+        index = end
+    return result
 
 
 def _scan_rules(content: str) -> list[_RuleBlock]:
-    """Conservative block scanner; uncertain Markdown remains opaque."""
+    """Track heading ancestry and complete opaque/list boundaries before rewriting."""
     lines = content.replace("\r\n", "\n").split("\n")
     blocks = []
+    headings = []
     index = 0
     while index < len(lines):
         start = index
         line = lines[index]
+        heading = re.match(r"^ {0,3}(#{1,6})(?:[ \t]+|$)", line)
+        heading_level = None
         fence = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
         if index == 0 and line.lstrip("\ufeff") == "---":
             index += 1
@@ -182,27 +255,36 @@ def _scan_rules(content: str) -> list[_RuleBlock]:
                 if closing:
                     break
             kind = "protected"
-        elif re.fullmatch(
-            r"(?:#{1,6}\s+)?Dynamic Runtime Context\s*:?\s*|<!-- Dynamic Runtime Context \(isolated for prompt caching\) -->",
-            line,
-            re.I,
+        elif (
+            "`" in line
+            and ("<!--" not in line or line.index("`") < line.index("<!--"))
+            and (inline_end := _inline_code_end(lines, index)) is not None
         ):
-            heading = re.match(r"^(#+) ", line)
-            level = len(heading[1]) if heading else 6
-            index += 1
-            while index < len(lines):
-                next_heading = re.match(r"^(#{1,6})\s+", lines[index])
-                if next_heading and len(next_heading[1]) <= level:
-                    break
-                index += 1
-            kind = "dynamic"
+            index = inline_end
+            kind = "protected"
+            heading_level = len(heading[1]) if heading else None
         elif (
             index + 1 < len(lines)
             and line.strip()
             and re.fullmatch(r" {0,3}(?:=+|-+)[ \t]*", lines[index + 1])
         ):
+            heading_level = 1 if lines[index + 1].lstrip().startswith("=") else 2
             index += 2
-            kind = "protected"  # Setext heading: retain its complete two-line form.
+            kind = "protected"
+        elif re.fullmatch(
+            r"(?:#{1,6}\s+)?Dynamic Runtime Context\s*:?\s*|<!-- Dynamic Runtime Context \(isolated for prompt caching\) -->",
+            line,
+            re.I,
+        ):
+            heading_level = len(heading[1]) if heading else None
+            level = heading_level or 6
+            index += 1
+            while index < len(lines):
+                next_heading = re.match(r"^ {0,3}(#{1,6})(?:[ \t]+|$)", lines[index])
+                if next_heading and len(next_heading[1]) <= level:
+                    break
+                index += 1
+            kind = "dynamic"
         elif "<!--" in line:
             index += 1
             if "-->" not in line.split("<!--", 1)[1]:
@@ -211,12 +293,18 @@ def _scan_rules(content: str) -> list[_RuleBlock]:
                     index += 1
                     if end:
                         break
+            # If opaque constructs overlap, retain the union rather than exposing
+            # a continuation as ordinary prose.
+            for boundary in {start, index - 1}:
+                if "`" in lines[boundary]:
+                    index = max(index, _inline_code_end(lines, boundary) or index)
             kind = "protected"
         else:
             index += 1
             if not line.strip():
                 kind = "blank"
-            elif re.match(r"^#{1,6}\s", line):
+            elif heading:
+                heading_level = len(heading[1])
                 kind = "heading"
             elif re.match(r"^\s*(?:[-+*]|\d+[.)])\s", line):
                 kind = "list"
@@ -228,8 +316,14 @@ def _scan_rules(content: str) -> list[_RuleBlock]:
                     index += 1
             else:
                 kind = "prose"
-        blocks.append(_RuleBlock(kind, lines[start:index], start + 1))
-    return blocks
+        if heading_level is not None:
+            while headings and headings[-1][0] >= heading_level:
+                headings.pop()
+        scope = tuple(position for _, position in headings)
+        if heading_level is not None:
+            headings.append((heading_level, start + 1))
+        blocks.append(_RuleBlock(kind, lines[start:index], start + 1, scope))
+    return _complete_list_items(blocks)
 
 
 def _safe_dynamic(block: _RuleBlock) -> bool:
@@ -264,7 +358,7 @@ def _safe_dynamic(block: _RuleBlock) -> bool:
     return found
 
 
-_DYNAMIC_MARKER = "<!-- Dynamic Runtime Context (isolated for prompt caching) -->"
+_DYNAMIC_MARKER = "# Dynamic Runtime Context"
 _STANDALONE_METADATA = re.compile(
     r"(?:Current Date|Current Time|Timestamp|Generated Date|Session(?: ID|_id)|Request(?: ID|_id))\s*[:=]\s*.+",
     re.I,
@@ -275,6 +369,7 @@ def _standalone_metadata(block: _RuleBlock) -> bool:
     line = block.lines[0]
     return (
         block.kind == "prose"
+        and not block.scope
         and line == line.lstrip()
         and not line.endswith("  ")
         and bool(_STANDALONE_METADATA.fullmatch(line))
@@ -307,41 +402,26 @@ def _canonical_rules(content: str, *, optimize: bool) -> str:
     blocks = _scan_rules(content)
     output = []
     dynamic = []
-    dynamic_marker = None
-    in_list = False
     previous_rule = None
-    section = 0
-    next_content = [None] * len(blocks)
-    following = None
-    for index in range(len(blocks) - 1, -1, -1):
-        next_content[index] = following
-        if blocks[index].kind != "blank":
-            following = blocks[index]
-    for index, block in enumerate(blocks):
-        if block.kind in {"blank", "heading"}:
-            in_list = False
-        elif block.kind == "list":
-            in_list = True
-        if optimize and not in_list and _standalone_metadata(block):
+    for block in blocks:
+        if optimize and _standalone_metadata(block):
             dynamic.append(block.lines[0].rstrip(" \t"))
             previous_rule = None
             continue
-        if block.kind == "dynamic" and _safe_dynamic(block) and optimize:
-            dynamic_marker = dynamic_marker or block.lines[0]
+        if block.kind == "dynamic" and not block.scope and _safe_dynamic(block) and optimize:
             dynamic.extend(line for line in block.lines[1:] if line.strip())
             previous_rule = None
             continue
-        if block.kind in {"protected", "dynamic"}:
+        if block.kind in {"protected", "dynamic"} or (
+            block.kind == "list" and len(block.lines) > 1
+        ):
             output.extend(block.lines)
             previous_rule = None
             continue
         line = block.lines[0]
         # Two spaces are Markdown's semantic hard break; otherwise trim padding.
         hard_break = line.endswith("  ") and bool(line.strip())
-        if not hard_break:
-            line = line.rstrip(" \t")
-        if block.kind == "heading":
-            section += 1
+        line = _rule_line(line)
         if optimize and block.kind == "prose" and not hard_break and _boilerplate(line):
             continue
         if block.kind == "blank":
@@ -349,27 +429,19 @@ def _canonical_rules(content: str, *, optimize: bool) -> str:
             if output and output[-1] != "":
                 output.append("")
             continue
-        # Only adjacent, childless simple bullets share an unambiguous scope.
-        nested = False
+        # Boundaries already include all continuation/child content.
         indent = len(line) - len(line.lstrip(" \t"))
-        following = next_content[index]
-        if following is not None:
-            next_line = following.lines[0]
-            nested = (
-                bool(next_line.strip()) and len(next_line) - len(next_line.lstrip(" \t")) > indent
-            )
         simple = (
             block.kind == "list"
             and indent == 0
             and bool(re.match(r"^\s*[-+*]\s", line))
-            and not nested
             and not hard_break
             and not re.search(r"[`<>]|https?://", line)
         )
         rule_text = line[indent:]
         if re.fullmatch(r"[-+*] [A-Za-z ,.!?;:-]+", rule_text):
             rule_text = re.sub(r"[ \t]+", " ", rule_text)
-        key = (section, line[:indent], rule_text) if simple else None
+        key = (block.scope, line[:indent], rule_text) if simple else None
         if optimize and key is not None and key == previous_rule:
             continue
         previous_rule = key
@@ -382,7 +454,7 @@ def _canonical_rules(content: str, *, optimize: bool) -> str:
     if dynamic:
         if output:
             output.append("")
-        output.append("\n".join([dynamic_marker or _DYNAMIC_MARKER, *dynamic]))
+        output.append("\n".join([_DYNAMIC_MARKER, *dynamic]))
     return "\n".join(output).rstrip("\n") + "\n"
 
 

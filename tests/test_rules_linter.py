@@ -35,13 +35,13 @@ def test_optimize_rules_strips_boilerplate_and_aligns_cache():
     res = optimize_rules(SAMPLE_RULES_BAD)
     assert res["optimized_tokens"] < res["original_tokens"]
     assert res["savings_pct"] > 0
-    assert res["is_cache_friendly"] is True
+    assert res["is_cache_friendly"] is False
 
     opt_text = res["optimized_content"]
     assert "You are a helpful coding assistant" not in opt_text
     assert "Please make sure to always remember" not in opt_text
-    # Full standalone whitelist metadata can move; ordinary instructions cannot.
-    assert "Dynamic Runtime Context" in opt_text
+    # Metadata under Project Guidelines must keep that section scope.
+    assert "Dynamic Runtime Context" not in opt_text
     assert "Current Date: 2026-09-20T14:39:40" in opt_text
     assert "- Always run tests before committing." in opt_text
 
@@ -305,7 +305,7 @@ def test_rules_nonempty_expansion_has_signed_percentage():
     ],
 )
 def test_rules_standalone_metadata_canonical_suffix_and_stable_prefix(date, session):
-    marker = "<!-- Dynamic Runtime Context (isolated for prompt caching) -->"
+    marker = "# Dynamic Runtime Context"
     content = f"Current Date: {date}\nSession_id: {session}\n# Rules\n- Run tests.\n"
     expected_prefix = "# Rules\n- Run tests.\n\n"
     expected = expected_prefix + marker + f"\nCurrent Date: {date}\nSession_id: {session}\n"
@@ -330,7 +330,7 @@ def test_rules_standalone_metadata_canonical_suffix_and_stable_prefix(date, sess
 def test_rules_standalone_metadata_whitelist(line):
     content = line + "\n# Rules\n- Run tests.\n"
     output = optimize_rules(content)["optimized_content"]
-    assert output.startswith("# Rules\n- Run tests.\n\n<!-- Dynamic Runtime Context")
+    assert output.startswith("# Rules\n- Run tests.\n\n# Dynamic Runtime Context")
     assert output.endswith(line + "\n")
     assert optimize_rules(output)["optimized_content"] == output
 
@@ -375,7 +375,7 @@ def test_rules_standalone_metadata_respects_protected_and_list_context(wrapper):
 
 
 def test_rules_standalone_metadata_merges_existing_safe_dynamic_blocks():
-    marker = "<!-- Dynamic Runtime Context (isolated for prompt caching) -->"
+    marker = "# Dynamic Runtime Context"
     content = (
         "Current Date: 2026-10-20\n" + marker + "\nSession_id: abcdef0123456789\n"
         "# Rules\n- Run tests.\n\n" + marker + "\nRequest ID: request-123\n"
@@ -389,3 +389,107 @@ def test_rules_standalone_metadata_merges_existing_safe_dynamic_blocks():
         + "\nCurrent Date: 2026-10-20\nSession_id: abcdef0123456789\nRequest ID: request-123\n"
     )
     assert optimize_rules(output)["optimized_content"] == output
+
+
+@pytest.mark.parametrize(
+    "transform", [minify_rules, lambda text: optimize_rules(text)["optimized_content"]]
+)
+def test_review_dynamic_metadata_retains_parent_section_scope(transform):
+    content = "# Staging\n## Dynamic Runtime Context\nWorkspace: /srv/staging\n\n# Production\n## Dynamic Runtime Context\nWorkspace: /srv/production\n"
+    output = transform(content)
+    assert output == content
+    staging, production = output.split("# Production\n")
+    assert "/srv/staging" in staging and "/srv/production" not in staging
+    assert "/srv/production" in production and "/srv/staging" not in production
+    assert transform(output) == output
+
+
+@pytest.mark.parametrize("delimiter", ["`", "``", "````"])
+def test_review_multiline_inline_code_is_atomic(delimiter):
+    content = f"Prose {delimiter}BEGIN\nHello Claude!\nEND{delimiter}\n"
+    for transform in (minify_rules, lambda text: optimize_rules(text)["optimized_content"]):
+        assert transform(content) == content
+        assert transform(transform(content)) == content
+
+
+def test_review_exact_multiline_inline_code():
+    content = "`BEGIN\nHello Claude!\nEND`\n"
+    assert optimize_rules(content)["optimized_content"] == content
+
+
+@pytest.mark.parametrize(
+    "continuation",
+    [
+        "with coverage before release.",
+        "  with coverage before release.",
+        "    - with coverage before release.",
+        "    ```sh\n    uv run pytest --cov\n    ```",
+        "    uv run pytest --cov",
+        "Hello Claude!",
+    ],
+)
+def test_review_list_item_with_continuation_is_not_a_simple_duplicate(continuation):
+    content = "- Run tests.\n- Run tests.\n" + continuation + "\n"
+    assert optimize_rules(content)["optimized_content"] == content
+    assert (
+        optimize_rules(optimize_rules(content)["optimized_content"])["optimized_content"] == content
+    )
+
+
+def test_review_complete_simple_list_items_can_still_be_deduplicated():
+    content = "- Run tests.\n- Run tests.\n"
+    assert optimize_rules(content)["optimized_content"] == "- Run tests.\n"
+
+
+@pytest.mark.parametrize("header", ["# Staging", "Staging\n=======", "## Staging"])
+@pytest.mark.parametrize("metadata", ["Current Date: 2026-10-20", "Session_id: staging123"])
+def test_review_standalone_metadata_inside_heading_scope_is_not_relocated(header, metadata):
+    content = header + "\n" + metadata + "\n# Production\n- Run tests.\n"
+    assert optimize_rules(content)["optimized_content"] == content
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "## Dynamic Runtime Context",
+        "<!-- Dynamic Runtime Context (isolated for prompt caching) -->",
+    ],
+)
+def test_review_dynamic_scope_is_not_reconstructed_from_rendered_marker(marker):
+    content = (
+        "# Staging\n"
+        + marker
+        + "\nWorkspace: /srv/staging\n\n# Production\n"
+        + marker
+        + "\nWorkspace: /srv/production\n"
+    )
+    assert optimize_rules(content)["optimized_content"] == content
+
+
+@pytest.mark.parametrize("delimiter", ["`", "``"])
+def test_review_unclosed_inline_code_keeps_uncertain_remainder(delimiter):
+    content = "Prose " + delimiter + "BEGIN\nHello Claude!\nCurrent Date: 2026-10-20\n"
+    assert optimize_rules(content)["optimized_content"] == content
+
+
+def test_review_inline_code_delimiter_lengths_and_literal_backticks():
+    content = "Text ``BEGIN\n`\nHello Claude!\nEND``\n"
+    assert optimize_rules(content)["optimized_content"] == content
+
+
+def test_review_child_heading_belongs_to_complete_list_item():
+    content = "- Run tests.\n- Run tests.\n  ## Coverage\n  with coverage before release.\n"
+    assert optimize_rules(content)["optimized_content"] == content
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "`BEGIN <!-- marker -->\nHello Claude!\nEND`\n",
+        "<!-- `BEGIN\n`\nHello Claude!\n-->\n",
+        "<!-- marker --> `BEGIN\nHello Claude!\nEND`\n",
+        "`BEGIN\n---\nHello Claude!\nEND`\n",
+    ],
+)
+def test_review_overlapping_opaque_boundaries_never_expose_code_or_comment_content(content):
+    assert optimize_rules(content)["optimized_content"] == content

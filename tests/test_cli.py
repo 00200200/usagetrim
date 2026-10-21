@@ -699,7 +699,8 @@ def test_cli_rules_optimize(tmp_path):
     assert "You are an expert" in bak_file.read_text()
     assert "You are an expert" not in target.read_text()
     assert "Current Date: 2026-09-22" in target.read_text()
-    assert "Dynamic Runtime Context" in target.read_text()
+    # The date belongs to Guidelines and must not be lifted into a global suffix.
+    assert "Dynamic Runtime Context" not in target.read_text()
 
 
 def test_cli_install_codex_and_profile(tmp_path, monkeypatch):
