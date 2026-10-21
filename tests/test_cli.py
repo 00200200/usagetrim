@@ -551,6 +551,83 @@ def test_cli_pack_output(tmp_path):
     assert "hello world" in out.read_text()
 
 
+def test_cli_pack_modes_formats_focus_and_budget(tmp_path, monkeypatch):
+    import xml.etree.ElementTree as ET
+
+    from usagetrim.metrics.tokenizer import count_tokens
+
+    monkeypatch.setenv("USAGETRIM_CACHE_DIR", str(tmp_path / "cache"))
+    core = tmp_path / "src" / "core"
+    core.mkdir(parents=True)
+    (core / "service.py").write_text("def service():\n" + "    return 1\n" * 80)
+    (tmp_path / "api.py").write_text("def api():\n" + "    return 2\n" * 80)
+    xml = runner.invoke(
+        app,
+        [
+            "pack",
+            "--root",
+            str(tmp_path),
+            "--mode",
+            "hybrid",
+            "--focus",
+            "src/core/",
+            "--budget",
+            "800",
+        ],
+    )
+    assert xml.exit_code == 0, xml.output
+    document = ET.fromstring(xml.stdout)
+    assert document.find("file_summary").attrib["mode"] == "hybrid"
+    assert count_tokens(xml.stdout).openai <= 800
+    markdown = runner.invoke(
+        app, ["pack", "--root", str(tmp_path), "--format", "markdown", "--mode", "full"]
+    )
+    assert markdown.exit_code == 0 and "## Directory Structure" in markdown.stdout
+    assert "### File: api.py (full)" in markdown.stdout
+
+
+def test_cli_pack_rejects_invalid_modes_and_legacy_conflict(tmp_path):
+    (tmp_path / "a.py").write_text("def a(): pass\n")
+    for options in (
+        ["--mode", "unknown"],
+        ["--format", "json"],
+        ["--skeleton", "--mode", "full"],
+        ["--focus", "a.py"],
+    ):
+        result = runner.invoke(app, ["pack", "--root", str(tmp_path), *options])
+        assert result.exit_code == 2
+
+
+def test_cli_pack_repeatable_focus_positional_paths_and_strip_comments(tmp_path):
+    (tmp_path / "first.py").write_text("# first comment\ndef first(): return 1\n")
+    (tmp_path / "second.py").write_text("# second comment\ndef second(): return 2\n")
+    (tmp_path / "other.py").write_text("def other(): return 3\n")
+    result = runner.invoke(
+        app,
+        [
+            "pack",
+            "first.py",
+            "second.py",
+            "--root",
+            str(tmp_path),
+            "--mode",
+            "hybrid",
+            "--focus",
+            "first.py",
+            "--focus",
+            "second.py",
+            "--strip-comments",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert {file["path"] for file in payload["files"]} == {"first.py", "second.py"}
+    assert all(not file["is_skeleton"] for file in payload["files"])
+    assert "first comment" not in payload["bundle_text"]
+    assert "second comment" not in payload["bundle_text"]
+
+
 def test_cli_distill(tmp_path):
     f = tmp_path / "chat.txt"
     f.write_text("User: Build feature in src/app.py\n\nAssistant: We decided to use SQLite.\n")
