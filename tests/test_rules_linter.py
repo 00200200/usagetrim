@@ -493,3 +493,70 @@ def test_review_child_heading_belongs_to_complete_list_item():
 )
 def test_review_overlapping_opaque_boundaries_never_expose_code_or_comment_content(content):
     assert optimize_rules(content)["optimized_content"] == content
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~"])
+@pytest.mark.parametrize("gap", ["\n", ""])
+def test_block_bound_inline_cannot_consume_following_fence(fence, gap):
+    block = f"{fence}text\nsome ` literal inside fence\nHello Claude!\n{fence}\n"
+    content = "Paragraph with unmatched ` literal\n" + gap + block
+    for transform in (minify_rules, lambda text: optimize_rules(text)["optimized_content"]):
+        output = transform(content)
+        assert output == content
+        assert block in output
+        assert transform(output) == output
+
+
+@pytest.mark.parametrize("parent_level", [1, 2])
+@pytest.mark.parametrize("comment", [" <!-- env -->", ""])
+def test_heading_with_inline_html_keeps_ancestry(parent_level, comment):
+    from usagetrim.core.rules_linter import _scan_rules
+
+    parent = "#" * parent_level
+    child = "#" * (parent_level + 1)
+    content = f"{parent} Staging{comment}\n{child} Dynamic Runtime Context\nWorkspace: /srv/staging\n\n{parent} Production{comment}\n{child} Dynamic Runtime Context\nWorkspace: /srv/production\n"
+    output = optimize_rules(content)["optimized_content"]
+    assert output == content
+    staging, production = output.split(f"{parent} Production{comment}\n")
+    assert "/srv/staging" in staging and "/srv/production" not in staging
+    assert "/srv/production" in production and "/srv/staging" not in production
+    dynamic = [block for block in _scan_rules(content) if block.kind == "dynamic"]
+    assert [block.scope for block in dynamic] == [(1,), (5,)]
+    assert optimize_rules(output)["optimized_content"] == output
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~"])
+def test_fence_remains_an_independent_atomic_scanner_block(fence):
+    from usagetrim.core.rules_linter import _scan_rules
+
+    body = [fence + "text", "some ` literal", "Hello Claude!", fence]
+    blocks = _scan_rules("Paragraph ` literal\n\n" + "\n".join(body) + "\n")
+    assert any(block.kind == "protected" and block.lines == body for block in blocks)
+    assert blocks[0].lines == ["Paragraph ` literal"]
+    assert blocks[0].uncertain
+
+
+def test_child_heading_inline_comment_keeps_full_parent_chain():
+    from usagetrim.core.rules_linter import _scan_rules
+
+    content = "## Staging <!-- env -->\n### Child <!-- note -->\n#### Dynamic Runtime Context\nWorkspace: /srv/staging\n\n## Production <!-- env -->\n### Child <!-- note -->\n#### Dynamic Runtime Context\nWorkspace: /srv/production\n"
+    assert optimize_rules(content)["optimized_content"] == content
+    dynamic = [block for block in _scan_rules(content) if block.kind == "dynamic"]
+    assert [block.scope for block in dynamic] == [(1, 2), (6, 7)]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Paragraph `BEGIN\nHello Claude!\nEND`\n\n```text\nsome ` literal\nHello Claude!\n```\n",
+        "Paragraph ``BEGIN\n`\nHello Claude!\nEND``\n\n~~~text\n` literal\nHello Claude!\n~~~\n",
+        "Paragraph `BEGIN <!-- marker -->\nHello Claude!\nEND`\n",
+        "<!-- marker --> `BEGIN\nHello Claude!\nEND`\n",
+        "Staging <!-- env -->\n==================\n## Dynamic Runtime Context\nWorkspace: /srv/staging\n",
+        "- Run tests.\n- Run tests.\n    ~~~text\n    some ` literal\n    Hello Claude!\n    ~~~\n",
+    ],
+)
+def test_targeted_block_collision_self_review_preserves_content(content):
+    for transform in (minify_rules, lambda text: optimize_rules(text)["optimized_content"]):
+        assert transform(content) == content
+        assert transform(transform(content)) == content

@@ -154,12 +154,31 @@ class _RuleBlock:
     lines: list[str]
     line: int
     scope: tuple[int, ...] = ()
+    uncertain: bool = False
 
 
-def _inline_code_end(lines: list[str], start: int) -> int | None:
-    """Protect matching backtick runs across lines; uncertainty protects to EOF."""
+def _starts_markdown_block(lines: list[str], index: int) -> bool:
+    line = lines[index]
+    if not line.strip():
+        return True
+    if re.match(
+        r"^(?: {0,3}(?:`{3,}|~{3,}|#{1,6}(?:[ \t]|$)|>|<!--|(?:[-+*]|\d+[.)])[ \t])| {4}|\t)", line
+    ):
+        return True
+    if re.fullmatch(r" {0,3}(?:(?:[ *_-]\s*){3,}|=+|-+)[ \t]*", line):
+        return True
+    if re.fullmatch(r"Dynamic Runtime Context\s*:?\s*", line, re.I):
+        return True
+    # A Setext heading begins at its title, not at the underline.
+    return index + 1 < len(lines) and bool(re.fullmatch(r" {0,3}(?:=+|-+)[ \t]*", lines[index + 1]))
+
+
+def _inline_code_end(lines: list[str], start: int) -> tuple[int, bool] | None:
+    """Return (end, closed) within one block; never seek a close in a new block."""
     delimiter = None
     for index in range(start, len(lines)):
+        if index > start and _starts_markdown_block(lines, index):
+            return index, False
         line = lines[index]
         for match in re.finditer(r"`+", line):
             if delimiter is None:
@@ -170,8 +189,8 @@ def _inline_code_end(lines: list[str], start: int) -> int | None:
             elif len(match[0]) == delimiter:
                 delimiter = None
         if delimiter is None:
-            return index + 1 if index > start else None
-    return len(lines)
+            return (index + 1, True) if index > start else None
+    return len(lines), False
 
 
 def _rule_line(line: str) -> str:
@@ -220,7 +239,15 @@ def _complete_list_items(blocks: list[_RuleBlock]) -> list[_RuleBlock]:
                 if part.kind in {"protected", "dynamic"}
                 else [_rule_line(line) for line in part.lines]
             )
-        result.append(_RuleBlock("list", lines, first.line, first.scope))
+        result.append(
+            _RuleBlock(
+                "list",
+                lines,
+                first.line,
+                first.scope,
+                any(part.uncertain for part in blocks[index:end]),
+            )
+        )
         index = end
     return result
 
@@ -236,6 +263,7 @@ def _scan_rules(content: str) -> list[_RuleBlock]:
         line = lines[index]
         heading = re.match(r"^ {0,3}(#{1,6})(?:[ \t]+|$)", line)
         heading_level = None
+        uncertain = False
         fence = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
         if index == 0 and line.lstrip("\ufeff") == "---":
             index += 1
@@ -255,12 +283,20 @@ def _scan_rules(content: str) -> list[_RuleBlock]:
                 if closing:
                     break
             kind = "protected"
+        elif line.startswith(("    ", "\t")) and not re.match(r"^\s*(?:[-+*]|\d+[.)])\s", line):
+            index += 1
+            while index < len(lines) and (
+                not lines[index].strip() or lines[index].startswith(("    ", "\t"))
+            ):
+                index += 1
+            kind = "protected"
         elif (
             "`" in line
             and ("<!--" not in line or line.index("`") < line.index("<!--"))
             and (inline_end := _inline_code_end(lines, index)) is not None
         ):
-            index = inline_end
+            index, closed = inline_end
+            uncertain = not closed
             kind = "protected"
             heading_level = len(heading[1]) if heading else None
         elif (
@@ -297,8 +333,13 @@ def _scan_rules(content: str) -> list[_RuleBlock]:
             # a continuation as ordinary prose.
             for boundary in {start, index - 1}:
                 if "`" in lines[boundary]:
-                    index = max(index, _inline_code_end(lines, boundary) or index)
+                    inline_end = _inline_code_end(lines, boundary)
+                    if inline_end is not None:
+                        end, closed = inline_end
+                        index = max(index, end)
+                        uncertain |= not closed
             kind = "protected"
+            heading_level = len(heading[1]) if heading else None
         else:
             index += 1
             if not line.strip():
@@ -308,12 +349,6 @@ def _scan_rules(content: str) -> list[_RuleBlock]:
                 kind = "heading"
             elif re.match(r"^\s*(?:[-+*]|\d+[.)])\s", line):
                 kind = "list"
-            elif line.startswith(("    ", "\t")):
-                kind = "protected"
-                while index < len(lines) and (
-                    not lines[index].strip() or lines[index].startswith(("    ", "\t"))
-                ):
-                    index += 1
             else:
                 kind = "prose"
         if heading_level is not None:
@@ -322,7 +357,7 @@ def _scan_rules(content: str) -> list[_RuleBlock]:
         scope = tuple(position for _, position in headings)
         if heading_level is not None:
             headings.append((heading_level, start + 1))
-        blocks.append(_RuleBlock(kind, lines[start:index], start + 1, scope))
+        blocks.append(_RuleBlock(kind, lines[start:index], start + 1, scope, uncertain))
     return _complete_list_items(blocks)
 
 
@@ -400,6 +435,10 @@ def _boilerplate(line: str) -> bool:
 
 def _canonical_rules(content: str, *, optimize: bool) -> str:
     blocks = _scan_rules(content)
+    if any(block.uncertain for block in blocks):
+        # Literal/unclosed backticks are ambiguous: preserve the document rather
+        # than exposing possibly protected instructions to any transformation.
+        return content.replace("\r\n", "\n").rstrip("\n") + "\n"
     output = []
     dynamic = []
     previous_rule = None
