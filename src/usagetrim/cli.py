@@ -119,6 +119,36 @@ def _emit(text: str) -> str:
     return emitted
 
 
+@app.command("pricing")
+def pricing_command(
+    model: Annotated[
+        str | None, typer.Argument(help="Optional model ID from the pricing registry.")
+    ] = None,
+):
+    """Show static reference model rates in USD per million tokens."""
+    from usagetrim.metrics.pricing import PRICING_TABLE
+
+    if model is not None and model not in PRICING_TABLE:
+        raise typer.BadParameter(f"Unknown model: {model}", param_hint="MODEL")
+    table = Table(
+        title="Static reference rates (USD per 1M tokens)",
+        caption="Rates may change. Cache Write uses the modeled TTL; — means no rate modeled.",
+    )
+    table.add_column("Model", no_wrap=True)
+    for column in ("Input", "Output", "Cache Read", "Cache Write"):
+        table.add_column(column, justify="right", no_wrap=True)
+    for model_id in [model] if model is not None else sorted(PRICING_TABLE):
+        pricing = PRICING_TABLE[model_id]
+        rates = (
+            pricing.input_per_million,
+            pricing.output_per_million,
+            pricing.cache_read_per_million,
+            pricing.cache_write_per_million,
+        )
+        table.add_row(model_id, *("—" if rate is None else f"${rate:g}" for rate in rates))
+    console.print(table)
+
+
 memory_app = typer.Typer(name="memory", help="Manage task memory retention.", no_args_is_help=True)
 app.add_typer(memory_app, name="memory")
 
