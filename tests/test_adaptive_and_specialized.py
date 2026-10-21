@@ -1,5 +1,6 @@
 import json
 import re
+import sqlite3
 
 import pytest
 
@@ -38,6 +39,7 @@ from usagetrim.core.specialized import (
     filter_mypy,
     filter_nextjs,
     filter_npm_install,
+    filter_otel_trace,
     filter_pip_install,
     filter_puppet_run,
     filter_pyright,
@@ -3271,3 +3273,814 @@ def test_filter_cloud_logs_reduces_provider_tokens_by_more_than_75_percent(provi
     assert reduction_pct > 75.0, (
         f"{provider}: {reduction_pct:.2f}% reduction ({raw_tokens}->{output_tokens})"
     )
+
+
+_TRACE_ID = "a" * 32
+_TRACE_BASE_US = 1792411200123456
+
+
+def _trace_export(provider, definitions):
+    """Build equivalent authored exports using each provider's actual wire shape."""
+    services = list(dict.fromkeys(item.get("service", "checkout") for item in definitions))
+
+    def otlp_attributes(values):
+        return [
+            {
+                "key": key,
+                "value": {
+                    "boolValue"
+                    if type(value) is bool
+                    else "intValue"
+                    if type(value) is int
+                    else "stringValue": value
+                },
+            }
+            for key, value in values.items()
+        ]
+
+    def tags(values):
+        return [
+            {
+                "key": key,
+                "type": "bool"
+                if type(value) is bool
+                else "int64"
+                if type(value) is int
+                else "string",
+                "value": value,
+            }
+            for key, value in values.items()
+        ]
+
+    records = []
+    for definition in definitions:
+        attributes = definition.get("attributes", {})
+        span_id = f"{definition['id']:016x}"
+        parent = definition.get("parent")
+        start = _TRACE_BASE_US + definition.get("start", 0)
+        duration = definition.get("duration", 100)
+        if provider == "jaeger":
+            record = {
+                "traceID": _TRACE_ID,
+                "spanID": span_id,
+                "operationName": definition["name"],
+                "startTime": start,
+                "duration": duration,
+                "processID": "p" + str(services.index(definition.get("service", "checkout"))),
+                "tags": tags(attributes),
+                "logs": [],
+                "warnings": None,
+                "references": [],
+            }
+            if parent:
+                record["references"] = [
+                    {"refType": "CHILD_OF", "traceID": _TRACE_ID, "spanID": f"{parent:016x}"}
+                ]
+            if definition.get("error"):
+                record["tags"] += tags({"error": True})
+            if "exception" in definition:
+                record["logs"] = [
+                    {
+                        "timestamp": start,
+                        "fields": tags({"event": "error", **definition["exception"]}),
+                    }
+                ]
+        else:
+            record = {
+                "traceId": _TRACE_ID,
+                "spanId": span_id,
+                "name": definition["name"],
+                "startTimeUnixNano": str(start * 1000),
+                "endTimeUnixNano": str((start + duration) * 1000),
+                "kind": 3,
+                "status": {"code": 2 if definition.get("error") else 0},
+                "attributes": otlp_attributes(attributes),
+            }
+            if parent:
+                record["parentSpanId"] = f"{parent:016x}"
+            if "exception" in definition:
+                record["events"] = [
+                    {
+                        "name": "exception",
+                        "timeUnixNano": str(start * 1000),
+                        "attributes": otlp_attributes(definition["exception"]),
+                    }
+                ]
+        records.append(record)
+    if provider == "jaeger":
+        processes = {
+            "p" + str(i): {
+                "serviceName": service,
+                "tags": tags(
+                    {"host.name": "controlled-host", "telemetry.sdk.name": "opentelemetry"}
+                ),
+            }
+            for i, service in enumerate(services)
+        }
+        return {"data": [{"traceID": _TRACE_ID, "spans": records, "processes": processes}]}
+    return {
+        "resourceSpans": [
+            {
+                "resource": {
+                    "attributes": otlp_attributes(
+                        {
+                            "service.name": service,
+                            "service.version": "1.2.0",
+                            "host.name": "controlled-host",
+                            "telemetry.sdk.name": "opentelemetry",
+                        }
+                    )
+                },
+                "scopeSpans": [
+                    {
+                        "scope": {"name": "controlled.instrumentation", "version": "1.0"},
+                        "spans": [
+                            record
+                            for record, definition in zip(records, definitions, strict=True)
+                            if definition.get("service", "checkout") == service
+                        ],
+                    }
+                ],
+            }
+            for service in services
+        ]
+    }
+
+
+def _trace_records(document, provider):
+    if provider == "jaeger":
+        return document["data"][0]["spans"]
+    return [
+        record
+        for resource in document["resourceSpans"]
+        for scope in resource["scopeSpans"]
+        for record in scope["spans"]
+    ]
+
+
+@pytest.mark.parametrize("provider", ["jaeger", "otlp"])
+def test_otel_trace_minimal_tree_service_and_raw_recovery(provider):
+    document = _trace_export(
+        provider,
+        [
+            {"id": 1, "name": "POST /checkout", "duration": 1000},
+            {
+                "id": 2,
+                "parent": 1,
+                "name": "inventory reserve",
+                "service": "inventory",
+                "start": 100,
+                "duration": 200,
+            },
+        ],
+    )
+    raw = json.dumps(document, indent=2)
+    output = filter_otel_trace(raw)
+    assert f"Trace {_TRACE_ID} — observed 1ms" in output
+    assert 'checkout "POST /checkout" 1ms ROOT SLOW' in output
+    assert '  inventory "inventory reserve" 0.2ms SLOW' in output
+    ref = re.search(r"tc_[a-f0-9]+", output).group()
+    assert ContextCache().retrieve(ref) == raw
+    assert output.count("UsageTrim: full output") == 1
+    if provider == "jaeger":
+        assert filter_otel_trace(json.dumps(document["data"][0])) != json.dumps(document["data"][0])
+
+
+@pytest.mark.parametrize("provider", ["jaeger", "otlp"])
+def test_otel_trace_threshold_overlap_and_exact_nanosecond_strings(provider):
+    document = _trace_export(
+        provider,
+        [
+            {"id": 1, "name": "root", "duration": 1000},
+            {"id": 2, "parent": 1, "name": "exact", "start": 1, "duration": 150},
+            {"id": 3, "parent": 1, "name": "slow", "start": 1, "duration": 151},
+            {"id": 4, "parent": 1, "name": "overlap", "start": 1, "duration": 800},
+        ]
+        + [
+            {"id": i, "parent": 1, "name": "cache GET", "start": i, "duration": 1}
+            for i in range(5, 15)
+        ],
+    )
+    output = filter_otel_trace(json.dumps(document, indent=2))
+    assert '"exact" 0.15ms\n' in output
+    assert '"slow" 0.151ms SLOW' in output
+    assert '"overlap" 0.8ms SLOW' in output
+    assert "observed 1ms" in output
+
+
+@pytest.mark.parametrize("provider", ["jaeger", "otlp"])
+def test_otel_trace_exception_values_and_ancestors_survive_redacted(provider):
+    secret = "ghp_" + "a" * 36
+    exception = {
+        "exception.type": "PaymentDeclined",
+        "exception.message": "拒否 " + secret,
+        "exception.stacktrace": "Traceback:\n  charge()\nPaymentDeclined: refused\n",
+    }
+    document = _trace_export(
+        provider,
+        [
+            {"id": 1, "name": "root", "duration": 1000},
+            {"id": 2, "parent": 1, "name": "short ancestor", "duration": 100},
+            {
+                "id": 3,
+                "parent": 2,
+                "name": "payment charge",
+                "duration": 20,
+                "exception": exception,
+            },
+        ],
+    )
+    raw = json.dumps(document, ensure_ascii=False, indent=2)
+    output = filter_otel_trace(raw)
+    assert '  checkout "short ancestor"' in output
+    assert '    checkout "payment charge" 0.02ms ERROR' in output
+    assert secret not in output and "REDACTED" in output
+    details = [json.loads(line) for line in output.splitlines() if line.lstrip().startswith("{")]
+    diagnostic_text = json.dumps(details, ensure_ascii=False)
+    assert json.dumps(exception["exception.stacktrace"])[1:-1] in diagnostic_text
+    assert "PaymentDeclined" in diagnostic_text
+    ref = re.search(r"tc_[a-f0-9]+", output).group()
+    recovered = ContextCache().retrieve(ref)
+    assert secret not in recovered and "REDACTED" in recovered
+    assert "exception.stacktrace" in recovered
+
+
+@pytest.mark.parametrize("provider", ["jaeger", "otlp"])
+def test_otel_trace_groups_only_equal_consecutive_safe_sibling_leaves(provider):
+    definitions = [{"id": 1, "name": "root", "duration": 1000}]
+    definitions += [
+        {
+            "id": i,
+            "parent": 1,
+            "name": "GET",
+            "service": "redis",
+            "start": i,
+            "duration": 10,
+            "attributes": {"db.system": "redis", "db.operation.name": "GET"},
+        }
+        for i in range(2, 5)
+    ]
+    definitions += [
+        {
+            "id": 5,
+            "parent": 1,
+            "name": "GET",
+            "service": "redis",
+            "start": 5,
+            "duration": 10,
+            "attributes": {"db.system": "redis", "db.operation.name": "SET"},
+        },
+        {
+            "id": 6,
+            "parent": 1,
+            "name": "GET",
+            "service": "redis",
+            "start": 6,
+            "duration": 10,
+            "error": True,
+        },
+        {"id": 7, "parent": 1, "name": "GET", "service": "redis", "start": 7, "duration": 200},
+    ]
+    output = filter_otel_trace(json.dumps(_trace_export(provider, definitions)))
+    assert "3 × redis GET folded; summed span duration=0.03ms" in output
+    assert output.count("folded; summed span duration=") == 1
+    assert 'redis "GET" 0.01ms ERROR' in output
+    assert 'redis "GET" 0.2ms SLOW' in output
+    assert "SET" in output
+
+
+@pytest.mark.parametrize("provider", ["jaeger", "otlp"])
+def test_otel_trace_multiple_roots_orphans_and_deterministic_order(provider):
+    document = _trace_export(
+        provider,
+        [
+            {"id": 1, "name": "later root", "start": 1000},
+            {"id": 2, "name": "orphan", "parent": 99, "start": 100},
+            {"id": 3, "name": "earlier root", "start": 0},
+        ],
+    )
+    raw = json.dumps(document, indent=2)
+    output = filter_otel_trace(raw)
+    assert (
+        output.index('checkout "earlier root"')
+        < output.index('checkout "orphan"')
+        < output.index('checkout "later root"')
+    )
+    assert "ORPHAN parent=0000000000000063" in output
+    assert filter_otel_trace(raw) == output
+
+
+@pytest.mark.parametrize("provider", ["jaeger", "otlp"])
+@pytest.mark.parametrize(
+    "problem", ["duplicate", "cycle", "negative", "missing-name", "parents", "bad-time"]
+)
+def test_otel_trace_unsafe_exports_passthrough_even_for_curl(provider, problem):
+    document = _trace_export(
+        provider,
+        [
+            {"id": 1, "name": "root", "duration": 1000},
+            {"id": 2, "name": "child", "parent": 1, "duration": 10},
+        ],
+    )
+    records = _trace_records(document, provider)
+    if problem == "duplicate":
+        records[1]["spanID" if provider == "jaeger" else "spanId"] = records[0][
+            "spanID" if provider == "jaeger" else "spanId"
+        ]
+    elif problem == "cycle":
+        if provider == "jaeger":
+            records[0]["references"] = [
+                {"refType": "CHILD_OF", "traceID": _TRACE_ID, "spanID": f"{2:016x}"}
+            ]
+        else:
+            records[0]["parentSpanId"] = f"{2:016x}"
+    elif problem == "negative":
+        records[0]["duration" if provider == "jaeger" else "endTimeUnixNano"] = -1
+    elif problem == "missing-name":
+        del records[0]["operationName" if provider == "jaeger" else "name"]
+    elif problem == "parents":
+        if provider == "jaeger":
+            records[1]["references"].append(
+                {"refType": "CHILD_OF", "traceID": _TRACE_ID, "spanID": f"{3:016x}"}
+            )
+        else:
+            records[1]["parentSpanId"] = 123
+    else:
+        records[0]["startTime" if provider == "jaeger" else "startTimeUnixNano"] = True
+    raw = json.dumps(document, indent=2)
+    assert filter_otel_trace(raw) == raw
+    assert (
+        auto_specialize_command_output("curl -s http://localhost:16686/api/traces/id", raw) == raw
+    )
+
+
+@pytest.mark.parametrize("provider", ["jaeger", "otlp"])
+def test_otel_trace_multiple_traces_are_separate(provider):
+    document = _trace_export(provider, [{"id": 1, "name": "root"}])
+    second = _trace_export(provider, [{"id": 1, "name": "second"}])
+    second = json.loads(json.dumps(second).replace(_TRACE_ID, "b" * 32))
+    key = "data" if provider == "jaeger" else "resourceSpans"
+    document[key].extend(second[key])
+    output = filter_otel_trace(json.dumps(document, indent=2))
+    assert output.count("Trace ") == 2
+    assert _TRACE_ID in output and "b" * 32 in output
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "not json",
+        '{"resourceSpans":',
+        '{"traceId":"unrelated","message":"hello"}',
+        '{"data":[{"name":"ordinary item"}]}',
+    ],
+)
+def test_otel_trace_invalid_or_unrelated_input_is_unchanged(raw):
+    assert filter_otel_trace(raw) == raw
+
+
+def test_otel_trace_routing_precedes_http_and_generic_sampling(monkeypatch):
+    import usagetrim.core.specialized as specialized
+
+    raw = json.dumps(_trace_export("otlp", [{"id": 1, "name": "root"}]), indent=2)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Recognized traces must not fall through to HTTP/JSON sampling")
+
+    monkeypatch.setattr(specialized, "filter_curl_http", forbidden)
+    monkeypatch.setattr(specialized, "filter_json_output", forbidden)
+    assert "Trace " in auto_specialize_command_output("curl -s http://localhost/traces", raw)
+    assert "Trace " in auto_specialize_command_output("cat trace.json", raw)
+
+
+def test_otel_trace_does_not_capture_regular_http_or_cloud_logs():
+    from usagetrim.core.specialized import filter_curl_http
+
+    raw = '{"traceId":"ordinary-log","message":"hello"}'
+    assert auto_specialize_command_output(
+        "curl -s http://localhost/example", raw
+    ) == filter_curl_http(raw)
+    assert (
+        auto_specialize_command_output("aws logs tail application", '{"message":"hello"}')
+        == "hello"
+    )
+
+
+def _large_trace_export(provider):
+    exception = {
+        "exception.type": "DatabaseUnavailable",
+        "exception.message": "checkout transaction rejected",
+        "exception.stacktrace": "Traceback:\n  checkout()\n  charge()\nDatabaseUnavailable: connection refused",
+    }
+    definitions = [
+        {
+            "id": 1,
+            "name": "POST /checkout",
+            "duration": 10000,
+            "attributes": {
+                "http.request.method": "POST",
+                "url.path": "/checkout",
+                "http.response.status_code": 500,
+            },
+        }
+    ]
+    for group, service in enumerate(("checkout", "inventory", "pricing", "shipping")):
+        parent = 2 + group
+        definitions.append(
+            {
+                "id": parent,
+                "parent": 1,
+                "name": service + " middleware",
+                "service": service,
+                "start": 500 + group * 1500,
+                "duration": 1400,
+            }
+        )
+        for offset in range(60):
+            definitions.append(
+                {
+                    "id": 10 + group * 60 + offset,
+                    "parent": parent,
+                    "service": "redis",
+                    "name": "GET cache",
+                    "start": 500 + group * 1500 + offset * 20,
+                    "duration": 10,
+                    "attributes": {
+                        "db.system": "redis",
+                        "db.operation.name": "GET",
+                        "server.address": "cache.internal",
+                        "server.port": 6379,
+                        "network.transport": "tcp",
+                        "db.namespace": "checkout",
+                        "code.function.name": "lookup_cached_price",
+                    },
+                }
+            )
+    definitions.extend(
+        [
+            {
+                "id": 300,
+                "parent": 1,
+                "name": "SELECT inventory",
+                "service": "postgres",
+                "start": 1000,
+                "duration": 6000,
+                "attributes": {
+                    "db.system": "postgresql",
+                    "db.namespace": "orders",
+                    "db.operation.name": "SELECT",
+                    "server.address": "orders.internal",
+                    "server.port": 5432,
+                },
+            },
+            {
+                "id": 301,
+                "parent": 3,
+                "name": "charge payment",
+                "service": "payments",
+                "start": 3000,
+                "duration": 100,
+                "error": True,
+                "exception": exception,
+            },
+        ]
+    )
+    return _trace_export(provider, definitions), exception
+
+
+@pytest.mark.parametrize("provider", ["jaeger", "otlp"])
+def test_otel_trace_large_authored_exports_exceed_85_percent_reduction(provider):
+    document, exception = _large_trace_export(provider)
+    records = _trace_records(document, provider)
+    assert 200 <= len(records) <= 500
+    raw = json.dumps(document, ensure_ascii=False, indent=2)
+    output = filter_otel_trace(raw)
+    raw_tokens, output_tokens = count_tokens(raw).openai, count_tokens(output).openai
+    reduction = 100 * (raw_tokens - output_tokens) / raw_tokens
+    assert reduction > 85, f"{provider}: {raw_tokens}->{output_tokens} tokens, {reduction:.3f}%"
+    for signal in (
+        "POST /checkout",
+        "SELECT inventory",
+        "charge payment",
+        "DatabaseUnavailable",
+        "checkout transaction rejected",
+    ):
+        assert signal in output
+    assert "SLOW" in output and "ERROR" in output
+    ref = re.search(r"tc_[a-f0-9]+", output).group()
+    assert ContextCache().retrieve(ref) == raw
+    diagnostics = json.dumps(
+        [json.loads(line) for line in output.splitlines() if line.lstrip().startswith("{")]
+    )
+    assert json.dumps(exception["exception.stacktrace"])[1:-1] in diagnostics
+
+
+def test_otel_trace_recovery_notice_is_not_duplicated_by_budget_layer():
+    raw = json.dumps(_trace_export("otlp", [{"id": 1, "name": "root"}]), indent=2)
+    compact = filter_otel_trace(raw)
+    ref = re.search(r"tc_[a-f0-9]+", compact).group()
+    output = compress_to_budget(compact, 4000, original_text=raw)
+    assert output.count(ref) == 1
+    assert ContextCache().retrieve(ref) == raw
+    assert count_tokens(output).claude <= 4000
+
+
+@pytest.mark.parametrize("provider", ["jaeger", "otlp"])
+@pytest.mark.parametrize("diagnostic", ["events", "links", "warnings", "metadata"])
+def test_otel_trace_diagnostic_leaves_are_not_grouped(provider, diagnostic):
+    document = _trace_export(
+        provider,
+        [
+            {"id": 1, "name": "root", "duration": 1000},
+            {"id": 2, "parent": 1, "name": "GET", "duration": 10},
+            {"id": 3, "parent": 1, "name": "GET", "duration": 10},
+        ],
+    )
+    records = _trace_records(document, provider)
+    for record in records[1:]:
+        if diagnostic == "events":
+            record["logs" if provider == "jaeger" else "events"] = (
+                [
+                    {
+                        "timestamp": _TRACE_BASE_US,
+                        "fields": [{"key": "message", "type": "string", "value": "cache stale"}],
+                    }
+                ]
+                if provider == "jaeger"
+                else [{"name": "cache stale", "attributes": []}]
+            )
+        elif diagnostic == "links":
+            if provider == "jaeger":
+                record["references"].append(
+                    {"refType": "FOLLOWS_FROM", "traceID": "b" * 32, "spanID": f"{99:016x}"}
+                )
+            else:
+                record["links"] = [{"traceId": "b" * 32, "spanId": f"{99:016x}"}]
+        elif diagnostic == "warnings":
+            if provider == "jaeger":
+                record["warnings"] = ["incomplete cache result"]
+            else:
+                record["attributes"] = [
+                    {
+                        "key": "cache.warning",
+                        "value": {"stringValue": "incomplete cache result " + record["spanId"]},
+                    }
+                ]
+        else:
+            record["customDiagnostic"] = record["spanID" if provider == "jaeger" else "spanId"]
+    output = filter_otel_trace(json.dumps(document, indent=2))
+    assert "folded; summed span duration=" not in output
+    assert output.count('checkout "GET" 0.01ms') == 2
+    if diagnostic == "links":
+        assert "ORPHAN" not in output
+        assert "b" * 32 in output
+
+
+def test_otel_trace_error_name_alone_does_not_mark_error():
+    raw = json.dumps(
+        _trace_export(
+            "otlp",
+            [
+                {"id": 1, "name": "error metrics", "duration": 1000},
+                {"id": 2, "parent": 1, "name": "error_count", "duration": 10},
+            ],
+        )
+    )
+    output = filter_otel_trace(raw)
+    assert "ERROR" not in output
+
+
+@pytest.mark.parametrize("code", [2, "ERROR", "STATUS_CODE_ERROR"])
+def test_otel_trace_recognizes_otlp_error_status_codes_and_message(code):
+    document = _trace_export("otlp", [{"id": 1, "name": "request"}])
+    _trace_records(document, "otlp")[0]["status"] = {"code": code, "message": "quota denied 雪"}
+    output = filter_otel_trace(json.dumps(document, indent=2))
+    assert "ERROR" in output and "quota denied 雪" in output
+
+
+@pytest.mark.parametrize("code", [True, 2.0, 9, "UNKNOWN", {}, []])
+def test_otel_trace_unsafe_status_is_passthrough(code):
+    document = _trace_export("otlp", [{"id": 1, "name": "request"}])
+    _trace_records(document, "otlp")[0]["status"] = {"code": code}
+    raw = json.dumps(document, indent=2)
+    assert auto_specialize_command_output("cat trace.json", raw) == raw
+
+
+@pytest.mark.parametrize(
+    "attributes",
+    [
+        [{"key": "error", "value": {"boolValue": "false"}}],
+        [{"key": "exception.message", "value": {"stringValue": 1}}],
+        [
+            {"key": "a", "value": {"stringValue": "first"}},
+            {"key": "a", "value": {"stringValue": "second"}},
+        ],
+    ],
+)
+def test_otel_trace_invalid_attribute_shapes_are_passthrough(attributes):
+    document = _trace_export("otlp", [{"id": 1, "name": "request"}])
+    _trace_records(document, "otlp")[0]["attributes"] = attributes
+    raw = json.dumps(document, indent=2)
+    assert filter_otel_trace(raw) == raw
+
+
+def test_otel_trace_benchmark_harness_counts_only_one_standard_recovery_notice():
+    from usagetrim.core.benchmark import benchmark_case
+
+    document, _ = _large_trace_export("jaeger")
+    raw = json.dumps(document, indent=2)
+    compact = filter_otel_trace(raw)
+    result = benchmark_case(
+        "trace-test", raw, "cat trace.json", ["DatabaseUnavailable", "SELECT inventory"]
+    )
+    assert result.output_tokens == count_tokens(compact).openai
+    assert result.signals_preserved and result.exact_recovery
+
+
+def test_otel_trace_duplicate_json_fields_are_not_silently_discarded():
+    raw = json.dumps(_trace_export("otlp", [{"id": 1, "name": "root"}]), indent=2)
+    raw = raw.replace('"name": "root"', '"name": "lost diagnostic", "name": "root"')
+    assert filter_otel_trace(raw) == raw
+    assert auto_specialize_command_output("curl -s http://localhost/traces", raw) == raw
+
+
+def test_otel_trace_same_name_different_service_kind_and_order_are_not_grouped():
+    document = _trace_export(
+        "otlp",
+        [
+            {"id": 1, "name": "root", "duration": 1000},
+            {"id": 2, "parent": 1, "name": "GET", "service": "first", "start": 1, "duration": 1},
+            {"id": 3, "parent": 1, "name": "GET", "service": "second", "start": 2, "duration": 1},
+            {"id": 4, "parent": 1, "name": "GET", "service": "first", "start": 3, "duration": 1},
+            {"id": 5, "parent": 1, "name": "GET", "service": "first", "start": 4, "duration": 1},
+        ],
+    )
+    next(record for record in _trace_records(document, "otlp") if record["spanId"] == f"{5:016x}")[
+        "kind"
+    ] = 2
+    output = filter_otel_trace(json.dumps(document, indent=2))
+    assert "folded; summed span duration=" not in output
+    assert output.count('"GET" 0.001ms') == 4
+
+
+@pytest.mark.parametrize("provider", ["jaeger", "otlp"])
+def test_explicit_cloud_log_command_precedes_trace_envelope(provider, monkeypatch):
+    import usagetrim.core.specialized as specialized
+
+    document = _trace_export(provider, [{"id": 1, "name": "root"}])
+    document["message"] = "controlled cloud log"
+    raw = json.dumps(document, indent=2)
+    expected = specialized.filter_cloud_logs(raw)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Explicit cloud-log commands must precede trace detection")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(specialized, "_compact_trace_payload", forbidden)
+        assert auto_specialize_command_output("aws logs filter-log-events", raw) == expected
+
+    trace_raw = json.dumps(_trace_export(provider, [{"id": 1, "name": "root"}]), indent=2)
+    assert "Trace " in auto_specialize_command_output("curl -s http://localhost/traces", trace_raw)
+
+
+@pytest.mark.parametrize("provider", ["jaeger", "otlp"])
+@pytest.mark.parametrize("routed", [False, True])
+@pytest.mark.parametrize(
+    "failure", [OSError("disk unavailable"), sqlite3.OperationalError("locked")]
+)
+def test_otel_trace_cache_failure_preserves_raw_and_terminates_routing(
+    provider, routed, failure, monkeypatch
+):
+    import usagetrim.core.specialized as specialized
+
+    document, _ = _large_trace_export(provider)
+    raw = json.dumps(document)
+
+    def unavailable(*args, **kwargs):
+        raise failure
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Recognized trace must not fall through")
+
+    monkeypatch.setattr(ContextCache, "store", unavailable)
+    monkeypatch.setattr(specialized, "filter_json_output", forbidden)
+    monkeypatch.setattr(specialized, "filter_curl_http", forbidden)
+    output = (
+        auto_specialize_command_output("curl localhost/traces", raw)
+        if routed
+        else filter_otel_trace(raw)
+    )
+    assert output == raw
+
+
+def _small_trace_cases():
+    root = {"id": 1, "name": "root", "duration": 1000}
+    return {
+        "root": [root],
+        "root-child": [root, {"id": 2, "parent": 1, "name": "child", "start": 10, "duration": 10}],
+        "error-root": [root | {"error": True}],
+        "error-message": [root | {"error": True, "exception": {"exception.message": "refused"}}],
+        "error-stack": [
+            root
+            | {
+                "error": True,
+                "exception": {
+                    "exception.message": "refused",
+                    "exception.stacktrace": "charge()\nDeclined",
+                },
+            }
+        ],
+        "error-child": [
+            root,
+            {"id": 2, "parent": 1, "name": "child", "duration": 10, "error": True},
+        ],
+        "slow-child": [root, {"id": 2, "parent": 1, "name": "child", "duration": 200}],
+        "unique": [root]
+        + [
+            {"id": i, "parent": 1, "name": f"op{i}", "start": i, "duration": 10}
+            for i in range(2, 6)
+        ],
+    }
+
+
+@pytest.mark.parametrize("provider", ["jaeger", "otlp"])
+@pytest.mark.parametrize("case", list(_small_trace_cases()))
+def test_otel_trace_small_exports_never_expand(provider, case, monkeypatch):
+    raw = json.dumps(_trace_export(provider, _small_trace_cases()[case]))
+    stored = []
+    original_store = ContextCache.store
+
+    def store(self, content, **kwargs):
+        stored.append(content)
+        return original_store(self, content, **kwargs)
+
+    monkeypatch.setattr(ContextCache, "store", store)
+    output = filter_otel_trace(raw)
+    assert count_tokens(output).openai <= count_tokens(raw).openai
+    if output == raw:
+        assert not stored
+        assert auto_specialize_command_output("curl localhost/traces", raw) == raw
+        assert not stored
+    else:
+        ref = re.search(r"tc_[a-f0-9]+", output).group()
+        assert ContextCache().retrieve(ref) == raw
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"resourceSpans": "ordinary application field", "items": list(range(100))},
+        {"resourceSpans": [], "items": list(range(100))},
+        {"data": [{"traceID": "abc", "spans": "not a trace list"}], "items": list(range(100))},
+    ],
+)
+def test_otel_trace_ambiguous_envelope_is_conservative_passthrough(document, monkeypatch):
+    import usagetrim.core.specialized as specialized
+
+    raw = json.dumps(document)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Unsafe envelope must not be cached or sampled")
+
+    monkeypatch.setattr(ContextCache, "store", forbidden)
+    monkeypatch.setattr(specialized, "filter_json_output", forbidden)
+    monkeypatch.setattr(specialized, "filter_curl_http", forbidden)
+    assert auto_specialize_command_output("curl localhost", raw) == raw
+
+
+def test_otel_trace_plain_identifier_fields_do_not_claim_json(monkeypatch):
+    import usagetrim.core.specialized as specialized
+
+    raw = json.dumps({"items": [{"traceId": "abc", "spanId": "def"}] * 100})
+    monkeypatch.setattr(
+        specialized, "filter_json_output", lambda *args, **kwargs: "ordinary JSON route"
+    )
+    assert auto_specialize_command_output("cat data.json", raw) == "ordinary JSON route"
+
+
+@pytest.mark.parametrize("provider", ["jaeger", "otlp"])
+def test_otel_trace_root_and_orphan_are_never_grouped(provider):
+    definitions = [
+        {"id": i, "name": "same", "duration": 1, **({"parent": 99} if i > 2 else {})}
+        for i in range(1, 5)
+    ]
+    definitions.append({"id": 5, "name": "long root", "duration": 1000})
+    raw = json.dumps(_trace_export(provider, definitions), indent=2)
+    output = filter_otel_trace(raw)
+    assert "folded; summed span duration=" not in output
+    assert output.count("ORPHAN parent=") == 2
+    assert output.count("ROOT") == 3
+    assert output == filter_otel_trace(raw)
+
+
+def test_otel_trace_duplicate_id_across_resources_falls_back():
+    document = _trace_export(
+        "otlp",
+        [
+            {"id": 1, "name": "first", "service": "a"},
+            {"id": 1, "name": "second", "service": "b"},
+        ],
+    )
+    raw = json.dumps(document)
+    assert filter_otel_trace(raw) == raw
+    assert auto_specialize_command_output("curl localhost", raw) == raw

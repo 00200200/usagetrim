@@ -3,6 +3,7 @@ from __future__ import annotations
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.cleaner import CleanerOptions, compact_terminal_output, strip_ansi
 from usagetrim.core.redactor import redact_secrets
+from usagetrim.core.safe_filter import recovery_notice
 from usagetrim.metrics.tokenizer import count_tokens
 
 
@@ -37,6 +38,9 @@ def compress_to_budget(
 
     # Sanitization is deliberately applied before persistence, not only display.
     ref_id = ContextCache().store(original, source=source)
+    existing_notice = recovery_notice(ref_id)
+    if cleaned.endswith(existing_notice):
+        cleaned = cleaned.removesuffix(existing_notice)
     marker = f"\n[... Ref: {ref_id}; retrieve omitted lines]"
     if size(marker + suffix) > max_tokens:
         raise ValueError("max_tokens is too small for the recovery reference")
