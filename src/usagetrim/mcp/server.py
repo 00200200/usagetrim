@@ -19,7 +19,7 @@ from usagetrim.core.diff_slimmer import budgeted_diff_slice, classify_git_diff
 from usagetrim.core.gain import build_gain_report
 from usagetrim.core.json_slimmer import slim_json
 from usagetrim.core.redactor import redact_secrets
-from usagetrim.core.safe_filter import safe_compact_output
+from usagetrim.core.safe_filter import recovery_notice, safe_compact_output
 from usagetrim.core.skeleton import extract_symbol_or_range
 from usagetrim.core.specialized import auto_specialize_command_output
 from usagetrim.core.telemetry import record_text, recovery_engine
@@ -700,6 +700,38 @@ def _compress(text, budget, **kwargs):
     return compress_to_budget(text, budget, **kwargs)
 
 
+def _budget_repo_map(map_result, budget: int) -> str:
+    """Fit complete ranked entries, reserving the header, notices and recovery.
+
+    Recovery contains the full query result, including its existing limit and
+    incomplete-index notices. Oversized entries are skipped, never truncated.
+    """
+    safe_result = redact_secrets(map_result.render())
+    if count_tokens(safe_result).claude <= budget:
+        return safe_result
+    ref_id = ContextCache().store(safe_result, source="code-query")
+    notice = recovery_notice(ref_id)
+    header = redact_secrets(map_result.header).removesuffix("\n")
+    entries = [redact_secrets(entry) for entry in map_result.entries]
+    notices = [redact_secrets(notice) for notice in map_result.notices]
+
+    def render(selected):
+        return "\n".join([header, *selected, *notices]) + "\n" + notice
+
+    selected = []
+    output = render(selected)
+    if count_tokens(output).claude > budget:
+        raise ValueError(
+            "max_tokens is too small for the repo map header, notices and recovery reference"
+        )
+    for entry in entries:
+        candidate = render([*selected, entry])
+        if count_tokens(candidate).claude <= budget:
+            selected.append(entry)
+            output = candidate
+    return output
+
+
 def _cwd(arguments: dict[str, Any]) -> str | None:
     cwd = arguments.get("cwd")
     if cwd is not None and (not isinstance(cwd, str) or not Path(cwd).is_absolute()):
@@ -713,13 +745,19 @@ def handle_usagetrim_code(arguments: dict[str, Any]) -> str:
 
     budget = _budget(arguments)
     index = CodeIndex(arguments["root"])
-    result = index.query(
-        arguments.get("mode", "map"),
+    mode = arguments.get("mode", "map")
+    query_args = (
         arguments.get("query", ""),
         arguments.get("file"),
         arguments.get("limit", 30),
     )
-    output = _compress(result, budget, source="code-query")
+    if mode == "map":
+        map_result = index._query_repo_map(*query_args)
+        result = map_result.render()
+        output = result if paused() else _budget_repo_map(map_result, budget)
+    else:
+        result = index.query(mode, *query_args)
+        output = _compress(result, budget, source="code-query")
     return _record(result, output, operation="code", project=arguments["root"])
 
 

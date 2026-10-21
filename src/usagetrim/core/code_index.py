@@ -9,6 +9,8 @@ import os
 import re
 import sqlite3
 import subprocess
+from collections import defaultdict
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -79,6 +81,84 @@ IDENTIFIERS = {
 }
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_FILES = 10000
+
+
+def _language_family(language: str) -> str:
+    """Group compatible syntax languages without resolving imports or names."""
+    return "javascript-typescript" if language in {"javascript", "typescript", "tsx"} else language
+
+
+def _build_file_graph(
+    db: sqlite3.Connection,
+) -> tuple[dict[str, set[str]], dict[tuple[str, str, int], int]]:
+    """Build syntactic file edges and conservative per-definition support.
+
+    An edge requires one external target file, even if that file has multiple
+    matching definitions. Symbol support requires one definition in the entire
+    language family. Repeated occurrences in one source file count only once.
+    """
+    families = {
+        path: _language_family(language)
+        for path, language in db.execute(
+            "SELECT path,language FROM files WHERE language IS NOT NULL AND issue IS NULL ORDER BY path"
+        )
+    }
+    graph = {path: set() for path in families}
+    definitions = defaultdict(list)
+    supporters = {}
+    for path, name, qualified, line in db.execute(
+        "SELECT path,name,qualified,line FROM symbols ORDER BY path,line,qualified"
+    ):
+        if path in families:
+            symbol = (path, qualified, line)
+            definitions[families[path], name].append(symbol)
+            supporters[symbol] = set()
+    for path, name in db.execute("SELECT DISTINCT path,name FROM occurrences ORDER BY path,name"):
+        if path not in families:
+            continue
+        matches = definitions.get((families[path], name), ())
+        # Declarations and local uses cannot establish an external reference.
+        if any(symbol[0] == path for symbol in matches):
+            continue
+        targets = {symbol[0] for symbol in matches if symbol[0] != path}
+        if len(targets) == 1:
+            graph[path].update(targets)
+        if len(matches) == 1 and matches[0][0] != path:
+            supporters[matches[0]].add(path)
+    return graph, {symbol: len(paths) for symbol, paths in supporters.items()}
+
+
+def _calculate_pagerank(
+    graph: Mapping[str, Collection[str]],
+    damping: float = 0.85,
+    iterations: int = 20,
+) -> dict[str, float]:
+    """Run deterministic fixed-iteration PageRank with uniform dangling mass.
+
+    Target-only nodes are treated as dangling nodes. Duplicate neighbors do not
+    create extra votes; sorted traversal fixes floating-point accumulation order.
+    """
+    if type(damping) not in (int, float) or not 0 <= damping <= 1:
+        raise ValueError("damping must be a number between 0 and 1")
+    if type(iterations) is not int or iterations <= 0:
+        raise ValueError("iterations must be a positive integer")
+    nodes = sorted(set(graph) | {target for targets in graph.values() for target in targets})
+    if not nodes:
+        return {}
+    neighbors = {node: sorted(set(graph.get(node, ()))) for node in nodes}
+    size = len(nodes)
+    scores = dict.fromkeys(nodes, 1 / size)
+    for _ in range(iterations):
+        dangling = sum(scores[node] for node in nodes if not neighbors[node])
+        base = (1 - damping) / size + damping * dangling / size
+        updated = dict.fromkeys(nodes, base)
+        for node in nodes:
+            if neighbors[node]:
+                share = damping * scores[node] / len(neighbors[node])
+                for target in neighbors[node]:
+                    updated[target] += share
+        scores = updated
+    return scores
 
 
 @dataclass
@@ -269,6 +349,19 @@ def source_files(root: Path) -> list[Path]:
     return paths
 
 
+@dataclass
+class _RepoMapResult:
+    header: str
+    entries: list[str]
+    notices: list[str]
+
+    def render(self) -> str:
+        body = "\n".join(self.entries)
+        for notice in self.notices:
+            body += ("\n" if body or notice != "No matches." else "") + notice
+        return self.header + (body or "No matches.")
+
+
 class CodeIndex:
     def __init__(self, root: str | Path):
         root = Path(root)
@@ -381,6 +474,13 @@ class CodeIndex:
             return len(seen)
 
     def query(self, mode="map", query="", file=None, limit=30) -> str:
+        result = self._query(mode, query, file, limit)
+        return result.render() if isinstance(result, _RepoMapResult) else result
+
+    def _query_repo_map(self, query="", file=None, limit=30) -> _RepoMapResult:
+        return self._query("map", query, file, limit)
+
+    def _query(self, mode, query, file, limit) -> str | _RepoMapResult:
         if mode not in {
             "map",
             "symbols",
@@ -448,7 +548,33 @@ class CodeIndex:
                     f"{p}:{line}:{col + 1} in {caller} | {context.strip()}"
                     for p, line, col, context, caller in rows[:limit]
                 )
-            elif mode in {"symbols", "map"}:
+            elif mode == "map":
+                graph, support = _build_file_graph(db)
+                scores = _calculate_pagerank(graph)
+                header = (
+                    f"# map: {total} files, {self.updated} reindexed; "
+                    "PageRank-ranked syntax map (not LSP)\n"
+                )
+                rows = db.execute(
+                    """SELECT path,qualified,line,end_line,signature FROM symbols
+                    WHERE (? IS NULL OR path=?)
+                    AND (?='' OR instr(lower(qualified),lower(?)) > 0)""",
+                    (file, file, query, query),
+                ).fetchall()
+                rows.sort(
+                    key=lambda row: (
+                        -scores.get(row[0], 0),
+                        -support.get((row[0], row[1], row[2]), 0),
+                        row[0],
+                        row[2],
+                        row[1],
+                    )
+                )
+                entries = [
+                    f"{p}:{line}-{end} {name} | {signature}"
+                    for p, name, line, end, signature in rows[:limit]
+                ]
+            elif mode == "symbols":
                 rows = db.execute(
                     """SELECT s.path,s.qualified,s.line,s.end_line,s.signature,
                     (SELECT COUNT(*) FROM occurrences o WHERE o.name=s.name) AS score
@@ -502,6 +628,17 @@ class CodeIndex:
                     if len(rows) > limit:
                         break
                 body = "\n".join(f"{p}:{line}\n{text}" for p, line, text in rows[:limit])
+        if mode == "map":
+            notices = []
+            if len(rows) > limit:
+                notices.append(
+                    "[More results omitted; narrow query/file or raise limit (max 200).]"
+                )
+            if self.issues:
+                notices.append("[Incomplete index: " + "; ".join(self.issues[:8]) + "]")
+            if not entries and not notices:
+                notices.append("No matches.")
+            return _RepoMapResult(header, entries, notices)
         if len(rows) > limit:
             body += "\n[More results omitted; narrow query/file or raise limit (max 200).]"
         if self.issues:

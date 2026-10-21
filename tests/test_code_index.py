@@ -6,11 +6,297 @@ from pathlib import Path
 import pytest
 
 from usagetrim.core.cache import ContextCache
-from usagetrim.core.code_index import CodeIndex, digest, parse_source, read_symbol
+from usagetrim.core.code_index import (
+    CodeIndex,
+    _build_file_graph,
+    _calculate_pagerank,
+    _language_family,
+    _RepoMapResult,
+    digest,
+    parse_source,
+    read_symbol,
+)
 from usagetrim.core.skeleton import extract_symbol_or_range
 from usagetrim.core.symbol_edit import replace_symbol
 from usagetrim.mcp import server
 from usagetrim.metrics.tokenizer import count_tokens
+
+
+def test_pagerank_known_graph_includes_dangling_mass():
+    scores = _calculate_pagerank({"A": {"B"}, "B": set()}, iterations=100)
+    assert scores == pytest.approx({"A": 20 / 57, "B": 37 / 57}, abs=1e-12)
+    assert sum(scores.values()) == pytest.approx(1.0)
+
+
+def test_pagerank_isolated_nodes_and_empty_graph():
+    assert _calculate_pagerank({}) == {}
+    scores = _calculate_pagerank({"A": set(), "B": set(), "C": set()})
+    assert scores == pytest.approx(dict.fromkeys(("A", "B", "C"), 1 / 3))
+    assert sum(scores.values()) == pytest.approx(1.0)
+
+
+def test_pagerank_is_deterministic_across_node_and_neighbor_order():
+    first = {"A": ["B", "C"], "B": ["C"], "C": [], "D": ["A", "C"]}
+    second = {"D": ["C", "A"], "C": [], "B": ["C"], "A": ["C", "B"]}
+    assert _calculate_pagerank(first) == _calculate_pagerank(second)
+    assert list(_calculate_pagerank(second)) == ["A", "B", "C", "D"]
+
+
+def test_pagerank_target_only_nodes_and_duplicate_neighbors():
+    assert _calculate_pagerank({"A": ["B", "B"]}) == _calculate_pagerank({"A": {"B"}, "B": set()})
+
+
+@pytest.mark.parametrize("damping", [-0.1, 1.1, float("nan"), float("inf"), True, "0.85", None])
+def test_pagerank_rejects_invalid_damping(damping):
+    with pytest.raises(ValueError, match="damping"):
+        _calculate_pagerank({}, damping=damping)
+
+
+@pytest.mark.parametrize("iterations", [0, -1, True, False, 1.5, "20", None])
+def test_pagerank_rejects_invalid_iterations(iterations):
+    with pytest.raises(ValueError, match="iterations"):
+        _calculate_pagerank({}, iterations=iterations)
+
+
+@pytest.mark.parametrize("damping", [0.0, 1.0])
+def test_pagerank_accepts_damping_boundaries(damping):
+    scores = _calculate_pagerank({"A": {"B"}, "B": set()}, damping=damping)
+    assert set(scores) == {"A", "B"}
+    assert sum(scores.values()) == pytest.approx(1.0)
+    if damping == 0:
+        assert scores == {"A": 0.5, "B": 0.5}
+
+
+@pytest.mark.parametrize(
+    ("language", "family"),
+    [
+        ("python", "python"),
+        ("javascript", "javascript-typescript"),
+        ("typescript", "javascript-typescript"),
+        ("tsx", "javascript-typescript"),
+        ("rust", "rust"),
+        ("go", "go"),
+    ],
+)
+def test_graph_language_families(language, family):
+    assert _language_family(language) == family
+
+
+def _index_graph_sources(tmp_path, sources):
+    root = tmp_path / "project"
+    root.mkdir()
+    for name, source in sources.items():
+        (root / name).write_text(source, encoding="utf-8")
+    index = CodeIndex(root)
+    index.sync()
+    with index.connect() as db:
+        return _build_file_graph(db)
+
+
+@pytest.mark.parametrize(
+    "sources",
+    [
+        {
+            "core.py": "class CoreService:\n    pass\n",
+            "api.py": "CoreService()\nCoreService()\nCoreService()\n",
+            "worker.py": "CoreService()\n",
+            "helper.py": "def unrelated():\n    pass\n",
+        },
+        {
+            "core.ts": "export class CoreService {}\n",
+            "api.ts": "new CoreService();\nnew CoreService();\nnew CoreService();\n",
+            "worker.js": "new CoreService();\n",
+            "helper.ts": "export function unrelated() {}\n",
+        },
+    ],
+    ids=["python", "typescript-javascript"],
+)
+def test_file_graph_multifile_hub_and_deduplicated_support(tmp_path, sources):
+    graph, support = _index_graph_sources(tmp_path, sources)
+    core, api, worker, helper = sources
+    assert graph == {core: set(), api: {core}, worker: {core}, helper: set()}
+    assert support[(core, "CoreService", 1)] == 2
+    assert support[(helper, "unrelated", 1)] == 0
+    scores = _calculate_pagerank(graph)
+    assert scores[core] > max(scores[path] for path in (api, worker, helper))
+
+
+@pytest.mark.parametrize("local_usage", ["", "shared()\n"])
+def test_file_graph_does_not_infer_edges_from_locally_defined_names(tmp_path, local_usage):
+    graph, support = _index_graph_sources(
+        tmp_path,
+        {
+            "a.py": "def shared(): pass\n" + local_usage,
+            "b.py": "def shared(): pass\n",
+        },
+    )
+    assert graph == {"a.py": set(), "b.py": set()}
+    assert support == {("a.py", "shared", 1): 0, ("b.py", "shared", 1): 0}
+
+
+def test_file_graph_skips_ambiguous_external_target_files(tmp_path):
+    graph, support = _index_graph_sources(
+        tmp_path,
+        {
+            "core.py": "def shared(): pass\n",
+            "other.py": "def shared(): pass\n",
+            "api.py": "shared()\n",
+        },
+    )
+    assert graph["api.py"] == set()
+    assert support[("core.py", "shared", 1)] == 0
+    assert support[("other.py", "shared", 1)] == 0
+
+
+def test_file_graph_allows_multiple_definitions_in_one_target_file(tmp_path):
+    graph, support = _index_graph_sources(
+        tmp_path,
+        {
+            "core.py": "class A:\n    def run(self): pass\nclass B:\n    def run(self): pass\n",
+            "api.py": "service.run()\nservice.run()\n",
+        },
+    )
+    assert graph == {"core.py": set(), "api.py": {"core.py"}}
+    assert support[("core.py", "A.run", 2)] == 0
+    assert support[("core.py", "B.run", 4)] == 0
+
+
+def test_file_graph_separates_python_and_typescript_names(tmp_path):
+    graph, support = _index_graph_sources(
+        tmp_path,
+        {
+            "python_client.py": "class Client: pass\n",
+            "typescript_client.ts": "export class Client {}\nexport class WebOnly {}\n",
+            "python_api.py": "Client()\nWebOnly()\n",
+            "typescript_api.ts": "new Client();\n",
+        },
+    )
+    assert graph == {
+        "python_client.py": set(),
+        "typescript_client.ts": set(),
+        "python_api.py": {"python_client.py"},
+        "typescript_api.ts": {"typescript_client.ts"},
+    }
+    assert support[("python_client.py", "Client", 1)] == 1
+    assert support[("typescript_client.ts", "Client", 1)] == 1
+    assert support[("typescript_client.ts", "WebOnly", 2)] == 0
+
+
+def test_file_graph_excludes_text_and_parse_failures_but_keeps_empty_code(tmp_path):
+    graph, support = _index_graph_sources(
+        tmp_path,
+        {
+            "empty.py": "# No declarations\n",
+            "broken.py": "def broken(:\n",
+            "notes.md": "Documentation only\n",
+        },
+    )
+    assert graph == {"empty.py": set()}
+    assert support == {}
+
+
+@pytest.fixture(params=["python", "typescript-javascript"])
+def ranked_map_index(tmp_path, request):
+    if request.param == "python":
+        sources = {
+            "core.py": "def local_helper(): pass\n\nclass CoreService: pass\n",
+            "api.py": "CoreService()\n" + "helper()\n" * 12,
+            "worker.py": "CoreService()\n",
+            "utils.py": "def helper(): pass\n",
+            "a_low.py": "class CoreUnused: pass\n",
+        }
+    else:
+        sources = {
+            "core.ts": "function localHelper() {}\nexport class CoreService {}\n",
+            "api.ts": "new CoreService();\n" + "helper();\n" * 12,
+            "worker.js": "new CoreService();\n",
+            "utils.ts": "export function helper() {}\n",
+            "a_low.ts": "export class CoreUnused {}\n",
+        }
+    root = tmp_path / "project"
+    root.mkdir()
+    for name, source in sources.items():
+        (root / name).write_text(source, encoding="utf-8")
+    return CodeIndex(root), next(iter(sources))
+
+
+def test_map_pagerank_prefers_core_over_repeated_occurrence_frequency(ranked_map_index):
+    index, core = ranked_map_index
+    repo_map = index.query(mode="map", limit=1)
+    symbols = index.query(mode="symbols", limit=1)
+    assert "PageRank-ranked syntax map (not LSP)" in repo_map.splitlines()[0]
+    assert repo_map.splitlines()[1].startswith(core + ":")
+    assert " CoreService | " in repo_map.splitlines()[1]
+    assert "utils." in symbols.splitlines()[1]
+    assert " helper | " in symbols.splitlines()[1]
+    assert "PageRank" not in symbols
+
+
+def test_map_orders_symbols_within_a_file_by_external_support(ranked_map_index):
+    index, core = ranked_map_index
+    result = index.query(mode="map", file=core)
+    entries = result.splitlines()[1:]
+    assert len(entries) == 2
+    assert all(entry.startswith(core + ":") for entry in entries)
+    assert " CoreService | " in entries[0]
+    assert "local_helper" in entries[1] or "localHelper" in entries[1]
+
+
+def test_map_query_filters_candidates_without_losing_global_rank(ranked_map_index):
+    index, core = ranked_map_index
+    result = index.query(mode="map", query="CoRe")
+    entries = result.splitlines()[1:]
+    assert len(entries) == 2
+    assert entries[0].startswith(core + ":") and " CoreService | " in entries[0]
+    assert entries[1].startswith("a_low.") and " CoreUnused | " in entries[1]
+    assert "No matches." in index.query(mode="map", query="no_such_symbol")
+
+
+@pytest.mark.parametrize("limit", [1, 2])
+def test_map_limit_selects_top_ranked_entries_and_preserves_omission_notice(
+    ranked_map_index, limit
+):
+    index, _ = ranked_map_index
+    complete = index.query(mode="map", limit=200)
+    limited = index.query(mode="map", limit=limit)
+    assert limited.splitlines()[1 : 1 + limit] == complete.splitlines()[1 : 1 + limit]
+    assert len(limited.splitlines()) == limit + 2
+    notice = "[More results omitted; narrow query/file or raise limit (max 200).]"
+    assert limited.endswith(notice)
+    assert notice not in complete
+
+
+def test_map_ties_use_path_line_and_qualified_name_deterministically(tmp_path):
+    (tmp_path / "b.ts").write_text("class Last {}\n", encoding="utf-8")
+    (tmp_path / "a.ts").write_text("class Z {} class A {}\nclass Earlier {}\n", encoding="utf-8")
+    index = CodeIndex(tmp_path)
+    index.sync()
+    first = index.query(mode="map")
+    assert first == index.query(mode="map")
+    assert [entry.split(" | ")[0] for entry in first.splitlines()[1:]] == [
+        "a.ts:1-1 A",
+        "a.ts:1-1 Z",
+        "a.ts:2-2 Earlier",
+        "b.ts:1-1 Last",
+    ]
+
+
+@pytest.mark.parametrize("sources", [{}, {"empty.py": "# No symbols\n"}, {"notes.md": "Notes\n"}])
+def test_map_empty_or_no_symbol_repository(tmp_path, sources):
+    for name, source in sources.items():
+        (tmp_path / name).write_text(source, encoding="utf-8")
+    result = CodeIndex(tmp_path).query(mode="map")
+    assert result.startswith(f"# map: {len(sources)} files,")
+    assert "PageRank-ranked syntax map (not LSP)" in result
+    assert result.endswith("No matches.")
+
+
+def test_map_preserves_incomplete_index_notice(tmp_path):
+    (tmp_path / "good.py").write_text("def visible(): pass\n", encoding="utf-8")
+    (tmp_path / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+    result = CodeIndex(tmp_path).query(mode="map")
+    assert "visible" in result
+    assert "[Incomplete index: broken.py: SyntaxError: no reliable symbols]" in result
 
 
 def test_qualified_symbol_preserves_source_and_rejects_ambiguity(tmp_path):
@@ -257,6 +543,271 @@ def test_code_events_have_no_source_or_query_in_telemetry(tmp_path):
     assert card["last_event"] is not None
 
 
+@pytest.fixture
+def large_repo_map(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "core.py").write_text(
+        "class CoreService: pass\n"
+        + "\n".join(f"def operation_{number}(): return {number}" for number in range(40)),
+        encoding="utf-8",
+    )
+    (root / "api.py").write_text("CoreService()\n", encoding="utf-8")
+    (root / "worker.py").write_text("CoreService()\n", encoding="utf-8")
+    index = CodeIndex(root)
+    index.sync()
+    return index
+
+
+def test_mcp_map_budget_preserves_entries_rank_recovery_and_raw_telemetry(
+    large_repo_map, monkeypatch
+):
+    index = large_repo_map
+    full = index.query(mode="map", limit=100)
+    recorded = []
+    original_record = server._record
+
+    def record(raw, output, **kwargs):
+        recorded.append((raw, output))
+        return original_record(raw, output, **kwargs)
+
+    monkeypatch.setattr(server, "_record", record)
+    output = server.handle_usagetrim_code(
+        {"root": str(index.root), "mode": "map", "limit": 100, "max_tokens": 128}
+    )
+    assert count_tokens(output).claude <= 128
+    assert output.splitlines()[0] == full.splitlines()[0]
+    full_entries = full.splitlines()[1:]
+    entries = [line for line in output.splitlines()[1:] if not line.startswith("[")]
+    assert entries and entries[0] == full_entries[0]
+    assert " CoreService | " in entries[0]
+    assert all(entry in full_entries for entry in entries)
+    positions = [full_entries.index(entry) for entry in entries]
+    assert positions == sorted(positions)
+    omitted = next(entry for entry in full_entries if entry not in entries)
+    ref = re.search(r"tc_[a-f0-9]+", output).group()
+    recovered = ContextCache().retrieve(ref)
+    assert recovered == full and omitted in recovered
+    assert recorded == [(full, output)]
+
+
+@pytest.mark.parametrize("query", ["", "Symbol.iterator"])
+def test_mcp_map_budget_keeps_multiline_computed_methods_atomic(tmp_path, query):
+    source = "\n".join(
+        f"class Collection{number} {{\n"
+        "  [\n"
+        "    Symbol.iterator\n"
+        "  ]() { return [1, 2, 3][Symbol.iterator](); }\n"
+        "}"
+        for number in range(5)
+    )
+    (tmp_path / "iterators.ts").write_text(source, encoding="utf-8")
+    index = CodeIndex(tmp_path)
+    index.sync()
+    full = index.query(mode="map", query=query)
+    symbols, _ = parse_source(source, "typescript")
+    entries = [
+        f"iterators.ts:{symbol.line}-{symbol.end_line} {symbol.qualified} | {symbol.signature}"
+        for symbol in symbols
+        if query.lower() in symbol.qualified.lower()
+    ]
+    header = full.splitlines()[0]
+    assert full == "\n".join([header, *entries])
+    assert sum("\n" in entry for entry in entries) == 5
+    assert count_tokens(full).claude > 128
+
+    output = server.handle_usagetrim_code(
+        {"root": str(tmp_path), "mode": "map", "query": query, "max_tokens": 128}
+    )
+    assert count_tokens(output).claude <= 128
+    ref = re.search(r"tc_[a-f0-9]+", output).group()
+    selected = [entry for entry in entries if entry in output]
+    assert any("\n" in entry for entry in selected)
+    assert len(selected) < len(entries)
+    # Exact reconstruction rules out orphaned continuations, partial entries or reordering.
+    assert output == "\n".join([header, *selected]) + "\n" + server.recovery_notice(ref)
+    recovered = ContextCache().retrieve(ref)
+    assert recovered == full
+    assert all(entry in recovered for entry in entries if entry not in selected)
+
+
+def test_mcp_map_that_fits_is_unchanged_without_cache(large_repo_map, monkeypatch):
+    full = large_repo_map.query(mode="map", limit=100)
+
+    def unexpected_store(*args, **kwargs):
+        pytest.fail("A fitting map must not create a recovery entry")
+
+    monkeypatch.setattr(ContextCache, "store", unexpected_store)
+    output = server.handle_usagetrim_code(
+        {"root": str(large_repo_map.root), "mode": "map", "limit": 100, "max_tokens": 32000}
+    )
+    assert output == full and "tc_" not in output
+
+
+def test_mcp_fitting_map_redacts_secret_in_file_path_without_recovery(tmp_path):
+    secret = "ghp_" + "a" * 36
+    (tmp_path / f"{secret}.py").write_text("def visible(): pass\n", encoding="utf-8")
+    full = CodeIndex(tmp_path).query(mode="map")
+    assert secret in full
+    output = server.handle_usagetrim_code(
+        {"root": str(tmp_path), "mode": "map", "max_tokens": 32000}
+    )
+    assert secret not in output
+    assert "[REDACTED" in output
+    assert "tc_" not in output
+    assert count_tokens(output).claude <= 32000
+
+
+@pytest.fixture
+def map_with_oversized_entry(tmp_path):
+    parameters = ", ".join(f"parameter_{number}: int" for number in range(30))
+    (tmp_path / "sample.py").write_text(
+        f"def giant({parameters}): pass\ndef short(): pass\ndef last(): pass\n",
+        encoding="utf-8",
+    )
+    index = CodeIndex(tmp_path)
+    index.sync()
+    return index
+
+
+def test_mcp_map_skips_oversized_entry_and_keeps_later_short_entries(map_with_oversized_entry):
+    index = map_with_oversized_entry
+    full = index.query(mode="map")
+    giant, short, _ = full.splitlines()[1:]
+    output = server.handle_usagetrim_code(
+        {"root": str(index.root), "mode": "map", "max_tokens": 128}
+    )
+    assert count_tokens(output).claude <= 128
+    assert "giant" not in output and short in output.splitlines()
+    ref = re.search(r"tc_[a-f0-9]+", output).group()
+    assert ContextCache().retrieve(ref) == full
+    assert giant in ContextCache().retrieve(ref)
+
+
+def test_mcp_map_preserves_limit_notice_and_limits_recovery(map_with_oversized_entry):
+    index = map_with_oversized_entry
+    full = index.query(mode="map", limit=1)
+    assert count_tokens(full).claude > 128
+    output = server.handle_usagetrim_code(
+        {"root": str(index.root), "mode": "map", "limit": 1, "max_tokens": 128}
+    )
+    assert count_tokens(output).claude <= 128
+    assert full.splitlines()[-1] in output.splitlines()
+    ref = re.search(r"tc_[a-f0-9]+", output).group()
+    recovered = ContextCache().retrieve(ref)
+    assert recovered == full and "giant" in recovered
+    assert " short | " not in recovered
+
+
+def test_mcp_map_preserves_complete_incomplete_index_notice(large_repo_map):
+    index = large_repo_map
+    (index.root / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+    index.sync()
+    full = index.query(mode="map", limit=100)
+    output = server.handle_usagetrim_code(
+        {"root": str(index.root), "mode": "map", "limit": 100, "max_tokens": 128}
+    )
+    assert count_tokens(output).claude <= 128
+    assert full.splitlines()[-1].startswith("[Incomplete index:")
+    assert full.splitlines()[-1] in output.splitlines()
+
+
+def test_map_budget_reserves_metadata_and_rejects_impossible_budget():
+    header = "# map: 200 files, 0 reindexed; PageRank-ranked syntax map (not LSP)"
+    entry = "sample.py:1-2 giant | def giant(" + ", ".join(f"param_{i}" for i in range(200)) + "):"
+    notice = "[More results omitted; narrow query/file or raise limit (max 200).]"
+    full = "\n".join((header, entry, notice))
+    ref = ContextCache().store(full, source="code-query")
+    metadata = header + "\n" + notice + "\n" + server.recovery_notice(ref)
+    minimum = count_tokens(metadata).claude
+    assert minimum > 64
+    assert (
+        server._budget_repo_map(_RepoMapResult(header + "\n", [entry], [notice]), minimum)
+        == metadata
+    )
+    with pytest.raises(ValueError, match="header, notices and recovery reference"):
+        server._budget_repo_map(_RepoMapResult(header + "\n", [entry], [notice]), minimum - 1)
+    with pytest.raises(ValueError, match="header, notices and recovery reference"):
+        server._budget_repo_map(_RepoMapResult(header + "\n", [entry], [notice]), 64)
+
+
+def test_map_budget_can_return_only_header_and_reference_at_64_tokens():
+    full = "# map\nsample.py:1-1 giant | " + "parameter " * 200
+    output = server._budget_repo_map(
+        _RepoMapResult("# map\n", [full.removeprefix("# map\n")], []), 64
+    )
+    assert count_tokens(output).claude <= 64
+    ref = re.search(r"tc_[a-f0-9]+", output).group()
+    assert output == "# map\n" + server.recovery_notice(ref)
+    assert ContextCache().retrieve(ref) == full
+
+
+def test_map_recovery_retains_existing_cache_redaction():
+    secret = "ghp_" + "a" * 36
+    full = "# map\nsample.py:1-1 giant | " + "parameter " * 200 + secret
+    output = server._budget_repo_map(
+        _RepoMapResult("# map\n", [full.removeprefix("# map\n")], []), 64
+    )
+    ref = re.search(r"tc_[a-f0-9]+", output).group()
+    recovered = ContextCache().retrieve(ref)
+    assert secret not in recovered and secret not in output
+    assert "[REDACTED" in recovered
+
+
+@pytest.mark.parametrize("mode", ["symbols", "search"])
+def test_non_map_code_modes_keep_generic_compression(large_repo_map, monkeypatch, mode):
+    calls = []
+    original_compress = server._compress
+
+    def compress(text, budget, **kwargs):
+        calls.append((text, budget, kwargs))
+        return original_compress(text, budget, **kwargs)
+
+    monkeypatch.setattr(server, "_compress", compress)
+    output = server.handle_usagetrim_code(
+        {"root": str(large_repo_map.root), "mode": mode, "query": "CoreService", "max_tokens": 128}
+    )
+    assert calls == [(large_repo_map.query(mode, "CoreService"), 128, {"source": "code-query"})]
+    assert count_tokens(output).claude <= 128
+
+
+def test_paused_map_keeps_existing_compression_bypass(large_repo_map, monkeypatch):
+    full = large_repo_map.query(mode="map", limit=100)
+    monkeypatch.setattr(server, "paused", lambda: True)
+    assert (
+        server.handle_usagetrim_code(
+            {"root": str(large_repo_map.root), "mode": "map", "limit": 100, "max_tokens": 128}
+        )
+        == full
+    )
+
+
+def test_cli_code_map_budget_uses_complete_entries_and_recovery(large_repo_map):
+    from typer.testing import CliRunner
+
+    from usagetrim.cli import app
+
+    full = large_repo_map.query(mode="map", limit=100)
+    result = CliRunner().invoke(
+        app,
+        [
+            "code",
+            str(large_repo_map.root),
+            "--mode",
+            "map",
+            "--limit",
+            "100",
+            "--budget",
+            "128",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert count_tokens(result.stdout).claude <= 128
+    assert result.stdout.splitlines()[0] == full.splitlines()[0]
+    ref = re.search(r"tc_[a-f0-9]+", result.stdout).group()
+    assert ContextCache().retrieve(ref) == full
+
+
 def test_mcp_code_and_search_recovery_obey_output_budget(tmp_path):
     root = tmp_path / "project"
     root.mkdir()
@@ -349,3 +900,50 @@ def test_code_index_references_and_callers_mode(tmp_path):
         {"root": str(root), "mode": "references", "query": "AuthService.verify_token"}
     )
     assert "login_endpoint" in mcp_res
+
+
+@pytest.mark.parametrize(
+    "computed_name,budget",
+    [
+        ('true ? "method":1-2', 96),
+        ('"foo.py:10-20 [Incomplete index: not a notice]"', 128),
+    ],
+)
+def test_mcp_map_structured_entries_ignore_boundary_like_symbol_text(
+    tmp_path, computed_name, budget
+):
+    source = "\n".join(
+        f"class C{number} {{\n  [\n    {computed_name}\n  ]() {{ return 1; }}\n}}"
+        for number in range(5)
+    )
+    (tmp_path / "computed.ts").write_text(source, encoding="utf-8")
+    index = CodeIndex(tmp_path)
+    index.sync()
+    full = index.query(mode="map")
+    symbols, _ = parse_source(source, "typescript")
+    entries = [
+        f"computed.ts:{symbol.line}-{symbol.end_line} {symbol.qualified} | {symbol.signature}"
+        for symbol in symbols
+    ]
+    assert sum("\n" in entry for entry in entries) == 5
+    structured = index._query_repo_map()
+    assert structured.entries == entries
+    assert structured.notices == []
+    assert structured.render() == full
+
+    output = server.handle_usagetrim_code(
+        {"root": str(tmp_path), "mode": "map", "max_tokens": budget}
+    )
+    assert count_tokens(output).claude <= budget
+    ref = re.search(r"tc_[a-f0-9]+", output).group()
+    selected = [entry for entry in entries if entry in output]
+    # No physical line is independently interpreted as an entry or notice.
+    assert output == structured.header + "\n".join(selected) + "\n" + server.recovery_notice(ref)
+    assert selected == [entry for entry in entries if entry in selected]
+    assert len(selected) < len(entries)
+    for entry in selected:
+        if "\n" in entry:
+            assert "] | " in entry
+    recovered = ContextCache().retrieve(ref)
+    assert recovered == full
+    assert all(entry in recovered for entry in entries if entry not in selected)
