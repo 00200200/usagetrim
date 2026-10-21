@@ -827,6 +827,127 @@ _DOCKER_KEEP_RE = re.compile(
 )
 
 
+_COMPOSE_PREFIX = re.compile(r"^(?:([\w][\w.-]*)\s+\|\s?|\[([\w][\w.-]*)\]\s*)(.*)$")
+_COMPOSE_EXIT = re.compile(r"^([\w][\w.-]*)\s+exited with code\s+\d+\b")
+_COMPOSE_ERROR = re.compile(
+    r"\b(?:error|warn(?:ing)?|fatal|fail(?:ed|ure)?|exception|traceback|panic)\b", re.I
+)
+
+
+def _compose_routine(payload: str) -> str | None:
+    if _COMPOSE_ERROR.search(payload):
+        return None
+    if re.fullmatch(r"\[healthcheck\]\s+ping\s+ok", payload.strip(), re.I):
+        return "healthcheck"
+    if re.fullmatch(
+        r'\S+ \S+ \S+ \[[^\]\r\n]+\] "GET /(?:ping|health|healthz) HTTP/[\d.]+" 200 \d+\s*', payload
+    ):
+        return "http-health"
+    if re.fullmatch(
+        r"\d+:[A-Z] \d{1,2} \w{3} \d{4} [\d:.]+ \* \d+ keys in \d+ shards", payload.strip()
+    ):
+        return "redis-heartbeat"
+    return None
+
+
+def _is_docker_compose_log_command(command: str) -> bool:
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    if not words or any(re.search(r"[;&|<>`\n]", word) for word in words):
+        return False
+    binary = PurePath(words[0]).name
+    if binary in {"docker", "podman"}:
+        if len(words) < 2 or words[1] != "compose":
+            return False
+        rest = words[2:]
+    elif binary in {"docker-compose", "podman-compose"}:
+        rest = words[1:]
+    else:
+        return False
+    value_flags = {
+        "-f",
+        "--file",
+        "-p",
+        "--project-name",
+        "--profile",
+        "--project-directory",
+        "--env-file",
+    }
+    while rest and rest[0].startswith("-"):
+        flag = rest[0]
+        if flag in value_flags and len(rest) >= 2:
+            rest = rest[2:]
+        elif "=" in flag and flag.split("=", 1)[0] in value_flags:
+            rest = rest[1:]
+        else:
+            return False
+    return bool(rest and rest[0] in {"up", "logs"})
+
+
+def filter_docker_compose(raw_output: str) -> str:
+    """Fold explicit successful routine logs, preserving order and crash context.
+
+    Unknown lines and errors are never sampled. Before every exit, keep the
+    last ten prefixed lines of every observed service, including routine lines.
+    Even an exact exit-name match can belong to a different service's container;
+    logs alone do not establish the project/custom-container naming map.
+    """
+    from collections import deque
+
+    lines = raw_output.splitlines(keepends=True)
+    parsed = []
+    history: dict[str, deque[int]] = {}
+    protected: set[int] = set()
+    for index, line in enumerate(lines):
+        match = _COMPOSE_PREFIX.match(line.rstrip("\r\n"))
+        record = (match[1] or match[2], match[3]) if match else None
+        parsed.append(record)
+        if record:
+            history.setdefault(record[0], deque(maxlen=10)).append(index)
+        exit_match = _COMPOSE_EXIT.match(line)
+        if exit_match:
+            # Do not infer identity from an exact or suffix match: project and
+            # custom container names can collide with another service's prefix.
+            for candidate in history.values():
+                protected.update(candidate)
+    groups: dict[str, tuple[str, list[int]]] = {}
+    replacements: dict[int, str] = {}
+
+    def flush(service: str) -> None:
+        group = groups.pop(service, None)
+        if group is None or len(group[1]) < 3:
+            return
+        _, indices = group
+        for index in indices[1:]:
+            replacements[index] = ""
+        last = indices[-1]
+        ending = (
+            "\r\n" if lines[last].endswith("\r\n") else "\n" if lines[last].endswith("\n") else ""
+        )
+        replacements[last] = (
+            f"{service} | [... {len(indices) - 1} routine log lines collapsed by usagetrim ...]{ending}"
+        )
+
+    for index, record in enumerate(parsed):
+        if record is None:
+            for service in list(groups):
+                flush(service)
+            continue
+        service, payload = record
+        kind = None if index in protected else _compose_routine(payload)
+        if kind is None:
+            flush(service)
+            continue
+        if service in groups and groups[service][0] != kind:
+            flush(service)
+        groups.setdefault(service, (kind, []))[1].append(index)
+    for service in list(groups):
+        flush(service)
+    return "".join(replacements.get(index, line) for index, line in enumerate(lines))
+
+
 def filter_docker_build(raw_output: str) -> str:
     """Collapse BuildKit layer progress while keeping failures and final tags."""
     if not raw_output.strip():
@@ -3700,6 +3821,8 @@ def auto_specialize_command_output(command: str, raw_output: str) -> str | None:
     gh_compact = filter_gh_command_output(command, raw_output)
     if gh_compact is not None:
         return gh_compact
+    if _is_docker_compose_log_command(command):
+        return filter_docker_compose(raw_output)
     if _is_cloud_log_command(command):
         return filter_cloud_logs(raw_output)
     trace_output = _compact_trace_payload(raw_output)

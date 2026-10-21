@@ -91,6 +91,7 @@ Local `o200k_base` estimate — not billing, quality, or subscription-limit clai
 ```sh
 usagetrim run -- pytest -v
 usagetrim run -- docker build -t app .
+usagetrim run -- docker compose logs
 usagetrim run -- cargo test
 usagetrim run -- go test ./...
 usagetrim run -- kubectl describe pod api-7d8f9c-xk2m9
@@ -104,6 +105,7 @@ usagetrim run -- npx eslint . --format codeframe
 
 - **Compact other MCP servers, losslessly.** The Claude Code hook rewrites results from *other* MCP servers: uniform JSON rows become TSV with the keys once, `{"result": "…"}` wrappers lose their escaping, and indentation goes. Every value and type survives, and prompt-injection boundaries such as Supabase's `<untrusted-data-…>` stay verbatim. [Measured below](#measured-on-real-sessions).
 - **Spend Haiku, not Opus, on reading.** The plugin adds `scout` (read-only search) and `runner` (tests and builds, failures only) agents on Haiku, so the main model gets conclusions instead of files and logs. `usagetrim install --cheap-explore` moves Claude Code's built-in Explore, which now inherits the main model, back to Haiku. `/output-style usagetrim:lean` trims reply preambles and recaps.
+- **Compose logs.** `docker compose` / `docker-compose` / `podman compose` / `podman-compose` `up` and `logs` fold repeated successful healthchecks, HTTP health polls and Redis heartbeats per service. Unknown lines, errors and exit events remain intact. Before every exit, the last ten lines of every observed service are preserved: even an exact name match can refer to another service's container. This deliberately favors crash context over maximum compression when project or custom container names are ambiguous. ANSI-decorated or other unrecognized formats are left unchanged; no Docker/Podman daemon is needed by the filter.
 - **Cut noise, keep the failure.** Specialized filters for pytest, Docker, cargo, go, vitest, eslint, tsc, mypy, pyright, kubectl, terraform/tofu plan|apply|destroy, GitHub Actions / GitLab CI log folding (`gh run view --log-failed`, `glab ci trace`), `uv sync`/`uv add`, git diff, ruff…
 - **Session dedup + spill.** Same `run` output *or* identical `cat` / MCP `usagetrim_read` view within ~15 minutes → short cache ref. Payloads over ~20 KiB → file + preview (`USAGETRIM_SPILL_BYTES`).
 - **Recover by reference.** Omitted text stays in a local CCR cache: `usagetrim retrieve tc_…`
