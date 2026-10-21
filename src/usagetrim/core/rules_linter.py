@@ -157,15 +157,28 @@ class _RuleBlock:
     uncertain: bool = False
 
 
-def _starts_markdown_block(lines: list[str], index: int) -> bool:
-    line = lines[index]
+def _starts_non_setext_block(line: str) -> bool:
+    """Recognize block starts that cannot serve as Setext title text."""
     if not line.strip():
         return True
     if re.match(
-        r"^(?: {0,3}(?:`{3,}|~{3,}|#{1,6}(?:[ \t]|$)|>|<!--|(?:[-+*]|\d+[.)])[ \t])| {4}|\t)", line
+        r"^(?: {4}|\t| {0,3}(?:`{3,}|~{3,}|#{1,6}(?:[ \t]|$)|>|<!--|(?:[-+*]|\d+[.)])(?:[ \t]|$)))",
+        line,
     ):
         return True
-    if re.fullmatch(r" {0,3}(?:(?:[ *_-]\s*){3,}|=+|-+)[ \t]*", line):
+    return bool(
+        re.fullmatch(
+            r" {0,3}(?:\*(?:[ \t]*\*){2,}|-(?:[ \t]*-){2,}|_(?:[ \t]*_){2,})[ \t]*",
+            line,
+        )
+    )
+
+
+def _starts_markdown_block(lines: list[str], index: int) -> bool:
+    line = lines[index]
+    if _starts_non_setext_block(line):
+        return True
+    if re.fullmatch(r" {0,3}(?:=+|-+)[ \t]*", line):
         return True
     if re.fullmatch(r"Dynamic Runtime Context\s*:?\s*", line, re.I):
         return True
@@ -196,6 +209,73 @@ def _inline_code_end(lines: list[str], start: int) -> tuple[int, bool] | None:
 def _rule_line(line: str) -> str:
     # Markdown hard breaks are semantic, unlike ordinary trailing padding.
     return line if line.endswith("  ") and line.strip() else line.rstrip(" \t")
+
+
+def _fenced_block_end(lines: list[str], start: int) -> int | None:
+    """Return the end of a fenced block, respecting its delimiter and length."""
+    opening = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", lines[start])
+    if opening is None:
+        return None
+    token = opening[1]
+    index = start + 1
+    while index < len(lines):
+        closing = re.fullmatch(
+            r" {0,3}" + re.escape(token[0]) + "{" + str(len(token)) + r",}[ \t]*",
+            lines[index],
+        )
+        index += 1
+        if closing:
+            break
+    return index
+
+
+def _html_comment_start(line: str) -> int | None:
+    """Find a comment opener outside inline backtick code spans."""
+    delimiter = None
+    for match in re.finditer(r"`+|<!--", line):
+        token = match[0]
+        if token == "<!--":
+            if delimiter is None:
+                return match.start()
+        elif (len(line[: match.start()]) - len(line[: match.start()].rstrip("\\"))) % 2 == 0:
+            if delimiter is None:
+                delimiter = len(token)
+            elif len(token) == delimiter:
+                delimiter = None
+    return None
+
+
+def _html_comment_end(lines: list[str], start: int) -> int | None:
+    """Consume block comments; stop inline comments at a new Markdown block."""
+    opening = _html_comment_start(lines[start])
+    if opening is None:
+        return None
+    block_comment = bool(re.match(r"^ {0,3}<!--", lines[start]))
+    index = start + 1
+    if "-->" not in lines[start][opening + 4 :]:
+        while index < len(lines):
+            if not block_comment and _starts_non_setext_block(lines[index]):
+                break
+            closed = "-->" in lines[index]
+            index += 1
+            if closed:
+                break
+    return index
+
+
+def _setext_heading(lines: list[str], start: int) -> tuple[int, int] | None:
+    """Find a Setext underline after consecutive lines of one paragraph."""
+    if _starts_non_setext_block(lines[start]):
+        return None
+    index = start + 1
+    while index < len(lines):
+        if re.fullmatch(r" {0,3}(?:=+|-+)[ \t]*", lines[index]):
+            level = 1 if lines[index].lstrip().startswith("=") else 2
+            return index + 1, level
+        if _starts_non_setext_block(lines[index]):
+            break
+        index += 1
+    return None
 
 
 def _complete_list_items(blocks: list[_RuleBlock]) -> list[_RuleBlock]:
@@ -264,24 +344,17 @@ def _scan_rules(content: str) -> list[_RuleBlock]:
         heading = re.match(r"^ {0,3}(#{1,6})(?:[ \t]+|$)", line)
         heading_level = None
         uncertain = False
-        fence = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        fence_end = _fenced_block_end(lines, index)
+        setext = _setext_heading(lines, index)
+        html_comment = _html_comment_start(line)
         if index == 0 and line.lstrip("\ufeff") == "---":
             index += 1
             while index < len(lines) and lines[index] not in {"---", "..."}:
                 index += 1
             index = min(index + 1, len(lines))
             kind = "protected"
-        elif fence:
-            token = fence[1]
-            index += 1
-            while index < len(lines):
-                closing = re.fullmatch(
-                    r" {0,3}" + re.escape(token[0]) + "{" + str(len(token)) + r",}[ \t]*",
-                    lines[index],
-                )
-                index += 1
-                if closing:
-                    break
+        elif fence_end is not None:
+            index = fence_end
             kind = "protected"
         elif line.startswith(("    ", "\t")) and not re.match(r"^\s*(?:[-+*]|\d+[.)])\s", line):
             index += 1
@@ -292,21 +365,21 @@ def _scan_rules(content: str) -> list[_RuleBlock]:
             kind = "protected"
         elif (
             "`" in line
-            and ("<!--" not in line or line.index("`") < line.index("<!--"))
+            and (html_comment is None or line.index("`") < html_comment)
             and (inline_end := _inline_code_end(lines, index)) is not None
         ):
             index, closed = inline_end
             uncertain = not closed
             kind = "protected"
             heading_level = len(heading[1]) if heading else None
-        elif (
-            index + 1 < len(lines)
-            and line.strip()
-            and re.fullmatch(r" {0,3}(?:=+|-+)[ \t]*", lines[index + 1])
-        ):
-            heading_level = 1 if lines[index + 1].lstrip().startswith("=") else 2
-            index += 2
+        elif setext is not None:
+            index, heading_level = setext
             kind = "protected"
+            uncertain = any(
+                (_html_comment_end(lines, title_index) or 0) > index
+                for title_index in range(start, index - 1)
+                if _html_comment_start(lines[title_index]) is not None
+            )
         elif re.fullmatch(
             r"(?:#{1,6}\s+)?Dynamic Runtime Context\s*:?\s*|<!-- Dynamic Runtime Context \(isolated for prompt caching\) -->",
             line,
@@ -319,16 +392,27 @@ def _scan_rules(content: str) -> list[_RuleBlock]:
                 next_heading = re.match(r"^ {0,3}(#{1,6})(?:[ \t]+|$)", lines[index])
                 if next_heading and len(next_heading[1]) <= level:
                     break
-                index += 1
+                next_setext = _setext_heading(lines, index)
+                if next_setext is not None and next_setext[1] <= level:
+                    break
+                # Only headings outside opaque blocks can end this section.
+                next_line = lines[index]
+                next_html = _html_comment_start(next_line)
+                next_inline = (
+                    _inline_code_end(lines, index)
+                    if "`" in next_line and (next_html is None or next_line.index("`") < next_html)
+                    else None
+                )
+                index = (
+                    _fenced_block_end(lines, index)
+                    or (next_inline[0] if next_inline is not None else None)
+                    or _html_comment_end(lines, index)
+                    or (next_setext[0] if next_setext is not None else None)
+                    or index + 1
+                )
             kind = "dynamic"
-        elif "<!--" in line:
-            index += 1
-            if "-->" not in line.split("<!--", 1)[1]:
-                while index < len(lines):
-                    end = "-->" in lines[index]
-                    index += 1
-                    if end:
-                        break
+        elif html_comment is not None:
+            index = _html_comment_end(lines, index)
             # If opaque constructs overlap, retain the union rather than exposing
             # a continuation as ordinary prose.
             for boundary in {start, index - 1}:
@@ -339,7 +423,8 @@ def _scan_rules(content: str) -> list[_RuleBlock]:
                         index = max(index, end)
                         uncertain |= not closed
             kind = "protected"
-            heading_level = len(heading[1]) if heading else None
+            if heading_level is None:
+                heading_level = len(heading[1]) if heading else None
         else:
             index += 1
             if not line.strip():

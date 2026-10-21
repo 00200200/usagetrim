@@ -560,3 +560,232 @@ def test_targeted_block_collision_self_review_preserves_content(content):
     for transform in (minify_rules, lambda text: optimize_rules(text)["optimized_content"]):
         assert transform(content) == content
         assert transform(transform(content)) == content
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~", "````", "~~~~"])
+def test_dynamic_section_skips_complete_fenced_block_before_real_heading(fence):
+    from usagetrim.core.rules_linter import _scan_rules
+
+    shorter = fence[:-1] + "\n" if len(fence) == 4 else ""
+    body = f"{fence}text\n{shorter}# Other\nHello Claude!\n<!-- comment -->\n{fence}"
+    content = f"## Dynamic Runtime Context\n{body}\n## Real heading\n- Run tests.\n"
+    blocks = _scan_rules(content)
+    assert blocks[0].kind == "dynamic"
+    assert blocks[0].lines == ["## Dynamic Runtime Context", *body.splitlines()]
+    assert blocks[1].kind == "heading"
+    assert blocks[1].lines == ["## Real heading"]
+    for transform in (minify_rules, lambda text: optimize_rules(text)["optimized_content"]):
+        assert transform(content) == content
+        assert transform(transform(content)) == content
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~"])
+def test_dynamic_section_ignores_heading_inside_html_comment(fence):
+    from usagetrim.core.rules_linter import _scan_rules
+
+    content = (
+        "## Dynamic Runtime Context\n<!--\n# Other\n-->\n"
+        f"{fence}text\n## Dynamic Runtime Context\n# Other\n{fence}\n"
+        "## Real heading\n- Run tests.\n"
+    )
+    blocks = _scan_rules(content)
+    assert blocks[0].kind == "dynamic"
+    assert blocks[0].lines[-1] == fence
+    assert blocks[1].lines == ["## Real heading"]
+    assert optimize_rules(content)["optimized_content"] == content
+
+
+@pytest.mark.parametrize("underline", ["=======", "-------"])
+def test_setext_multiline_html_comment_keeps_dynamic_sibling_scopes(underline):
+    from usagetrim.core.rules_linter import _scan_rules
+
+    content = (
+        f"Staging <!-- env\ncomment continuation\n-->\n{underline}\n"
+        "### Dynamic Runtime Context\nWorkspace: /srv/staging\n\n"
+        f"Production <!-- env\n-->\n{underline}\n"
+        "### Dynamic Runtime Context\nWorkspace: /srv/production\n"
+    )
+    blocks = _scan_rules(content)
+    parents = [block for block in blocks if block.lines[0].startswith(("Staging", "Production"))]
+    assert [block.lines[-1] for block in parents] == [underline, underline]
+    assert [block.kind for block in parents] == ["protected", "protected"]
+    dynamic = [block for block in blocks if block.kind == "dynamic"]
+    assert [block.scope for block in dynamic] == [(1,), (8,)]
+    assert [block.lines[1] for block in dynamic] == [
+        "Workspace: /srv/staging",
+        "Workspace: /srv/production",
+    ]
+    for transform in (minify_rules, lambda text: optimize_rules(text)["optimized_content"]):
+        assert transform(content) == content
+        assert transform(transform(content)) == content
+
+
+@pytest.mark.parametrize("underline,expected_scope", [("=======", (1, 4)), ("-------", (4,))])
+def test_setext_comment_assigns_the_correct_heading_level(underline, expected_scope):
+    from usagetrim.core.rules_linter import _scan_rules
+
+    content = (
+        f"Title <!-- comment\n-->\n{underline}\n"
+        "## Next section\n### Dynamic Runtime Context\nWorkspace: /srv/next\n"
+    )
+    dynamic = [block for block in _scan_rules(content) if block.kind == "dynamic"]
+    assert [block.scope for block in dynamic] == [expected_scope]
+    assert optimize_rules(content)["optimized_content"] == content
+
+
+@pytest.mark.parametrize("underline", ["=======", "-------"])
+def test_setext_multiline_comment_ends_at_underline(underline):
+    from usagetrim.core.rules_linter import _scan_rules
+
+    content = f"Title <!-- comment\n-->\n{underline}\nordinary prose\n"
+    blocks = _scan_rules(content)
+    assert blocks[0].lines == ["Title <!-- comment", "-->", underline]
+    assert blocks[1].kind == "prose"
+    assert blocks[1].lines == ["ordinary prose"]
+    assert optimize_rules(content)["optimized_content"] == content
+
+
+def test_setext_title_with_inline_code_and_unclosed_comment_is_preserved():
+    valid = "Title `code` <!-- note\ncomment continuation\n-->\n=======\ntext\n"
+    malformed = "Title <!-- unclosed\n=======\nHello Claude!\n"
+    for content in (valid, malformed):
+        assert optimize_rules(content)["optimized_content"] == content
+        assert minify_rules(content) == content
+
+
+@pytest.mark.parametrize("underline", ["=======", "-------"])
+def test_separate_html_comment_does_not_create_setext_ancestry(underline):
+    from usagetrim.core.rules_linter import _scan_rules
+
+    content = (
+        f"Title\n<!-- note\n-->\n{underline}\n### Dynamic Runtime Context\nWorkspace: /srv/title\n"
+    )
+    blocks = _scan_rules(content)
+    assert blocks[0].kind == "prose" and blocks[0].lines == ["Title"]
+    assert blocks[1].kind == "protected" and blocks[1].lines == ["<!-- note", "-->"]
+    assert blocks[2].lines == [underline]
+    dynamic = [block for block in blocks if block.kind == "dynamic"]
+    assert len(dynamic) == 1 and dynamic[0].scope == ()
+
+
+@pytest.mark.parametrize("delimiter", ["`", "``"])
+def test_html_comment_literal_inside_setext_inline_code_keeps_heading(delimiter):
+    from usagetrim.core.rules_linter import _scan_rules
+
+    content = (
+        f"Title {delimiter}<!--{delimiter}\n=======\n"
+        "### Dynamic Runtime Context\nWorkspace: /srv/title\n"
+    )
+    blocks = _scan_rules(content)
+    assert blocks[0].kind == "protected"
+    assert blocks[0].lines == [f"Title {delimiter}<!--{delimiter}", "======="]
+    assert [block.scope for block in blocks if block.kind == "dynamic"] == [(1,)]
+    assert optimize_rules(content)["optimized_content"] == content
+
+
+@pytest.mark.parametrize("delimiter", ["`", "``"])
+def test_html_comment_literal_inside_dynamic_section_does_not_hide_real_heading(delimiter):
+    from usagetrim.core.rules_linter import _scan_rules
+
+    content = (
+        f"## Dynamic Runtime Context\nLiteral {delimiter}<!--{delimiter}\n"
+        "## Real heading\n- Run tests.\n"
+    )
+    blocks = _scan_rules(content)
+    assert blocks[0].kind == "dynamic"
+    assert blocks[0].lines == ["## Dynamic Runtime Context", f"Literal {delimiter}<!--{delimiter}"]
+    assert blocks[1].kind == "heading" and blocks[1].lines == ["## Real heading"]
+    assert optimize_rules(content)["optimized_content"] == content
+
+
+@pytest.mark.parametrize("title", [">Title", "># Title", ">", "***", "---", "___"])
+def test_setext_candidate_cannot_start_as_another_markdown_block(title):
+    from usagetrim.core.rules_linter import _scan_rules, _setext_heading
+
+    assert _setext_heading([title, "======="], 0) is None
+    content = f"# Prelude\n{title}\n=======\n### Dynamic Runtime Context\nWorkspace: /srv/test\n"
+    blocks = _scan_rules(content)
+    assert not any(block.lines == [title, "======="] for block in blocks)
+    assert [block.scope for block in blocks if block.kind == "dynamic"] == [(1,)]
+
+
+@pytest.mark.parametrize(
+    "content,following",
+    [
+        ("Text <!-- comment\n## Real heading\n-->\n", ["## Real heading"]),
+        (
+            "Text <!-- comment\n```text\nHello Claude!\n```\n-->\n",
+            ["```text", "Hello Claude!", "```"],
+        ),
+        ("Text <!-- comment\n> block quote\n-->\n", ["> block quote"]),
+    ],
+)
+def test_inline_html_comment_stops_at_a_new_markdown_block(content, following):
+    from usagetrim.core.rules_linter import _scan_rules
+
+    blocks = _scan_rules(content)
+    assert blocks[0].kind == "protected" and blocks[0].lines == ["Text <!-- comment"]
+    assert blocks[1].lines == following
+    assert optimize_rules(content)["optimized_content"] == content
+
+
+def test_html_block_comment_keeps_heading_looking_lines_opaque():
+    from usagetrim.core.rules_linter import _scan_rules
+
+    content = "<!--\n## Not a real heading\n-->\n"
+    blocks = _scan_rules(content)
+    assert blocks[0].kind == "protected" and blocks[0].lines == content.splitlines()
+    assert optimize_rules(content)["optimized_content"] == content
+
+
+@pytest.mark.parametrize("block_comment", [False, True])
+def test_dynamic_section_distinguishes_inline_and_block_html_comments(block_comment):
+    from usagetrim.core.rules_linter import _scan_rules
+
+    if block_comment:
+        content = (
+            "## Dynamic Runtime Context\n<!--\n## Not a heading\n-->\n"
+            "## Real heading\n- Run tests.\n"
+        )
+        expected_dynamic = ["## Dynamic Runtime Context", "<!--", "## Not a heading", "-->"]
+    else:
+        content = "## Dynamic Runtime Context\nText <!-- comment\n## Real heading\n- Run tests.\n"
+        expected_dynamic = ["## Dynamic Runtime Context", "Text <!-- comment"]
+    blocks = _scan_rules(content)
+    assert blocks[0].kind == "dynamic" and blocks[0].lines == expected_dynamic
+    assert blocks[1].kind == "heading" and blocks[1].lines == ["## Real heading"]
+    assert optimize_rules(content)["optimized_content"] == content
+
+
+@pytest.mark.parametrize("underline", ["=======", "-------"])
+def test_multiline_setext_heading_ends_dynamic_section(underline):
+    from usagetrim.core.rules_linter import _scan_rules
+
+    content = (
+        "## Dynamic Runtime Context\nText <!-- comment\nOther\n"
+        f"{underline}\n### Real heading\n- Run tests.\n"
+    )
+    blocks = _scan_rules(content)
+    assert blocks[0].kind == "dynamic"
+    assert blocks[0].lines == ["## Dynamic Runtime Context"]
+    assert blocks[1].kind == "protected"
+    assert blocks[1].lines == ["Text <!-- comment", "Other", underline]
+    assert blocks[1].scope == ()
+    assert blocks[2].kind == "heading" and blocks[2].lines == ["### Real heading"]
+    assert blocks[3].kind == "list" and blocks[3].lines == ["- Run tests."]
+    assert optimize_rules(content)["optimized_content"] == content
+
+
+@pytest.mark.parametrize("underline", ["=======", "-------"])
+def test_multiline_paragraph_setext_heading_sets_dynamic_parent_scope(underline):
+    from usagetrim.core.rules_linter import _scan_rules
+
+    content = (
+        f"First line\nsecond line\n{underline}\n### Dynamic Runtime Context\nWorkspace: /srv/test\n"
+    )
+    blocks = _scan_rules(content)
+    assert blocks[0].kind == "protected"
+    assert blocks[0].lines == ["First line", "second line", underline]
+    assert blocks[1].kind == "dynamic"
+    assert blocks[1].scope == (1,)
+    assert optimize_rules(content)["optimized_content"] == content
