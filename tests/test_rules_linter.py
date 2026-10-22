@@ -789,3 +789,25 @@ def test_multiline_paragraph_setext_heading_sets_dynamic_parent_scope(underline)
     assert blocks[1].kind == "dynamic"
     assert blocks[1].scope == (1,)
     assert optimize_rules(content)["optimized_content"] == content
+
+
+@pytest.mark.parametrize("underline", ["=======", "-------"])
+def test_setext_indented_paragraph_continuation_keeps_dynamic_parent_scope(underline):
+    from usagetrim.core.rules_linter import _scan_rules, _setext_heading
+
+    content = (
+        f"Staging\n    environment\n{underline}\n"
+        "### Dynamic Runtime Context\nWorkspace: /srv/staging\n"
+    )
+    blocks = _scan_rules(content)
+    assert blocks[0].kind == "protected"
+    assert blocks[0].lines == ["Staging", "    environment", underline]
+    assert blocks[1].kind == "dynamic" and blocks[1].scope == (1,)
+    assert blocks[1].lines[:2] == [
+        "### Dynamic Runtime Context",
+        "Workspace: /srv/staging",
+    ]
+    assert _setext_heading(["    environment", underline], 0) is None
+    assert _setext_heading(["Staging", "    ", "    environment", underline], 0) is None
+    assert minify_rules(content) == content
+    assert optimize_rules(content)["optimized_content"] == content

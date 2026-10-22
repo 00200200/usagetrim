@@ -272,7 +272,11 @@ def _setext_heading(lines: list[str], start: int) -> tuple[int, int] | None:
         if re.fullmatch(r" {0,3}(?:=+|-+)[ \t]*", lines[index]):
             level = 1 if lines[index].lstrip().startswith("=") else 2
             return index + 1, level
-        if _starts_non_setext_block(lines[index]):
+        # Indented code cannot interrupt an existing paragraph. Nonblank
+        # indented lines therefore continue a title, but cannot start one.
+        continuation = lines[index]
+        indented = continuation.startswith(("    ", "\t")) and bool(continuation.strip())
+        if not indented and _starts_non_setext_block(continuation):
             break
         index += 1
     return None
