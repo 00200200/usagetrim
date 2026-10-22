@@ -348,8 +348,30 @@ TOOLS_DEFINITIONS = [
                 },
                 "skeleton": {
                     "type": "boolean",
-                    "description": "If true, force AST structural skeletons for all code files.",
+                    "description": "Legacy alias for mode=skeleton.",
                     "default": False,
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["xml", "markdown"],
+                    "default": "xml",
+                    "description": "Repository pack output format.",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["full", "skeleton", "hybrid"],
+                    "default": "skeleton",
+                    "description": "Full source, AST skeletons, or full focus paths with skeletons elsewhere.",
+                },
+                "focus": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Repo-relative focus files/directories for hybrid mode.",
+                },
+                "strip_comments": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Strip comments from full source files.",
                 },
             },
             "required": ["root"],
@@ -1074,7 +1096,7 @@ def handle_usagetrim_clip(arguments: dict[str, Any]) -> str:
 
 @_timed
 def handle_usagetrim_pack(arguments: dict[str, Any]) -> str:
-    from usagetrim.core.pack import pack_context
+    from usagetrim.core.pack import pack_repository
 
     root_str = arguments.get("root")
     if not root_str:
@@ -1086,13 +1108,39 @@ def handle_usagetrim_pack(arguments: dict[str, Any]) -> str:
     budget = arguments.get("budget", 4000)
     if type(budget) is not int or not 100 <= budget <= 64000:
         raise ValueError("budget must be an integer between 100 and 64000")
-    force_skeleton = bool(arguments.get("skeleton", False))
-
-    res = pack_context(
+    mode = arguments.get("mode", "skeleton")
+    format_type = arguments.get("format", "xml")
+    focus = arguments.get("focus")
+    paths = arguments.get("paths")
+    skeleton = arguments.get("skeleton", False)
+    strip_comments = arguments.get("strip_comments", False)
+    if (
+        type(mode) is not str
+        or type(format_type) is not str
+        or mode not in {"full", "skeleton", "hybrid"}
+        or format_type not in {"xml", "markdown"}
+    ):
+        raise ValueError("invalid pack mode or format")
+    if type(skeleton) is not bool or type(strip_comments) is not bool:
+        raise ValueError("skeleton and strip_comments must be booleans")
+    if skeleton and mode != "skeleton":
+        raise ValueError("skeleton conflicts with mode")
+    if focus is not None and (
+        not isinstance(focus, list) or any(type(x) is not str for x in focus)
+    ):
+        raise ValueError("focus must be an array of strings")
+    if paths is not None and (
+        not isinstance(paths, list) or any(type(x) is not str for x in paths)
+    ):
+        raise ValueError("paths must be an array of strings")
+    res = pack_repository(
         paths=paths,
         root=root,
         budget=budget,
-        force_skeleton=force_skeleton,
+        mode=mode,
+        format_type=format_type,
+        focus=focus,
+        strip_comments=strip_comments,
     )
     return _record("", res.bundle_text, operation="pack", project=root)
 

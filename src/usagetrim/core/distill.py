@@ -337,7 +337,49 @@ def _create_tool_receipt(
                 summary = clean
                 break
 
-    return f"[Tool {tool_name}{target} -> {summary} (omitted by usagetrim; ref: {ref_id})]"
+    return redact_secrets(
+        f"[Tool {tool_name}{target} -> {summary} (omitted by usagetrim; ref: {ref_id})]"
+    )
+
+
+def _compact_tool_observations(
+    msg: dict[str, Any],
+    tool_calls_map: dict[str, tuple[str, str]],
+    cache: ContextCache,
+    min_tool_tokens: int = 80,
+) -> dict[str, Any]:
+    """Copy a message and compact only verbose textual tool result content."""
+    m = copy.deepcopy(msg)
+    role = str(m.get("role", "")).lower()
+
+    def compact(content, name, args_str):
+        if isinstance(content, str):
+            if count_tokens(content).openai > min_tool_tokens:
+                return _create_tool_receipt(name, args_str, content, cache)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        part["text"] = compact(text, name, args_str)
+        return content
+
+    if role == "tool":
+        if "content" in m:
+            cid = str(m.get("tool_call_id", ""))
+            name, args_str = tool_calls_map.get(cid, (m.get("name") or "tool", ""))
+            m["content"] = compact(m["content"], name, args_str)
+        return m
+
+    content = m.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                if "content" in block:
+                    cid = str(block.get("tool_use_id", ""))
+                    name, args_str = tool_calls_map.get(cid, ("tool", ""))
+                    block["content"] = compact(block["content"], name, args_str)
+    return m
 
 
 def _compact_intermediate_message(
@@ -347,36 +389,9 @@ def _compact_intermediate_message(
     min_tool_tokens: int = 80,
 ) -> dict[str, Any]:
     """Compact verbose tool observations and condense thoughts in an intermediate turn."""
-    m = copy.deepcopy(msg)
+    m = _compact_tool_observations(msg, tool_calls_map, cache, min_tool_tokens)
     role = str(m.get("role", "")).lower()
-
-    if role == "tool":
-        content = m.get("content")
-        if isinstance(content, str):
-            tok_count = count_tokens(content).openai
-            if tok_count > min_tool_tokens:
-                cid = str(m.get("tool_call_id", ""))
-                name, args_str = tool_calls_map.get(cid, (m.get("name") or "tool", ""))
-                m["content"] = _create_tool_receipt(name, args_str, content, cache)
-        return m
-
     content = m.get("content")
-    if isinstance(content, list):
-        new_blocks: list[Any] = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "tool_result":
-                b = copy.deepcopy(block)
-                res_content = b.get("content")
-                if isinstance(res_content, str):
-                    if count_tokens(res_content).openai > min_tool_tokens:
-                        cid = str(b.get("tool_use_id", ""))
-                        name, args_str = tool_calls_map.get(cid, ("tool", ""))
-                        b["content"] = _create_tool_receipt(name, args_str, res_content, cache)
-                new_blocks.append(b)
-            else:
-                new_blocks.append(block)
-        m["content"] = new_blocks
-        return m
 
     if role == "assistant" and isinstance(content, str):
         if _THOUGHT_BLOCK.search(content):

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import copy
 import json
+import re
+
+import pytest
 
 from usagetrim.core.cache import ContextCache
-from usagetrim.core.optimizer import optimize_context
+from usagetrim.core.optimizer import mask_completed_observations, optimize_context
+from usagetrim.metrics.tokenizer import count_tokens
 
 
 def test_optimize_intra_fence_json_to_toon():
@@ -158,3 +163,162 @@ def test_optimize_secret_redaction():
     assert "AKIAIOSFODNN7EXAMPLE" not in res.text
     assert "[REDACTED_AWS_KEY]" in res.text
     assert ContextCache().retrieve(res.ref_id) == res.text
+
+
+def _long_observation():
+    return "\n".join(
+        f"Diagnostic row {i}: worker completed operation in {i + 10} ms" for i in range(200)
+    )
+
+
+def test_mask_completed_observations_reduces_history_and_preserves_active_result():
+    output = _long_observation()
+    history = [
+        {"role": "user", "content": "Inspect the service."},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "done",
+                    "function": {"name": "read_file", "arguments": '{"path":"src/service.py"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "done", "content": output, "metadata": {"exit": 0}},
+        {"role": "assistant", "content": "The service is healthy."},
+        {"role": "user", "content": "Now inspect the active request."},
+        {"role": "tool", "tool_call_id": "active", "content": "active diagnostic " * 200},
+    ]
+    before = copy.deepcopy(history)
+    masked = mask_completed_observations(history)
+    assert history == before
+    assert masked[:2] == history[:2] and masked[3:] == history[3:]
+    assert masked[2]["tool_call_id"] == "done"
+    assert masked[2]["metadata"] == {"exit": 0}
+    assert "read_file" in masked[2]["content"] and "src/service.py" in masked[2]["content"]
+    ref = re.search(r"tc_[a-f0-9]+", masked[2]["content"])[0]
+    assert ContextCache().retrieve(ref) == output
+    raw_tokens = count_tokens(json.dumps(history)).openai
+    assert 100 * (raw_tokens - count_tokens(json.dumps(masked)).openai) / raw_tokens > 60
+    masked[2]["metadata"]["exit"] = 1
+    assert history[2]["metadata"]["exit"] == 0
+
+
+@pytest.mark.parametrize(
+    "content", [None, "", " \n", [], [{"type": "thinking", "thinking": "Working"}]]
+)
+def test_mask_requires_nonempty_assistant_text(content):
+    history = [
+        {"role": "tool", "tool_call_id": "pending", "content": _long_observation()},
+        {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [{"id": "next", "function": {"name": "read"}}],
+        },
+    ]
+    assert mask_completed_observations(history) == history
+
+
+@pytest.mark.parametrize("role", ["user", "human", "system", "developer"])
+def test_mask_does_not_use_synthesis_from_another_turn(role):
+    history = [
+        {"role": "tool", "content": _long_observation()},
+        {"role": role, "content": "Start another request."},
+        {"role": "assistant", "content": "New request completed."},
+    ]
+    assert mask_completed_observations(history) == history
+
+
+@pytest.mark.parametrize("structured_content", [False, True])
+def test_mask_anthropic_results_preserves_blocks_and_uses_text_synthesis(structured_content):
+    output = _long_observation()
+    content = (
+        [
+            {"type": "text", "text": output, "extra": "keep"},
+            {"type": "image", "source": {"type": "base64", "data": "keep"}},
+        ]
+        if structured_content
+        else output
+    )
+    history = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "lookup",
+                    "name": "lookup",
+                    "input": {"query": "service"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "lookup",
+                    "is_error": True,
+                    "content": content,
+                }
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "The lookup result shows the cause."}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "active", "content": output}],
+        },
+    ]
+    before = copy.deepcopy(history)
+    masked = mask_completed_observations(history)
+    assert history == before
+    assert masked[0] == history[0] and masked[2:] == history[2:]
+    block = masked[1]["content"][0]
+    assert block["tool_use_id"] == "lookup" and block["is_error"] is True
+    if structured_content:
+        assert block["content"][1] == content[1]
+        assert block["content"][0]["extra"] == "keep"
+        receipt = block["content"][0]["text"]
+    else:
+        receipt = block["content"]
+    assert "Tool lookup" in receipt and "service" in receipt
+    assert ContextCache().retrieve(re.search(r"tc_[a-f0-9]+", receipt)[0]) == output
+
+
+def test_mask_mixed_user_instruction_and_tool_result_is_conservative():
+    history = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "old", "content": _long_observation()},
+                {"type": "text", "text": "Start a new task."},
+            ],
+        },
+        {"role": "assistant", "content": "New task complete."},
+    ]
+    assert mask_completed_observations(history) == history
+
+
+def test_mask_receipt_and_recovery_redact_secrets():
+    secret = "ghp_" + "a" * 36
+    output = f"warning {secret}\n" + _long_observation()
+    history = [
+        {"role": "tool", "content": output},
+        {"role": "assistant", "content": "The warning was handled."},
+    ]
+    receipt = mask_completed_observations(history)[0]["content"]
+    assert secret not in receipt and "[REDACTED" in receipt
+    recovered = ContextCache().retrieve(re.search(r"tc_[a-f0-9]+", receipt)[0])
+    assert secret not in recovered and "[REDACTED" in recovered
+
+
+def test_mask_preserves_small_results_and_assistant_thoughts():
+    history = [
+        {"role": "tool", "content": "ok"},
+        {"role": "assistant", "content": "<thinking>Kept intact.</thinking>\nDone."},
+    ]
+    assert mask_completed_observations(history) == history
+    assert mask_completed_observations([]) == []
