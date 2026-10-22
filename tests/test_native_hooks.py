@@ -232,7 +232,7 @@ def test_powershell_shell_wrapper_routes_argv_and_preserves_native_arguments(tmp
             "sys.exit(17)\n"
         )
         path.chmod(0o755)
-    special = ["space name", "$(touch PWNED)", "; touch PWNED", "*", "", "a\nb", "'\"\\"]
+    special = ["space name", "$(touch PWNED)", "; touch PWNED", "", "a\nb", "'\"\\"]
     cases = [
         *_SHELL_ROUTING_CASES,
         (["pytest", *special], True),
@@ -257,6 +257,24 @@ foreach ($case in $cases) {
     if ($commandArgv.Count -gt 1) { $tail = @($commandArgv[1..($commandArgv.Count - 1)]) }
     & $commandArgv[0] @tail
     if ($LASTEXITCODE -ne 17) { throw 'Exit code changed' }
+}
+# Compare globbing with direct invocation of the exact native application used
+# by each route. PowerShell may expand '*' even when it comes from an argv array.
+foreach ($name in @('pytest', 'git')) {
+    $wildcardArgs = @('*')
+    $nativeName = 'usagetrim'
+    $nativeArgs = @('run', '--', $name) + $wildcardArgs
+    if ($name -eq 'git') {
+        $wildcardArgs = @('commit', '*')
+        $nativeName = 'git'
+        $nativeArgs = $wildcardArgs
+    }
+    $application = @(Microsoft.PowerShell.Core\\Get-Command -Name $nativeName -CommandType Application -ErrorAction Stop)[0]
+    $direct = & $application.Path @nativeArgs
+    if ($LASTEXITCODE -ne 17) { throw 'Direct wildcard exit code changed' }
+    $wrapped = & $name @wildcardArgs
+    if ($LASTEXITCODE -ne 17) { throw 'Wrapped wildcard exit code changed' }
+    if ($direct -cne $wrapped) { throw 'Wrapper changed native wildcard semantics' }
 }
 exit 0
 """)
