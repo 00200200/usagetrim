@@ -2232,7 +2232,7 @@ def mcp(
         typer.Option(
             "--profile",
             envvar="USAGETRIM_MCP_PROFILE",
-            help="coding: 9 core tools with compact schemas (default, lowest usage); desktop: 11 tools; full: all tools",
+            help="minimal: 4 tools, smallest schema footprint; coding: 9 core tools with compact schemas (default); desktop: 11 tools; full: all tools",
         ),
     ] = "coding",
 ):

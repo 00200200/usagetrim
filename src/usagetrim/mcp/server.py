@@ -543,6 +543,10 @@ for _tool in TOOLS_DEFINITIONS:
         )
 
 
+MINIMAL_TOOLS = frozenset(
+    {"usagetrim_read", "usagetrim_exec", "usagetrim_edit_symbol", "usagetrim_retrieve"}
+)
+
 CODING_TOOLS = frozenset(
     {
         "usagetrim_code",
@@ -616,7 +620,7 @@ _COMPACT_PROP_DESCRIPTIONS = {
 }
 
 
-def _make_desktop_tool(base_tool: dict) -> dict:
+def _make_desktop_tool(base_tool: dict, *, minimal: bool = False) -> dict:
     import copy
 
     tool = copy.deepcopy(base_tool)
@@ -625,25 +629,44 @@ def _make_desktop_tool(base_tool: dict) -> dict:
         tool["description"] = DESKTOP_TOOL_DESCRIPTIONS[name]
     props = tool.get("inputSchema", {}).get("properties", {})
     for prop_name, prop_def in props.items():
-        if prop_name in _COMPACT_PROP_DESCRIPTIONS and isinstance(prop_def, dict):
+        if minimal and isinstance(prop_def, dict):
+            prop_def.pop("description", None)
+        elif prop_name in _COMPACT_PROP_DESCRIPTIONS and isinstance(prop_def, dict):
             prop_def["description"] = _COMPACT_PROP_DESCRIPTIONS[prop_name]
+    if minimal:
+        # All tools share this optional response schema; omit its repeated text
+        # while retaining every input constraint and safety annotation.
+        tool.pop("outputSchema", None)
     return tool
 
 
 def tool_definitions(profile: str = "full") -> list[dict]:
     """Return tool schemas filtered and formatted for the requested profile."""
-    if profile not in {"full", "coding", "desktop"}:
-        raise ValueError("MCP profile must be full, coding, or desktop")
+    if profile not in {"full", "coding", "desktop", "minimal"}:
+        raise ValueError("MCP profile must be full, coding, desktop, or minimal")
     if profile == "full":
         return [tool for tool in TOOLS_DEFINITIONS]
-    if profile == "desktop":
+    if profile == "minimal":
+        allowed = MINIMAL_TOOLS
+    elif profile == "desktop":
         allowed = DESKTOP_TOOLS
     else:
         allowed = CODING_TOOLS
-    return [_make_desktop_tool(tool) for tool in TOOLS_DEFINITIONS if tool["name"] in allowed]
+    return [
+        _make_desktop_tool(tool, minimal=profile == "minimal")
+        for tool in TOOLS_DEFINITIONS
+        if tool["name"] in allowed
+    ]
 
 
 def server_instructions(profile: str) -> str:
+    if profile == "minimal":
+        return (
+            "Use usagetrim_read for targeted reads; usagetrim_edit_symbol for hash-guarded edits; "
+            "usagetrim_exec for noninteractive commands with an absolute cwd; "
+            "usagetrim_retrieve for omitted output. Omit exec limits to preserve diagnostics. "
+            "Keep normal approvals."
+        )
     if profile == "desktop":
         return (
             "UsageTrim Desktop Profile (Claude Desktop & Codex Desktop). "
