@@ -385,6 +385,27 @@ def test_repository_pack_focus_and_path_security(tmp_path):
     assert result.file_count == 1
 
 
+def test_repository_pack_absolute_path_through_symlinked_parent(tmp_path):
+    root = tmp_path / "repo"
+    (root / "src").mkdir(parents=True)
+    source = "def handle():\n    return 42\n"
+    (root / "src" / "api.py").write_text(source, encoding="utf-8")
+    alias = tmp_path / "alias"
+    alias.symlink_to(root, target_is_directory=True)
+    outside = tmp_path / "outside.py"
+    outside.write_text("outside = True\n", encoding="utf-8")
+    (root / "escape.py").symlink_to(outside)
+
+    for path in (outside, root / "escape.py", alias / "escape.py"):
+        with pytest.raises(ValueError, match="inside the project root"):
+            pack_repository(root, paths=[path], mode="full")
+
+    result = pack_repository(root, paths=[alias / "src" / "api.py"], mode="full")
+    assert result.file_count == 1
+    assert result.files[0].path == "src/api.py"
+    assert result.files[0].content == source
+
+
 def test_repository_pack_redacts_path_metadata_and_excludes_env_file(tmp_path):
     secret = "ghp_" + "q" * 36
     (tmp_path / f"{secret}.py").write_text("def ordinary(): pass\n")
@@ -394,6 +415,25 @@ def test_repository_pack_redacts_path_metadata_and_excludes_env_file(tmp_path):
     assert "[REDACTED_GITHUB_TOKEN]" in result.bundle_text
     assert "very_private_value" not in result.bundle_text
     assert len(result.files) == 1
+
+
+@pytest.mark.parametrize("mode", ["skeleton", "hybrid"])
+def test_repository_pack_no_body_sources_use_full_fallback(tmp_path, mode):
+    sources = {
+        "types.ts": "export interface Settings { endpoint: string; }\nexport type RequestId = string;\n",
+        "doc.go": "// Package example provides shared configuration.\npackage example\n",
+        "lib.rs": "pub mod network;\npub mod storage;\n",
+    }
+    for name, source in sources.items():
+        (tmp_path / name).write_text(source, encoding="utf-8")
+
+    result = pack_repository(tmp_path, mode=mode)
+    assert result.file_count == 3
+    assert {file.path: file.content for file in result.files} == sources
+    assert all(not file.is_skeleton and file.ref_id is None for file in result.files)
+    files = ET.fromstring(result.bundle_text).findall("./files/file")
+    assert {file.attrib["path"]: file.text for file in files} == sources
+    assert all(file.attrib["mode"] == "full" for file in files)
 
 
 def test_repository_pack_strip_comments_and_unsupported_fallback(tmp_path):

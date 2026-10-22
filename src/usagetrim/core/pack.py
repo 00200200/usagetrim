@@ -137,6 +137,7 @@ def _pack_files(root: Path, paths: list[str | Path] | None) -> list[Path]:
             if part != root and root in part.parents
         ):
             raise ValueError("paths must not traverse symlinks")
+        target = root / resolved.relative_to(root)
         selected.update(path for path in eligible if path == target or target in path.parents)
     return sorted(selected)
 
@@ -340,7 +341,7 @@ def pack_repository(
                     if path.suffix.lower() == ".py"
                     else skeletonize_code_ast(cleaned, path.suffix.lower())
                 )
-                if proposed.strip():
+                if proposed and proposed.strip():
                     ref = "tc_" + hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
                     if count_tokens(proposed).openai < original_tokens:
                         packed_content = proposed
