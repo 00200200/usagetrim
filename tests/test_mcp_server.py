@@ -20,7 +20,111 @@ from usagetrim.mcp.server import (
     handle_usagetrim_tree,
     run_mcp_stdio_server,
 )
-from usagetrim.metrics.tokenizer import count_tokens
+from usagetrim.metrics.tokenizer import count_tokens, get_o200k
+
+
+def test_minimal_profile_keeps_exactly_four_tools_and_input_constraints():
+    before = json.dumps(server.TOOLS_DEFINITIONS)
+    minimal = server.tool_definitions("minimal")
+    assert {tool["name"] for tool in minimal} == {
+        "usagetrim_read",
+        "usagetrim_exec",
+        "usagetrim_edit_symbol",
+        "usagetrim_retrieve",
+    }
+
+    def without_descriptions(value):
+        if isinstance(value, dict):
+            return {
+                key: without_descriptions(item)
+                for key, item in value.items()
+                if key != "description"
+            }
+        if isinstance(value, list):
+            return [without_descriptions(item) for item in value]
+        return value
+
+    for tool in minimal:
+        full = next(item for item in server.TOOLS_DEFINITIONS if item["name"] == tool["name"])
+        assert tool["inputSchema"] == without_descriptions(full["inputSchema"])
+        assert tool["annotations"] == full["annotations"]
+        assert len(tool["description"]) <= len(full["description"])
+    assert json.dumps(server.TOOLS_DEFINITIONS) == before
+
+
+def test_minimal_profile_is_under_800_o200k_tokens():
+    encoding = get_o200k()
+    assert encoding.name == "o200k_base"
+    tokens = len(encoding.encode(json.dumps(server.tool_definitions("minimal"))))
+    assert tokens < 800, tokens
+
+
+@pytest.mark.parametrize(
+    "name",
+    sorted(
+        tool["name"]
+        for tool in server.TOOLS_DEFINITIONS
+        if tool["name"] not in server.MINIMAL_TOOLS
+    ),
+)
+def test_minimal_profile_blocks_every_hidden_tool(name, monkeypatch):
+    monkeypatch.setattr(server, f"handle_{name}", lambda *args: pytest.fail("Hidden tool executed"))
+    response = server._respond(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": {}},
+        },
+        profile="minimal",
+    )
+    assert response["error"] == {"code": -32602, "message": "Unknown tool"}
+
+
+@pytest.mark.parametrize(
+    "name,arguments",
+    [
+        ("usagetrim_read", {"path": "/project/file.py"}),
+        ("usagetrim_exec", {"command": "echo ok"}),
+        (
+            "usagetrim_edit_symbol",
+            {
+                "path": "/project/file.py",
+                "selector": "run",
+                "replacement": "def run(): pass",
+                "expected_hash": "abc",
+            },
+        ),
+        ("usagetrim_retrieve", {"ref_id": "tc_example"}),
+    ],
+)
+def test_minimal_profile_dispatches_visible_tools(name, arguments, monkeypatch):
+    received = []
+
+    def handler(args):
+        received.append(args)
+        return "ok"
+
+    monkeypatch.setattr(server, f"handle_{name}", handler)
+    response = server._respond(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        },
+        profile="minimal",
+    )
+    assert response["result"]["isError"] is False
+    assert received == [arguments]
+
+
+def test_minimal_profile_lists_and_advertises_only_visible_tools():
+    listed = server._respond({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, profile="minimal")
+    assert listed["result"]["tools"] == server.tool_definitions("minimal")
+    instructions = server.server_instructions("minimal")
+    for tool in server.TOOLS_DEFINITIONS:
+        assert (tool["name"] in instructions) == (tool["name"] in server.MINIMAL_TOOLS)
 
 
 def test_coding_profile_keeps_coding_and_recovery_tools_without_hidden_dispatch(monkeypatch):
@@ -60,6 +164,8 @@ def test_profile_stdio_and_environment_selection(monkeypatch):
     runner = CliRunner()
     for args, env, expected in (
         ([], {}, 9),
+        (["--profile", "minimal"], {}, 4),
+        ([], {"USAGETRIM_MCP_PROFILE": "minimal"}, 4),
         (["--profile", "coding"], {}, 9),
         ([], {"USAGETRIM_MCP_PROFILE": "coding"}, 9),
         (["--profile", "desktop"], {}, 11),
