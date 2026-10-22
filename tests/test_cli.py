@@ -17,6 +17,51 @@ def test_cli_help():
     assert "Context compression engine" in res.output
 
 
+def test_cli_pricing_lists_static_reference_rates(monkeypatch):
+    from rich.console import Console
+
+    from usagetrim import cli
+    from usagetrim.metrics.pricing import PRICING_TABLE
+
+    monkeypatch.setattr(cli, "console", Console(width=160, color_system=None))
+    result = runner.invoke(app, ["pricing"])
+    assert result.exit_code == 0
+    assert "Static reference rates (USD per 1M tokens)" in result.stdout
+    for heading in ("Model", "Input", "Output", "Cache Read", "Cache Write"):
+        assert heading in result.stdout
+    for model in PRICING_TABLE:
+        assert model in result.stdout
+    assert "—" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "model,rates,absent_model",
+    [
+        ("gpt-4o", ["$2.5", "$10", "$1.25", "—"], "gpt-4o-mini"),
+        ("claude-3-7-sonnet", ["$3", "$15", "$0.3", "$3.75"], "claude-3-5-sonnet"),
+    ],
+)
+def test_cli_pricing_selects_one_model(monkeypatch, model, rates, absent_model):
+    from rich.console import Console
+
+    from usagetrim import cli
+
+    monkeypatch.setattr(cli, "console", Console(width=160, color_system=None))
+    result = runner.invoke(app, ["pricing", model])
+    assert result.exit_code == 0
+    assert model in result.stdout and absent_model not in result.stdout
+    for rate in rates:
+        assert rate in result.stdout
+    if model == "gpt-4o":
+        assert "$0" not in result.stdout
+
+
+def test_cli_pricing_unknown_model_is_usage_error():
+    result = runner.invoke(app, ["pricing", "not-a-model"])
+    assert result.exit_code == 2
+    assert "Unknown model: not-a-model" in result.output
+
+
 def test_cli_demo():
     res = runner.invoke(app, ["demo"])
     assert res.exit_code == 0
