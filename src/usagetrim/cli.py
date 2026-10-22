@@ -11,7 +11,7 @@ import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import Annotated
 
 import typer
@@ -61,7 +61,10 @@ from usagetrim.core.hooks import install_zsh_hook, setup_claude_code_mcp_config
 from usagetrim.core.json_slimmer import slim_json
 from usagetrim.core.native_hooks import install_claude_hook, run_hook_filter
 from usagetrim.core.pr_analyzer import analyze_pr_tokens
+from usagetrim.core.redactor import redact_secrets
 from usagetrim.core.rules_linter import (
+    CLIENT_RULE_PATHS,
+    _rules_client,
     generate_desktop_rules,
     lint_rule_content,
     minify_rules,
@@ -2037,77 +2040,135 @@ def lint(
         )
 
 
+def _write_rules_atomic(target: Path, original: bytes, optimized: str) -> Path:
+    """Back up original bytes exclusively, then atomically replace a regular file."""
+    if target.is_symlink() or not target.is_file():
+        raise ValueError("rules write requires a regular file, not a symlink")
+    backup = target.with_suffix(target.suffix + ".bak")
+    staged = None
+    backup_created = False
+    replaced = False
+    try:
+        with NamedTemporaryFile(
+            dir=target.parent, prefix=".usagetrim-rules-", delete=False
+        ) as stream:
+            staged = Path(stream.name)
+            stream.write(optimized.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(staged, target.stat().st_mode & 0o777)
+        if target.is_symlink() or target.read_bytes() != original:
+            raise ValueError("rules file changed before write; retry on the current file")
+        backup_fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        backup_created = True
+        with os.fdopen(backup_fd, "wb") as stream:
+            stream.write(original)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(staged, target)
+        replaced = True
+    finally:
+        cleanup = [staged] if staged is not None else []
+        if backup_created and not replaced:
+            cleanup.append(backup)
+        for path in cleanup:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                # Preserve the original write error if cleanup is also unavailable.
+                pass
+    return backup
+
+
+def _rules_stats(result: dict) -> str:
+    return (
+        f"UsageTrim Rules Optimization: {result['original_tokens']} -> {result['optimized_tokens']} "
+        f"local OpenAI tokens; delta (before-after) {result['token_delta']:+d}; "
+        f"reduction {result['savings_pct']:+.1f}%; "
+        f"estimated baseline input-cost delta (before-after, USD): "
+        f"{result['estimated_baseline_input_cost_delta']:+.8f} "
+        "(reference Sonnet/GPT-4o/Gemini Pro average; not provider billing)."
+    )
+
+
 @app.command("rules")
 def rules_command(
     init: Annotated[
-        bool,
-        typer.Option("--init", "-i", help="Initialize token-optimized CLAUDE.md or AGENTS.md"),
+        bool, typer.Option("--init", "-i", help="Initialize a new client rules file")
     ] = False,
     optimize: Annotated[
+        bool, typer.Option("--optimize", "-o", help="Optimize existing rules conservatively")
+    ] = False,
+    check: Annotated[
         bool,
-        typer.Option(
-            "--optimize", "-o", help="Optimize existing rules file (strip filler, align cache)"
-        ),
+        typer.Option("--check", help="Check canonical rules without writing (exit 1 if changed)"),
     ] = False,
     write: Annotated[
         bool,
         typer.Option(
-            "--write", "-w", help="Write optimized rules back to file (creates .bak backup)"
+            "--write", "-w", help="Write optimized rules atomically with a byte-exact .bak backup"
         ),
     ] = False,
     stats: Annotated[
         bool,
-        typer.Option("--stats", "-s", help="Print token savings and cache score"),
+        typer.Option(
+            "--stats", "-s", help="Report local tokens and estimated baseline input-cost delta"
+        ),
     ] = False,
     client: Annotated[
-        str, typer.Option("--client", "-c", help="Target client: claude or codex")
+        str, typer.Option("--client", "-c", help="Target client: claude, codex, cursor or copilot")
     ] = "claude",
     file_path: Annotated[
         Path | None, typer.Option("--file", "-f", help="Target rules file path")
     ] = None,
 ):
-    """Generate, initialize, or optimize rules for Claude Desktop and Codex."""
-    target = file_path or Path(
-        "AGENTS.md" if client.lower() in {"codex", "codex-desktop"} else "CLAUDE.md"
-    )
-    if optimize:
-        if not target.exists():
-            err_console.print(f"[bold red]File not found:[/bold red] {target}")
-            raise typer.Exit(code=1)
-        raw_content = target.read_text(encoding="utf-8", errors="replace")
-        res = optimize_rules(raw_content)
-        if write:
-            bak_path = target.with_suffix(target.suffix + ".bak")
-            bak_path.write_text(raw_content, encoding="utf-8")
-            target.write_text(res["optimized_content"], encoding="utf-8")
-            console.print(f"[green]✓ Optimized {target} (backup saved to {bak_path.name})[/green]")
+    """Generate or safely optimize cross-agent instructions."""
+    try:
+        client = _rules_client(client)
+        if sum((init, optimize, check)) > 1:
+            raise ValueError("--init, --optimize and --check are mutually exclusive")
+        if write and not optimize:
+            raise ValueError("--write requires --optimize")
+        if stats and not (optimize or check):
+            raise ValueError("--stats requires --optimize or --check")
+        target = file_path or Path(CLIENT_RULE_PATHS[client])
+        if optimize or check:
+            if write and target.is_symlink():
+                raise ValueError("refusing to write rules through a symlink")
+            original = target.read_bytes()
+            content = original.decode("utf-8")
+            result = optimize_rules(content)
+            if check:
+                typer.echo(
+                    (
+                        "Canonical. "
+                        if content == result["optimized_content"]
+                        else "Optimization needed. "
+                    )
+                    + _rules_stats(result)
+                )
+                raise typer.Exit(code=0 if content == result["optimized_content"] else 1)
+            if write:
+                backup = _write_rules_atomic(target, original, result["optimized_content"])
+                typer.echo(f"Optimized {target} (backup saved to {backup.name})")
+            else:
+                sys.stdout.write(result["optimized_content"])
+            if stats or write:
+                # Keep stdout suitable for piping the optimized document.
+                typer.echo(_rules_stats(result), err=not write)
+            return
+        text = generate_desktop_rules(client)
+        if init:
+            if target.exists() or target.is_symlink():
+                raise ValueError("rules target already exists; refusing to overwrite")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("x", encoding="utf-8", newline="\n") as stream:
+                stream.write(text)
+            typer.echo(f"Initialized {target} ({count_tokens(text).openai} local OpenAI tokens)")
         else:
-            sys.stdout.write(res["optimized_content"])
-
-        if stats or write:
-            threshold_note = (
-                "[green]Standalone Cache Ready (>=1,024 tok)[/green]"
-                if res.get("exceeds_cache_threshold")
-                else "[cyan]Paired with usagetrim MCP desktop (~2k tokens) to cache[/cyan]"
-            )
-            console.print(
-                f"[bold cyan]UsageTrim Rules Optimization:[/bold cyan] "
-                f"{res['original_tokens']} -> {res['optimized_tokens']} tokens "
-                f"([green]-{res['savings_pct']}%[/green]) | "
-                f"Cache Friendly: {'[green]YES[/green]' if res['is_cache_friendly'] else '[yellow]NO[/yellow]'} | "
-                f"{threshold_note}"
-            )
-        return
-
-    rules_text = generate_desktop_rules(client)
-    if init:
-        target.write_text(rules_text, encoding="utf-8")
-        tok_count = count_tokens(rules_text).openai
-        console.print(
-            f"[green]✓ Initialized token-optimized {target} (~{tok_count} tokens)![/green]"
-        )
-    else:
-        sys.stdout.write(rules_text)
+            sys.stdout.write(text)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise typer.BadParameter(redact_secrets(str(exc))) from exc
 
 
 @app.command()
