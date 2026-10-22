@@ -307,7 +307,20 @@ def pack_command(
         int, typer.Option("--budget", "-b", min=100, max=200000, help="Target token budget ceiling")
     ] = 4000,
     skeleton: Annotated[
-        bool, typer.Option("--skeleton", "-s", help="Force AST skeletonization on code files")
+        bool, typer.Option("--skeleton", "-s", help="Alias for --mode skeleton")
+    ] = False,
+    format_type: Annotated[
+        str, typer.Option("--format", help="Pack format: xml or markdown")
+    ] = "xml",
+    mode: Annotated[
+        str | None, typer.Option("--mode", help="Pack mode: full, skeleton or hybrid")
+    ] = None,
+    focus: Annotated[
+        list[str] | None,
+        typer.Option("--focus", help="Repo-relative hybrid focus file or directory; repeatable"),
+    ] = None,
+    strip_comments: Annotated[
+        bool, typer.Option("--strip-comments", help="Strip comments from full source")
     ] = False,
     copy: Annotated[
         bool, typer.Option("--copy", "-c", help="Copy packed bundle to clipboard")
@@ -319,16 +332,25 @@ def pack_command(
 ):
     """Pack repository files into an AI-optimized context bundle with AST skeletons and secret scrubbing."""
     from usagetrim.core.clip import set_clipboard
-    from usagetrim.core.pack import pack_context
+    from usagetrim.core.pack import pack_repository
+    from usagetrim.core.redactor import redact_secrets
 
     project_root = (root or Path.cwd()).resolve()
     path_strs = [str(p) for p in paths] if paths else None
-    result = pack_context(
-        paths=path_strs,
-        root=project_root,
-        budget=budget,
-        force_skeleton=skeleton,
-    )
+    if skeleton and mode not in {None, "skeleton"}:
+        raise typer.BadParameter("--skeleton conflicts with --mode")
+    try:
+        result = pack_repository(
+            root=project_root,
+            paths=path_strs,
+            budget=budget,
+            format_type=format_type,
+            mode=mode if mode is not None else "skeleton",
+            focus=focus,
+            strip_comments=strip_comments,
+        )
+    except (ValueError, OSError) as exc:
+        raise typer.BadParameter(redact_secrets(str(exc))) from exc
 
     if json_output:
         _emit(json.dumps(result.to_dict(), indent=2))
@@ -337,9 +359,11 @@ def pack_command(
     if output is not None:
         try:
             output.write_text(result.bundle_text, encoding="utf-8")
-            err_console.print(f"[green]Packed bundle written to {output}[/green]")
+            err_console.print(
+                f"[green]Packed bundle written to {redact_secrets(str(output))}[/green]"
+            )
         except OSError as exc:
-            raise typer.BadParameter(f"Failed to write output file: {exc}") from exc
+            raise typer.BadParameter(redact_secrets(f"Failed to write output file: {exc}")) from exc
     else:
         _emit(result.bundle_text)
 
