@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import re
 import subprocess
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,7 +14,12 @@ from typing import Any
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.code_index import CodeIndex, allowed_file, source_files
 from usagetrim.core.redactor import redact_secrets
-from usagetrim.core.skeleton import extract_symbol_or_range
+from usagetrim.core.skeleton import (
+    extract_symbol_or_range,
+    skeletonize_code_ast,
+    skeletonize_python,
+    strip_comments_and_blanks,
+)
 from usagetrim.metrics.tokenizer import count_tokens
 
 
@@ -37,16 +44,22 @@ class PackResult:
     reduction_pct: float
     files: list[PackedFile]
     bundle_text: str
+    mode: str | None = None
+    format_type: str | None = None
+    omitted_files: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "root": str(self.root),
+            "root": redact_secrets(str(self.root)),
             "file_count": self.file_count,
             "original_tokens": self.original_tokens,
             "packed_tokens": self.packed_tokens,
             "saved_tokens": self.saved_tokens,
             "reduction_pct": self.reduction_pct,
             "bundle_text": self.bundle_text,
+            "mode": self.mode,
+            "format": self.format_type,
+            "omitted_files": self.omitted_files or [],
             "files": [
                 {
                     "path": f.path,
@@ -59,6 +72,380 @@ class PackResult:
                 for f in self.files
             ],
         }
+
+
+_PACK_FORMATS = {"xml", "markdown"}
+_PACK_MODES = {"full", "skeleton", "hybrid"}
+_SKELETON_EXTENSIONS = {".py", ".ts", ".go", ".rs"}
+_COMMENT_STRIP_EXTENSIONS = _SKELETON_EXTENSIONS | {
+    ".pyi",
+    ".js",
+    ".jsx",
+    ".tsx",
+    ".swift",
+    ".java",
+    ".c",
+    ".h",
+    ".cpp",
+    ".hpp",
+    ".sh",
+    ".toml",
+    ".yaml",
+    ".yml",
+}
+_PACK_PRIORITY = {".py": 0, ".ts": 1, ".go": 2, ".rs": 3}
+
+
+def _pack_selector(root: Path, value: str | Path) -> str:
+    """Validate a repo-relative selector without following a symlink outside root."""
+    item = Path(value)
+    if item.is_absolute() or ".." in item.parts or not item.parts:
+        raise ValueError("focus must contain repo-relative paths without '..'")
+    target = root / item
+    try:
+        resolved = target.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("focus path cannot be resolved safely") from exc
+    if not resolved.is_relative_to(root) or any(
+        part.is_symlink()
+        for part in (target, *target.parents)
+        if part != root and root in part.parents
+    ):
+        raise ValueError("focus must stay inside the project root and avoid symlinks")
+    return item.as_posix().rstrip("/")
+
+
+def _pack_files(root: Path, paths: list[str | Path] | None) -> list[Path]:
+    eligible = source_files(root)
+    if not paths:
+        return eligible
+    selected: set[Path] = set()
+    for entry in paths:
+        item = Path(entry)
+        if ".." in item.parts:
+            raise ValueError("paths must not contain '..'")
+        target = item if item.is_absolute() else root / item
+        try:
+            resolved = target.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("path cannot be resolved safely") from exc
+        if not resolved.is_relative_to(root):
+            raise ValueError("paths must stay inside the project root")
+        if any(
+            part.is_symlink()
+            for part in (target, *target.parents)
+            if part != root and root in part.parents
+        ):
+            raise ValueError("paths must not traverse symlinks")
+        target = root / resolved.relative_to(root)
+        selected.update(path for path in eligible if path == target or target in path.parents)
+    return sorted(selected)
+
+
+def _xml_safe(value: str) -> str:
+    """Replace characters forbidden by XML 1.0 before ElementTree escaping."""
+    return "".join(
+        char
+        if ord(char) in {9, 10, 13}
+        or 32 <= ord(char) <= 0xD7FF
+        or 0xE000 <= ord(char) <= 0xFFFD
+        or 0x10000 <= ord(char) <= 0x10FFFF
+        else "\ufffd"
+        for char in value
+    )
+
+
+def _pack_tree(paths: list[str], *, compact: bool) -> str:
+    if compact:
+        return "\n".join(
+            sorted({path.split("/", 1)[0] + ("/" if "/" in path else "") for path in paths})
+        )
+    rows: set[tuple[str, int]] = set()
+    for path in paths:
+        parts = path.split("/")
+        for depth in range(1, len(parts)):
+            rows.add(("/".join(parts[:depth]) + "/", depth - 1))
+        rows.add((path, len(parts) - 1))
+    return "\n".join(
+        "  " * depth + name.rstrip("/").split("/")[-1] + ("/" if name.endswith("/") else "")
+        for name, depth in sorted(rows)
+    )
+
+
+def _pack_fence(content: str) -> str:
+    return "`" * max(3, max((len(run) for run in re.findall(r"`+", content)), default=0) + 1)
+
+
+def _parseable_for_skeleton(source: str, suffix: str) -> bool:
+    """Reject malformed syntax before calling skeletonizers with regex fallbacks."""
+    if suffix == ".py":
+        try:
+            ast.parse(source)
+            return True
+        except (SyntaxError, ValueError):
+            return False
+    from ast_grep_py import SgRoot
+
+    language = {".ts": "typescript", ".go": "go", ".rs": "rust"}[suffix]
+    try:
+        root = SgRoot(source, language).root()
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            span = node.range()
+            if node.kind() == "ERROR" or (node is not root and span.start.index == span.end.index):
+                return False
+            stack.extend(node.children())
+        return True
+    except (ValueError, RecursionError):
+        return False
+
+
+def _render_repository_pack(
+    *,
+    root_name: str,
+    format_type: str,
+    mode: str,
+    candidates: list[PackedFile],
+    selected: list[PackedFile],
+    source_tokens: int,
+    detail: int,
+) -> str:
+    selected_ids = {id(file) for file in selected}
+    omitted = [file for file in candidates if id(file) not in selected_ids]
+    all_paths = [file.path for file in candidates]
+    if format_type == "xml":
+        outer = ET.Element("repository")
+        ET.SubElement(
+            outer,
+            "file_summary",
+            {
+                "name": _xml_safe(root_name),
+                "mode": mode,
+                "files": str(len(candidates)),
+                "packed": str(len(selected)),
+                "omitted": str(len(omitted)),
+                "source_tokens": str(source_tokens),
+            },
+        )
+        tree = ET.SubElement(outer, "directory_structure")
+        tree.text = _xml_safe(_pack_tree(all_paths, compact=detail > 0)) if detail < 2 else ""
+        files = ET.SubElement(outer, "files")
+        for file in selected:
+            attributes = {
+                "path": _xml_safe(file.path),
+                "mode": "skeleton" if file.is_skeleton else "full",
+            }
+            if file.ref_id:
+                attributes["ref"] = file.ref_id
+            element = ET.SubElement(
+                files,
+                "file",
+                attributes,
+            )
+            element.text = _xml_safe(file.content)
+        omitted_element = ET.SubElement(outer, "omitted_files", {"count": str(len(omitted))})
+        if detail == 0:
+            for file in omitted:
+                ET.SubElement(omitted_element, "file", {"path": _xml_safe(file.path)})
+        return ET.tostring(outer, encoding="unicode") + "\n"
+    lines = [
+        f"# Repository: {root_name}",
+        "",
+        "## File Summary",
+        f"Mode: {mode}; files: {len(candidates)}; packed: {len(selected)}; omitted: {len(omitted)}; source tokens: {source_tokens}",
+        "",
+        "## Directory Structure",
+    ]
+    tree = _pack_tree(all_paths, compact=detail > 0) if detail < 2 else ""
+    fence = _pack_fence(tree)
+    lines.extend([fence, tree, fence, "", "## Files"])
+    for file in selected:
+        language = Path(file.path).suffix.lstrip(".") or "text"
+        fence = _pack_fence(file.content)
+        lines.extend(
+            [
+                "",
+                f"### File: {file.path} ({'skeleton' if file.is_skeleton else 'full'}"
+                + (f"; recover: usagetrim retrieve {file.ref_id}" if file.ref_id else "")
+                + ")",
+                f"{fence}{language}",
+                file.content + ("" if file.content.endswith("\n") else "\n") + fence,
+            ]
+        )
+    lines.extend(["", "## Omitted Files", f"Count: {len(omitted)}"])
+    if detail == 0:
+        lines.extend(file.path for file in omitted)
+    return "\n".join(lines) + "\n"
+
+
+def pack_repository(
+    root: Path,
+    format_type: str = "xml",
+    mode: str = "skeleton",
+    budget: int | None = None,
+    focus: list[str] | None = None,
+    *,
+    paths: list[str | Path] | None = None,
+    strip_comments: bool = False,
+) -> PackResult:
+    """Pack eligible files into a deterministic, complete, strictly budgeted document."""
+    if (
+        type(format_type) is not str
+        or type(mode) is not str
+        or format_type not in _PACK_FORMATS
+        or mode not in _PACK_MODES
+    ):
+        raise ValueError("format must be xml or markdown; mode must be full, skeleton or hybrid")
+    if budget is not None and (type(budget) is not int or budget <= 0):
+        raise ValueError("budget must be a positive integer or None")
+    if focus and mode != "hybrid":
+        raise ValueError("focus is only valid with hybrid mode")
+    root = Path(root).resolve()
+    if not root.is_dir():
+        raise ValueError("root must be a directory")
+    if focus is not None and (
+        not isinstance(focus, list) or any(type(item) is not str for item in focus)
+    ):
+        raise ValueError("focus must be a list of repo-relative paths")
+    focus_paths = [_pack_selector(root, item) for item in (focus or [])]
+    safe_focus_paths = [redact_secrets(item).replace("\n", "\\n") for item in focus_paths]
+    selected_paths = _pack_files(root, paths)
+    candidates: list[PackedFile] = []
+    full_sources: dict[str, str] = {}
+    source_tokens = 0
+    for path in selected_paths:
+        relative = path.relative_to(root).as_posix()
+        try:
+            raw_bytes = path.read_bytes()
+        except OSError:
+            continue
+        if b"\x00" in raw_bytes:
+            continue
+        try:
+            raw_text = raw_bytes.decode("utf-8")
+            valid_utf8 = True
+        except UnicodeDecodeError:
+            raw_text = raw_bytes.decode("utf-8", errors="replace")
+            valid_utf8 = False
+        cleaned = redact_secrets(raw_text)
+        original_tokens = count_tokens(cleaned).openai
+        source_tokens += original_tokens
+        focused = any(relative == item or relative.startswith(item + "/") for item in focus_paths)
+        skeleton = valid_utf8 and mode != "full" and not (mode == "hybrid" and focused)
+        packed_content = cleaned
+        if skeleton and path.suffix.lower() in _SKELETON_EXTENSIONS:
+            if _parseable_for_skeleton(cleaned, path.suffix.lower()):
+                proposed = (
+                    skeletonize_python(cleaned)
+                    if path.suffix.lower() == ".py"
+                    else skeletonize_code_ast(cleaned, path.suffix.lower())
+                )
+                if proposed and proposed.strip():
+                    ref = "tc_" + hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
+                    if count_tokens(proposed).openai < original_tokens:
+                        packed_content = proposed
+                    else:
+                        skeleton = False
+                else:
+                    skeleton = False
+            else:
+                skeleton = False
+        else:
+            skeleton = False
+        if not skeleton and strip_comments and path.suffix.lower() in _COMMENT_STRIP_EXTENSIONS:
+            packed_content = strip_comments_and_blanks(cleaned, suffix=path.suffix)
+        safe_path = redact_secrets(relative).replace("\n", "\\n")
+        if skeleton:
+            full_sources[ref] = cleaned
+        candidates.append(
+            PackedFile(
+                safe_path,
+                original_tokens,
+                count_tokens(packed_content).openai,
+                skeleton,
+                ref if skeleton else None,
+                redact_secrets(packed_content),
+                file_type="repository",
+            )
+        )
+    candidates.sort(
+        key=lambda file: (
+            0
+            if mode == "hybrid"
+            and any(
+                file.path == item or file.path.startswith(item + "/") for item in safe_focus_paths
+            )
+            else 1,
+            _PACK_PRIORITY.get(Path(file.path).suffix.lower(), 9),
+            file.path,
+        )
+    )
+    root_name = redact_secrets(root.name)
+
+    def render(selected: list[PackedFile], detail: int) -> tuple[str, int]:
+        text = _render_repository_pack(
+            root_name=root_name,
+            format_type=format_type,
+            mode=mode,
+            candidates=candidates,
+            selected=selected,
+            source_tokens=source_tokens,
+            detail=detail,
+        )
+        return text, count_tokens(text).openai
+
+    packable = candidates
+    count = len(packable)
+    bundle_text, packed_tokens = render(packable, 0)
+    if budget is not None and packed_tokens > budget:
+        minimum_tokens = render([], 2)[1]
+        if minimum_tokens > budget:
+            raise ValueError("budget is too small for a valid repository pack")
+        # A file whose content alone exceeds the available space cannot fit.
+        # Skipping it lets smaller, lower-ranked files remain eligible.
+        packable = [file for file in candidates if file.packed_tokens <= budget - minimum_tokens]
+        choices = []
+        for level in range(3):
+            _, minimal_tokens = render([], level)
+            if minimal_tokens > budget:
+                continue
+            selected = []
+            text, tokens = render(selected, level)
+            for file in packable:
+                candidate_text, candidate_tokens = render([*selected, file], level)
+                if candidate_tokens <= budget:
+                    selected.append(file)
+                    text, tokens = candidate_text, candidate_tokens
+            choices.append((len(selected), -level, selected, text, tokens))
+        if not choices:
+            raise ValueError("budget is too small for a valid repository pack")
+        count, _, packed_files, bundle_text, packed_tokens = max(choices, key=lambda x: x[:2])
+    else:
+        packed_files = packable[:count]
+    if any(file.is_skeleton for file in packed_files):
+        cache = ContextCache()
+        for file in packed_files:
+            if file.is_skeleton:
+                stored = cache.store(full_sources[file.ref_id], source=f"pack:{file.path}")
+                if stored != file.ref_id:
+                    raise RuntimeError("recovery reference changed during packing")
+    packed_ids = {id(file) for file in packed_files}
+    omitted = [file.path for file in candidates if id(file) not in packed_ids]
+    saved = max(0, source_tokens - packed_tokens)
+    return PackResult(
+        root,
+        len(packed_files),
+        source_tokens,
+        packed_tokens,
+        saved,
+        round(100 * saved / source_tokens, 1) if source_tokens else 0.0,
+        packed_files,
+        bundle_text,
+        mode,
+        format_type,
+        omitted,
+    )
 
 
 def pack_context(
