@@ -7,6 +7,7 @@ into a single smart, self-routing pipeline.
 
 from __future__ import annotations
 
+import copy
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -14,7 +15,11 @@ from typing import Any
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.clip import compact_text
 from usagetrim.core.diff_slimmer import slim_git_diff
-from usagetrim.core.distill import distill_conversation
+from usagetrim.core.distill import (
+    _compact_tool_observations,
+    _extract_tool_calls_map,
+    distill_conversation,
+)
 from usagetrim.core.prompt_optimizer import align_prompt, lint_prompt
 from usagetrim.core.redactor import redact_secrets
 from usagetrim.core.table import compact_table
@@ -22,6 +27,57 @@ from usagetrim.metrics.tokenizer import count_tokens
 
 _COLOR = re.compile(r"\x1b\[[0-9;]*m")
 _FENCE_PATTERN = re.compile(r"(```([a-zA-Z0-9_\-]+)?\n(.*?)```)", re.DOTALL)
+
+
+def mask_completed_observations(history: list[dict]) -> list[dict]:
+    """Copy history, masking verbose results synthesized later in the same turn.
+
+    A nonblank assistant string or text block completes preceding observations.
+    Ordinary user/human, system and developer messages reset the turn; Anthropic
+    user messages containing only tool_result blocks continue it. Mixed user
+    instructions/results are left untouched. Active results remain verbatim.
+    """
+    result = copy.deepcopy(history)
+    pending: list[int] = []
+    tool_calls_map: dict[str, tuple[str, str]] = {}
+    cache = None
+    for index, message in enumerate(history):
+        role = str(message.get("role", "")).lower()
+        content = message.get("content")
+        tool_results = (
+            isinstance(content, list)
+            and bool(content)
+            and all(
+                isinstance(block, dict) and block.get("type") == "tool_result" for block in content
+            )
+        )
+        if role in {"system", "developer", "user", "human"} and not (
+            role == "user" and tool_results
+        ):
+            pending.clear()
+            tool_calls_map.clear()
+        tool_calls_map.update(_extract_tool_calls_map([message]))
+        if role == "tool" or (role == "user" and tool_results):
+            pending.append(index)
+        elif role == "assistant":
+            has_text = isinstance(content, str) and bool(content.strip())
+            if isinstance(content, list):
+                has_text = any(
+                    isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and isinstance(block.get("text"), str)
+                    and bool(block["text"].strip())
+                    for block in content
+                )
+            if has_text and pending:
+                if cache is None:
+                    cache = ContextCache()
+                for observation in pending:
+                    result[observation] = _compact_tool_observations(
+                        history[observation], tool_calls_map, cache
+                    )
+                pending.clear()
+    return result
 
 
 @dataclass
