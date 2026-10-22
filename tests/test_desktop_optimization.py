@@ -306,7 +306,7 @@ def test_prompt_cache_threshold_and_lint(tmp_path):
     # Test CLI rules --optimize --stats output
     rules_cli = runner.invoke(app, ["rules", "--optimize", "--stats", "--file", str(test_file)])
     assert rules_cli.exit_code == 0
-    assert "UsageTrim Rules Optimization:" in rules_cli.stdout
+    assert "UsageTrim Rules Optimization:" in rules_cli.stderr
 
 
 def test_prepare_cli_clipboard_and_copy(tmp_path, monkeypatch):

@@ -82,6 +82,46 @@ def test_coding_profile_reduces_schema_text_and_does_not_advertise_hidden_tools(
     assert "usagetrim_pack" in server.server_instructions("full")
 
 
+def test_pack_schema_exposes_modes_focus_and_format_only_in_full_profile():
+    tool = next(
+        item for item in server.tool_definitions("full") if item["name"] == "usagetrim_pack"
+    )
+    props = tool["inputSchema"]["properties"]
+    assert props["mode"]["enum"] == ["full", "skeleton", "hybrid"]
+    assert props["format"]["enum"] == ["xml", "markdown"]
+    assert props["focus"]["items"]["type"] == "string"
+    assert "strip_comments" in props
+    assert "usagetrim_pack" not in {item["name"] for item in server.tool_definitions("coding")}
+
+
+def test_mcp_pack_hybrid_xml_and_invalid_arguments(tmp_path, monkeypatch):
+    import xml.etree.ElementTree as ET
+
+    monkeypatch.setenv("USAGETRIM_CACHE_DIR", str(tmp_path / "cache"))
+    (tmp_path / "focus.py").write_text("def focus():\n" + "    return 1\n" * 80)
+    (tmp_path / "other.py").write_text("def other():\n" + "    return 2\n" * 80)
+    output = server.handle_usagetrim_pack(
+        {"root": str(tmp_path), "mode": "hybrid", "focus": ["focus.py"], "budget": 500}
+    )
+    document = ET.fromstring(output)
+    assert document.find("file_summary").attrib["mode"] == "hybrid"
+    assert count_tokens(output).openai <= 500
+    markdown = server.handle_usagetrim_pack(
+        {"root": str(tmp_path), "mode": "full", "format": "markdown", "budget": 2000}
+    )
+    assert "## Directory Structure" in markdown
+    assert "### File: focus.py (full)" in markdown
+    for arguments in (
+        {"mode": "unknown"},
+        {"mode": []},
+        {"format": "json"},
+        {"focus": "focus.py"},
+        {"mode": "full", "skeleton": True},
+    ):
+        with pytest.raises(ValueError):
+            server.handle_usagetrim_pack({"root": str(tmp_path), **arguments})
+
+
 def test_desktop_profile_reduces_schema_text_and_sets_instructions():
     full = count_tokens(json.dumps(server.tool_definitions())).openai
     desktop = count_tokens(json.dumps(server.tool_definitions("desktop"))).openai
@@ -571,6 +611,8 @@ def test_mcp_clip():
 
 
 def test_mcp_pack(tmp_path):
+    import xml.etree.ElementTree as ET
+
     (tmp_path / "main.py").write_text("def run():\n    return 42\n")
     res = server._respond(
         {
@@ -585,8 +627,9 @@ def test_mcp_pack(tmp_path):
     )
     assert not res["result"]["isError"]
     text = res["result"]["content"][0]["text"]
-    assert "UsageTrim Context Bundle" in text
-    assert "main.py" in text
+    document = ET.fromstring(text)
+    assert document.find("file_summary").attrib["mode"] == "skeleton"
+    assert document.find("./files/file").attrib["path"] == "main.py"
 
 
 def test_mcp_distill():
