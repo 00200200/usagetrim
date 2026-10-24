@@ -1,14 +1,15 @@
-# Contributing to usagetrim ⚡
+# Contributing to UsageTrim
 
-Thank you for your interest in contributing to **usagetrim**! We are building the undisputed state-of-the-art token optimization engine and universal MCP server for AI coding assistants (Claude Code, Cursor, Codex, Gemini CLI).
-
-Whether you want to add a new compression heuristic, add an AST skeletonizer for a new programming language, improve prompt cache protection, or optimize algorithms, you are very welcome!
+UsageTrim compacts tool output for coding assistants while keeping the original
+available by reference. Useful contributions include reproductions of lost
+diagnostic context, command filters, regression tests, and integration fixes.
+Check existing issues and pull requests before starting overlapping work.
 
 ---
 
-## 🛠️ Development Setup
+## Development setup
 
-We use [`uv`](https://docs.astral.sh/uv/) for blazing-fast Python dependency management.
+Use Python 3.11+ and [`uv`](https://docs.astral.sh/uv/) for the development environment.
 
 ### 1. Clone & Install
 ```bash
@@ -21,7 +22,7 @@ uv sync --all-extras
 
 ### 2. Run Tests
 ```bash
-# Run complete test suite (should take ~0.5s)
+# Run the complete test suite
 uv run pytest -v
 
 # Run with test coverage
@@ -39,7 +40,7 @@ uv run ruff format .
 
 ---
 
-## 🗺️ Codebase Architecture
+## Code layout
 
 Before writing code, here is where things live in `src/usagetrim/`:
 
@@ -52,7 +53,7 @@ src/usagetrim/
 │   ├── cache.py               # SQLite-backed Compress-Cache-Retrieve (CCR) store
 │   ├── specialized.py         # Context-aware filters for git log, git status, test runners
 │   ├── skeleton.py            # AST & regex structural outline generator (Py, TS, Go, Rust)
-│   ├── diff_slimmer.py        # Git diff compactor & lockfile folder (-97% diff tokens)
+│   ├── diff_slimmer.py        # Git diff compactor and lockfile folding
 │   ├── redactor.py            # Sensitive credential & API key masking
 │   ├── tree_scanner.py        # Directory token distribution scanner & tree visualizer
 │   ├── rules_linter.py        # CLAUDE.md / .cursorrules prompt cache linter & minifier
@@ -60,13 +61,13 @@ src/usagetrim/
 ├── mcp/
 │   └── server.py              # Stdio JSON-RPC 2.0 Model Context Protocol server
 └── metrics/
-    ├── tokenizer.py           # Multi-provider token counting (Claude, OpenAI, Gemini)
-    └── pricing.py             # Dollar savings and cost calculations
+    ├── tokenizer.py           # Local token counts and estimates
+    └── pricing.py             # Cost estimates, not billing measurements
 ```
 
 ---
 
-## 💡 How to Add New Capabilities
+## Adding capabilities
 
 ### Adding a New Specialized Command Filter
 If you want to optimize a specific command (e.g. `docker ps`, `cargo test`, `kubectl`):
@@ -91,7 +92,7 @@ If you want to add language support (e.g. C++, Java, Kotlin, Swift):
 
 ---
 
-## 📋 Pull Request Guidelines
+## Pull request guidelines
 
 1. **Keep Code Clean:** Run `uv run ruff check .` and `uv run ruff format .` before pushing.
 2. **Add Tests:** Every new feature or bugfix should include corresponding unit tests in `tests/`.
@@ -103,4 +104,4 @@ If you want to add language support (e.g. C++, Java, Kotlin, Swift):
    - `docs: ...` for documentation
    - `test: ...` for tests
 
-Thank you for helping make AI coding assistants faster, cheaper, and unblocked! 🚀
+Include the checks you ran and any platforms or integrations you did not test.

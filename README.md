@@ -1,22 +1,14 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-reduced-motion: reduce)" srcset="https://raw.githubusercontent.com/00200200/usagetrim/main/assets/readme-hero.png">
-    <img src="https://raw.githubusercontent.com/00200200/usagetrim/main/assets/readme-hero.gif" width="100%" alt="UsageTrim: keep the signal, cut the noise. Authored fixtures cut docker 18,360→107, cargo 3,795→185, pytest 1,562→174.">
-  </picture>
-</p>
+# UsageTrim
 
-<p align="center">
-  <strong>Keep the signal. Cut the noise.</strong><br>
-  Local CLI + MCP that folds verbose tool output for Claude Code, Codex, Cursor, and Claude Desktop — recoverable by reference. Optional macOS pet.
-</p>
+A local CLI and MCP server for compacting verbose test and build output.
+Filters preserve diagnostic context, and the original output remains available
+by cache reference. Integrations are available for Claude Code, Codex, Cursor,
+and Claude Desktop; the macOS companion is optional.
 
 <p align="center">
   <a href="https://github.com/00200200/usagetrim/actions/workflows/ci.yml"><img src="https://github.com/00200200/usagetrim/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/00200200/usagetrim/releases"><img src="https://img.shields.io/github/v/release/00200200/usagetrim?include_prereleases&amp;color=b3f5cd&amp;label=release" alt="Release"></a>
   <a href="https://github.com/00200200/usagetrim/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-b3f5cd" alt="MIT license"></a>
-  <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-compatible-2ec79b" alt="MCP Compatible"></a>
-  <img src="https://img.shields.io/badge/runs%20in-Claude%20Code%20·%20Codex%20·%20Cursor%20·%20Desktop-1a3330" alt="Runs in Claude Code, Codex, Cursor, Desktop">
-  <a href="https://github.com/00200200/usagetrim/stargazers"><img src="https://img.shields.io/github/stars/00200200/usagetrim?style=social" alt="GitHub stars"></a>
 </p>
 
 <p align="center">
@@ -27,10 +19,6 @@
   <a href="#connect-your-agent">Connect</a> ·
   <a href="#desktop-companion">Pet</a> ·
   <a href="https://github.com/00200200/usagetrim/blob/main/docs/guide.md">Guide</a>
-</p>
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/00200200/usagetrim/main/assets/harnesses.svg" width="920" alt="Harnesses and tools: Claude, Codex, Cursor, Desktop, pytest, docker, cargo, go, eslint, mypy">
 </p>
 
 ---
@@ -68,10 +56,6 @@ verbose tool text  →  keep the failure  →  recover the rest by reference
 `usagetrim demo` is offline — **no model calls**. Failures stay; originals recover exactly.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/00200200/usagetrim/main/assets/cuts.svg" width="920" alt="Measured savings: docker 99.4%, go 98%, terraform 95.7%, cargo 95.1%, kubectl 92.7%">
-</p>
-
-<p align="center">
   <img src="https://raw.githubusercontent.com/00200200/usagetrim/main/assets/demo.svg" width="860" alt="Terminal showing usagetrim demo measured fixture results">
 </p>
 
@@ -104,7 +88,7 @@ usagetrim run -- npx eslint . --format codeframe
 ## What you get
 
 - **Compact other MCP servers, losslessly.** The Claude Code hook rewrites results from *other* MCP servers: uniform JSON rows become TSV with the keys once, `{"result": "…"}` wrappers lose their escaping, and indentation goes. Every value and type survives, and prompt-injection boundaries such as Supabase's `<untrusted-data-…>` stay verbatim. [Measured below](#measured-on-real-sessions).
-- **Spend Haiku, not Opus, on reading.** The plugin adds `scout` (read-only search) and `runner` (tests and builds, failures only) agents on Haiku, so the main model gets conclusions instead of files and logs. `usagetrim install --cheap-explore` moves Claude Code's built-in Explore, which now inherits the main model, back to Haiku. `/output-style usagetrim:lean` trims reply preambles and recaps.
+- **Focused helper agents.** The plugin adds `scout` (read-only search) and `runner` (tests and builds, failures only) agents on Haiku. `usagetrim install --cheap-explore` configures Claude Code's built-in Explore to use Haiku. `/output-style usagetrim:lean` trims reply preambles and recaps.
 - **Compose logs.** `docker compose` / `docker-compose` / `podman compose` / `podman-compose` `up` and `logs` fold repeated successful healthchecks, HTTP health polls and Redis heartbeats per service. Unknown lines, errors and exit events remain intact. Before every exit, the last ten lines of every observed service are preserved: even an exact name match can refer to another service's container. This deliberately favors crash context over maximum compression when project or custom container names are ambiguous. ANSI-decorated or other unrecognized formats are left unchanged; no Docker/Podman daemon is needed by the filter.
 - **Cut noise, keep the failure.** Specialized filters for pytest, Docker, cargo, go, vitest, eslint, tsc, mypy, pyright, kubectl, terraform/tofu plan|apply|destroy, GitHub Actions / GitLab CI log folding (`gh run view --log-failed`, `glab ci trace`), `uv sync`/`uv add`, git diff, ruff…
 - **Session dedup + spill.** Same `run` output *or* identical `cat` / MCP `usagetrim_read` view within ~15 minutes → short cache ref. Payloads over ~20 KiB → file + preview (`USAGETRIM_SPILL_BYTES`).
@@ -218,26 +202,18 @@ Mint robot on your Mac — draggable pet or menu-bar mode. Local measurements, t
 
 ## Roadmap
 
-Ideas from the strongest tools in this space, adopted only with a measurement behind them:
+Possible follow-up work, separate from the features available today:
 
 - Ranked repo map (Aider-style PageRank over the symbol graph) fitted to a token budget.
 - LSP-backed references and rename (Serena-style), falling back to the ast-grep index.
 - Lossless log templating (Drain-style) for dev-server, Docker and CI logs.
 - A paired A/B harness on provider-reported tokens and task pass rate, because output-size savings alone can hide extra turns.
 
-## Make it better with us
+## Contributing
 
-If UsageTrim earns a place in your workflow, **[star the repo](https://github.com/00200200/usagetrim/stargazers)**. Lost context or a missed cut? [Open an issue](https://github.com/00200200/usagetrim/issues/new) with a small redacted example.
-
-<p align="center">
-  <a href="https://star-history.com/#00200200/usagetrim&amp;Date">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=00200200/usagetrim&amp;type=Date&amp;theme=dark" />
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=00200200/usagetrim&amp;type=Date" />
-      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=00200200/usagetrim&amp;type=Date" width="600" />
-    </picture>
-  </a>
-</p>
+Lost context or an incorrect filter result? [Open an issue](https://github.com/00200200/usagetrim/issues/new)
+with a small redacted input, the command, and the expected output.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and checks.
 
 [Guide](https://github.com/00200200/usagetrim/blob/main/docs/guide.md) · [Measurements](https://github.com/00200200/usagetrim/blob/main/docs/guide.md#measurements-and-development) · [MIT](https://github.com/00200200/usagetrim/blob/main/LICENSE)
 
