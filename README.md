@@ -1,8 +1,9 @@
 # UsageTrim
 
 A local CLI and MCP server for compacting verbose test and build output.
-Filters preserve diagnostic context, and the original output remains available
-by cache reference. Integrations are available for Claude Code, Codex, Cursor,
+Filters use format-specific rules to retain diagnostic context; cached output is
+recoverable after recognized secrets are redacted, while the entry remains stored.
+Integrations are available for Claude Code, Codex, Cursor,
 and Claude Desktop; the macOS companion is optional.
 
 <p align="center">
@@ -53,7 +54,7 @@ verbose tool text  →  keep the failure  →  recover the rest by reference
 
 ## See it cut
 
-`usagetrim demo` is offline — **no model calls**. Failures stay; originals recover exactly.
+`usagetrim demo` runs authored fixtures with **no model calls**. It checks failure retention and exact recovery for those fixtures, which contain no recognized secrets. These checks do not guarantee preservation of every diagnostic in arbitrary output.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/00200200/usagetrim/main/assets/demo.svg" width="860" alt="Terminal showing usagetrim demo measured fixture results">
@@ -87,12 +88,12 @@ usagetrim run -- npx eslint . --format codeframe
 
 ## What you get
 
-- **Compact other MCP servers, losslessly.** The Claude Code hook rewrites results from *other* MCP servers: uniform JSON rows become TSV with the keys once, `{"result": "…"}` wrappers lose their escaping, and indentation goes. Every value and type survives, and prompt-injection boundaries such as Supabase's `<untrusted-data-…>` stay verbatim. [Measured below](#measured-on-real-sessions).
+- **Compact supported MCP text formats.** The Claude Code hook rewrites results from *other* MCP servers: uniform JSON rows become TSV with the keys once, `{"result": "…"}` wrappers lose their escaping, and indentation goes. The rewrites target supported JSON shapes and preserve recognized `<untrusted-data-…>` delimiters and surrounding warnings; they do not provide a prompt-injection defense. [Measured below](#measured-on-real-sessions).
 - **Focused helper agents.** The plugin adds `scout` (read-only search) and `runner` (tests and builds, failures only) agents on Haiku. `usagetrim install --cheap-explore` configures Claude Code's built-in Explore to use Haiku. `/output-style usagetrim:lean` trims reply preambles and recaps.
 - **Compose logs.** `docker compose` / `docker-compose` / `podman compose` / `podman-compose` `up` and `logs` fold repeated successful healthchecks, HTTP health polls and Redis heartbeats per service. Unknown lines, errors and exit events remain intact. Before every exit, the last ten lines of every observed service are preserved: even an exact name match can refer to another service's container. This deliberately favors crash context over maximum compression when project or custom container names are ambiguous. ANSI-decorated or other unrecognized formats are left unchanged; no Docker/Podman daemon is needed by the filter.
 - **Cut noise, keep the failure.** Specialized filters for pytest, Docker, cargo, go, vitest, eslint, tsc, mypy, pyright, kubectl, terraform/tofu plan|apply|destroy, GitHub Actions / GitLab CI log folding (`gh run view --log-failed`, `glab ci trace`), `uv sync`/`uv add`, git diff, ruff…
 - **Session dedup + spill.** Same `run` output *or* identical `cat` / MCP `usagetrim_read` view within ~15 minutes → short cache ref. Payloads over ~20 KiB → file + preview (`USAGETRIM_SPILL_BYTES`).
-- **Recover by reference.** Omitted text stays in a local CCR cache: `usagetrim retrieve tc_…`
+- **Recover by reference.** `usagetrim retrieve tc_…` returns cached text after recognized secrets are redacted. Cache entries can be evicted when the size budget is exceeded, pruned, or cleared; references are not permanent backups. Redaction uses patterns and may miss sensitive content.
 - **Measure it.** `usagetrim gain` / MCP `usagetrim_gain` — per-tool-family savings and passthrough candidates (local estimates, not account quotas).
 - **Desktop-ready.** MCP for Claude Code / Codex / Cursor / Claude Desktop; Prepare-for-chat clipboard flow; optional macOS pet.
 
@@ -107,7 +108,7 @@ usagetrim prepare --file draft.txt
 
 ### Measured on real sessions
 
-14 days of the maintainer's Claude Code transcripts, replayed offline through the same functions the hook runs. Token counts are local `o200k_base` estimates, not billing.
+Maintainer-reported results from 14 days of Claude Code transcripts, replayed offline through the same functions the hook runs. Token counts are local `o200k_base` estimates, not billing; the private transcripts are not included as a public benchmark dataset.
 
 | Tool results | Count | Tokens before → after | Cut |
 |---|---:|---:|---:|
@@ -122,11 +123,11 @@ All 3,144 SQL results rewritten as TSV decoded back to the original rows ([repro
 
 ## How it fits
 
-UsageTrim is **not** a chat interceptor. It sits on the tool path (CLI wrapper, MCP, Prepare-for-chat) so agents still see failures — just without the noise.
+UsageTrim sits on the tool path (CLI wrapper, MCP, Prepare-for-chat). It does not intercept or rewrite the chat stream. Its filters aim to retain failure details while reducing repetitive output; inspect the cached text when the compact view is insufficient.
 
 | Approach | What UsageTrim does instead |
 | --- | --- |
-| Blind head/tail truncation | Specialized cutters keep the failure signal; rest recovers via `usagetrim retrieve` |
+| Blind head/tail truncation | Specialized cutters retain recognized failure details; redacted cached text is available via `usagetrim retrieve` while retained |
 | Rewrite the whole chat stream | MCP + `prepare` only — Desktop cannot rewrite model turns |
 | Opaque “saved tokens” badges | `usagetrim gain` shows local Raw→Compact by tool family (not billing quotas) |
 
@@ -136,7 +137,7 @@ Same CCR idea as peers (compress → cache → retrieve). Differentiation is spe
 
 ## Connect your agent
 
-**Desktop & Coding profiles:** 9–11 essential tools instead of 16 — about **36–38% smaller tool schemas** in local `o200k_base` measurements (3,414 → 2,183 / 2,102). Not a per-turn usage guarantee.
+**Desktop & Coding profiles:** 11 and 9 tools respectively, compared with 16 in the full profile, with shorter schema descriptions. Schema token counts depend on the release, serialization, and tokenizer; smaller schemas do not guarantee lower per-turn usage.
 
 ```sh
 # One-command installer for Codex & Claude Desktop
