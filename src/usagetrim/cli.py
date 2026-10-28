@@ -3129,6 +3129,9 @@ def benchmark():
 
 
 def main():
+    from usagetrim.core.shell_shim import dispatch_if_native_shim
+
+    dispatch_if_native_shim()
     app()
 
 

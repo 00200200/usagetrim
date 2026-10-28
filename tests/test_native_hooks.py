@@ -6,12 +6,13 @@ import shutil
 import stat
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
 from usagetrim.cli import app
-from usagetrim.core import hooks, native_hooks
+from usagetrim.core import hooks, native_hooks, shell_shim
 
 _SHELL_ROUTING_CASES = [
     (["pytest"], True),
@@ -180,20 +181,19 @@ def test_fish_wrapper_generator_is_native_and_guards_all_command_names():
         assert f"if not functions -q {name}\n    function {name}\n" in snippet
 
 
-def test_powershell_wrapper_generator_is_native_and_guards_command_names():
+def test_powershell_wrapper_generator_uses_native_path_interception():
     snippet = hooks.generate_shell_wrapper("powershell")
-    for forbidden in ("invoke-expression", "iex", "cmd /c"):
+    for forbidden in (
+        "invoke-expression",
+        "iex",
+        "cmd /c",
+        "function ",
+        "$psnativecommandargumentpassing",
+    ):
         assert forbidden not in snippet.lower()
-    assert "@originalArgv" in snippet and "@CommandArgs" in snippet
-    assert "$PSNativeCommandArgumentPassing" not in snippet
-    assert "-CommandType Application" in snippet
-    for name in ("git", "docker", "pytest", "cargo", "go", "kubectl", "terraform"):
-        guard = (
-            f"Get-Command -Name {name} -CommandType Alias,Function -ErrorAction SilentlyContinue"
-        )
-        assert guard in snippet
-        assert f"function global:{name}" in snippet
-    assert "Test-UsageTrimShellIntercept,Invoke-UsageTrimShellDispatch" in snippet
+    assert "usagetrim.core.shell_shim --prepare" in snippet
+    assert "$env:PATH =" in snippet
+    assert "@CommandArgs" not in snippet
 
 
 @pytest.mark.parametrize(
@@ -249,32 +249,11 @@ $ErrorActionPreference = 'Stop'
 $cases = Get-Content -Raw -LiteralPath $env:CASE_FILE | ConvertFrom-Json
 foreach ($case in $cases) {
     [string[]]$commandArgv = @($case.argv)
-    if ((Test-UsageTrimShellIntercept -Argv $commandArgv) -ne $case.expected) {
-        throw ('Routing mismatch: ' + ($case.argv | ConvertTo-Json -Compress))
-    }
     if ($commandArgv.Count -eq 0 -or $commandArgv[0] -eq 'cd' -or $commandArgv[0].Contains('/')) { continue }
     $tail = @()
     if ($commandArgv.Count -gt 1) { $tail = @($commandArgv[1..($commandArgv.Count - 1)]) }
     & $commandArgv[0] @tail
     if ($LASTEXITCODE -ne 17) { throw 'Exit code changed' }
-}
-# Compare globbing with direct invocation of the exact native application used
-# by each route. PowerShell may expand '*' even when it comes from an argv array.
-foreach ($name in @('pytest', 'git')) {
-    $wildcardArgs = @('*')
-    $nativeName = 'usagetrim'
-    $nativeArgs = @('run', '--', $name) + $wildcardArgs
-    if ($name -eq 'git') {
-        $wildcardArgs = @('commit', '*')
-        $nativeName = 'git'
-        $nativeArgs = $wildcardArgs
-    }
-    $application = @(Microsoft.PowerShell.Core\\Get-Command -Name $nativeName -CommandType Application -ErrorAction Stop)[0]
-    $direct = & $application.Path @nativeArgs
-    if ($LASTEXITCODE -ne 17) { throw 'Direct wildcard exit code changed' }
-    $wrapped = & $name @wildcardArgs
-    if ($LASTEXITCODE -ne 17) { throw 'Wrapped wildcard exit code changed' }
-    if ($direct -cne $wrapped) { throw 'Wrapper changed native wildcard semantics' }
 }
 exit 0
 """)
@@ -287,6 +266,7 @@ exit 0
         env={
             **os.environ,
             "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
             "WRAPPER_FILE": str(snippet),
             "CASE_FILE": str(case_path),
         },
@@ -298,6 +278,276 @@ exit 0
         if argv and argv[0] != "cd" and "/" not in argv[0]
     ]
     assert not (tmp_path / "PWNED").exists()
+
+
+@pytest.mark.parametrize("case", ["pipeline", "failure", "quoted_pathspec"])
+def test_powershell_literal_native_command_semantics(tmp_path, case):
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        pytest.skip(f"pwsh is not installed: literal {case} regression")
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git is not installed")
+    repo = tmp_path / "repo"
+    (repo / "nested").mkdir(parents=True)
+    (repo / "root.py").write_text("root = True\n")
+    (repo / "nested" / "child.py").write_text("child = True\n")
+    subprocess.run([git, "init", "-q", str(repo)], check=True, capture_output=True)
+    subprocess.run([git, "-C", str(repo), "add", "."], check=True, capture_output=True)
+    profile = tmp_path / "wrapper.ps1"
+    profile.write_text(hooks.generate_shell_wrapper("powershell"))
+    commands = {
+        "pipeline": "'review-pipeline-payload' | git hash-object --stdin\n",
+        "failure": """git definitely-invalid-review-command 2>$null && Write-Output 'WRONG-SUCCESS-BRANCH'
+$nativeSuccess = $?
+$nativeCode = $LASTEXITCODE
+Write-Output ("{0}|{1}" -f $nativeSuccess, $nativeCode)
+""",
+        "quoted_pathspec": "git ls-files '*.py'\n",
+    }
+    outputs = []
+    for wrapped in (False, True):
+        script = tmp_path / ("wrapped.ps1" if wrapped else "native.ps1")
+        script.write_text((". $env:WRAPPER_FILE\n" if wrapped else "") + commands[case])
+        result = subprocess.run(
+            [pwsh, "-NoProfile", "-NonInteractive", "-File", str(script)],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            timeout=15,
+            env={
+                **os.environ,
+                "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+                "WRAPPER_FILE": str(profile),
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        outputs.append(result.stdout.splitlines())
+    assert outputs[1] == outputs[0]
+    if case == "pipeline":
+        assert len(outputs[0]) == 1 and len(outputs[0][0]) == 40
+    elif case == "failure":
+        assert outputs[0] == ["False|1"]
+    else:
+        assert outputs[0] == ["nested/child.py", "root.py"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX native exec bootstrap")
+@pytest.mark.parametrize(
+    "argv,intercept",
+    [
+        (["docker", "build", "."], True),
+        (["pytest"], True),
+        (["git", "ls-files", "*.py"], False),
+    ],
+)
+def test_native_powershell_shim_preserves_os_argv_and_exit_code(
+    tmp_path, monkeypatch, argv, intercept
+):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("docker", "pytest", "git", "usagetrim"):
+        executable = bin_dir / name
+        executable.write_text(
+            f"#!{sys.executable}\nimport json, os, sys\n"
+            "print(json.dumps([os.path.basename(sys.argv[0]), *sys.argv[1:]]))\n"
+            "sys.exit(17)\n"
+        )
+        executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[1] / "src"))
+    profile = tmp_path / "profile.ps1"
+    hooks.install_shell_wrapper("powershell", profile)
+    directory = tmp_path / ".usagetrim-shims-profile.ps1"
+    shell_shim.prepare_powershell_shims(directory)
+    initial = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in directory.iterdir()}
+    shell_shim.prepare_powershell_shims(directory)
+    assert initial == {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in directory.iterdir()}
+    special = ["space name", "", "a\nb", "'\"\\", "$(touch PWNED)", "; touch PWNED", "*", "-flag"]
+    result = subprocess.run(
+        [str(directory / argv[0]), *argv[1:], *special],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        env={**os.environ, "PATH": str(directory) + os.pathsep + os.environ["PATH"]},
+    )
+    assert result.returncode == 17, result.stderr
+    expected = (["usagetrim", "run", "--", *argv] if intercept else argv) + special
+    assert json.loads(result.stdout) == expected
+    assert not (tmp_path / "PWNED").exists()
+    hooks.uninstall_shell_wrapper("powershell", profile)
+    assert not directory.exists()
+    assert not profile.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX native exec bootstrap")
+def test_native_powershell_shim_forwards_stdin_and_literal_git_pathspec(tmp_path, monkeypatch):
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git is not installed")
+    monkeypatch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[1] / "src"))
+    repo = tmp_path / "repo"
+    (repo / "nested").mkdir(parents=True)
+    (repo / "root.py").write_text("root = True\n")
+    (repo / "nested" / "child.py").write_text("child = True\n")
+    subprocess.run([git, "init", "-q", str(repo)], check=True, capture_output=True)
+    subprocess.run([git, "-C", str(repo), "add", "."], check=True, capture_output=True)
+    directory = tmp_path / ".usagetrim-shims-profile.ps1"
+    shell_shim.prepare_powershell_shims(directory)
+    for args, stdin in [
+        (["hash-object", "--stdin"], "review-pipeline-payload\n"),
+        (["ls-files", "*.py"], None),
+        (["definitely-invalid-review-command"], None),
+    ]:
+        direct = subprocess.run([git, *args], input=stdin, cwd=repo, capture_output=True, text=True)
+        wrapped = subprocess.run(
+            [str(directory / "git"), *args],
+            input=stdin,
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert (wrapped.stdout, wrapped.stderr, wrapped.returncode) == (
+            direct.stdout,
+            direct.stderr,
+            direct.returncode,
+        )
+
+
+def test_native_powershell_shim_windows_launcher_normalizes_exe_name(tmp_path, monkeypatch):
+    launcher = tmp_path / "git.exe"
+    launcher.write_bytes(b"owned launcher")
+    (tmp_path / ".usagetrim-native-shims.json").write_text(
+        json.dumps({"version": 1, "files": {"git.exe": shell_shim._digest(launcher)}})
+    )
+    monkeypatch.setattr(sys, "argv", [str(tmp_path / "git"), "ls-files", "*.py"])
+    called = []
+
+    def dispatch(path, args):
+        called.append((path, args))
+        return 17
+
+    monkeypatch.setattr(shell_shim, "run_native_shim", dispatch)
+    with pytest.raises(SystemExit) as exc:
+        shell_shim.dispatch_if_native_shim()
+    assert exc.value.code == 17
+    assert called == [(tmp_path / "git.exe", ["ls-files", "*.py"])]
+
+
+@pytest.mark.parametrize("name", ["usagetrim", "cli.py", "pytest", "git"])
+def test_native_shim_activation_requires_owned_file(tmp_path, monkeypatch, name):
+    executable = tmp_path / name
+    executable.write_bytes(b"unrelated executable")
+    marker = tmp_path / shell_shim._MANIFEST
+    marker.write_text(json.dumps({"version": 1, "files": {"git": "0" * 64}}))
+    monkeypatch.setattr(sys, "argv", [str(executable)])
+
+    def unexpected(*args):
+        pytest.fail("unowned executable activated shim dispatch")
+
+    monkeypatch.setattr(shell_shim, "run_native_shim", unexpected)
+    assert shell_shim.dispatch_if_native_shim() is False
+    marker.write_text("invalid JSON")
+    assert shell_shim.dispatch_if_native_shim() is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX native exec bootstrap")
+def test_native_shim_lookup_excludes_owned_paths_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[1] / "src"))
+    first = tmp_path / ".usagetrim-shims-first.ps1"
+    second = tmp_path / ".usagetrim-shims-second.ps1"
+    for directory in (first, second):
+        shell_shim.prepare_powershell_shims(directory)
+    alias = tmp_path / "alias"
+    alias.symlink_to(first, target_is_directory=True)
+    user = tmp_path / ".usagetrim-shims-user"
+    user.mkdir()
+    (user / shell_shim._MANIFEST).write_text("{}")
+    (user / "git").write_text("#!/bin/sh\nprintf 'user executable'\nexit 19\n")
+    (user / "git").chmod(0o700)
+    # Empty/relative entries and symlink aliases must not find another shim.
+    path = os.pathsep.join([str(first), "", first.name, str(alias), str(second), user.name])
+    result = subprocess.run(
+        [str(first / "git"), "commit"],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": path},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert (result.returncode, result.stdout, result.stderr) == (19, "user executable", "")
+    result = subprocess.run(
+        [str(first / "git"), "commit"],
+        env={**os.environ, "PATH": os.pathsep.join([str(first), str(second)])},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 127
+    assert "original executable unavailable" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires real Windows console launchers")
+def test_native_shim_windows_exe_launcher_and_batch_passthrough(tmp_path, monkeypatch):
+    git = shutil.which("git")
+    if git is None or Path(git).suffix.lower() != ".exe":
+        pytest.skip("native git.exe is not installed")
+    bin_dir = tmp_path / "batch files"
+    bin_dir.mkdir()
+    for name, extension in [("docker", ".cmd"), ("kubectl", ".bat")]:
+        (bin_dir / (name + extension)).write_text("@exit /b 23\n")
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
+    directory = tmp_path / ".usagetrim-shims-profile.ps1"
+    # This executes the actual copied usagetrim.exe, not a mocked Windows path.
+    shell_shim.prepare_powershell_shims(directory)
+    assert not (directory / "docker.exe").exists()
+    assert not (directory / "kubectl.exe").exists()
+    expected = subprocess.run([git, "--version"], capture_output=True)
+    result = subprocess.run(
+        [str(directory / "GIT.EXE"), "--version"], capture_output=True, timeout=20
+    )
+    assert (result.returncode, result.stdout, result.stderr) == (
+        expected.returncode,
+        expected.stdout,
+        expected.stderr,
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX native exec bootstrap")
+def test_native_shim_preserves_sole_empty_path_entry(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[1] / "src"))
+    directory = tmp_path / ".usagetrim-shims-profile.ps1"
+    shell_shim.prepare_powershell_shims(directory)
+    git = tmp_path / "git"
+    git.write_text("#!/bin/sh\nprintf cwd-git\n")
+    git.chmod(0o700)
+    result = subprocess.run(
+        [str(directory / "git"), "commit"],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": str(directory) + os.pathsep},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert (result.returncode, result.stdout, result.stderr) == (0, "cwd-git", "")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX native exec bootstrap")
+def test_native_powershell_shim_refuses_user_modifications_and_preserves_user_files(tmp_path):
+    directory = tmp_path / ".usagetrim-shims-profile.ps1"
+    shell_shim.prepare_powershell_shims(directory)
+    user_file = directory / "user-note.txt"
+    user_file.write_bytes(b"keep me")
+    before = {p.name: p.read_bytes() for p in directory.iterdir()}
+    with pytest.raises(ValueError, match="user modifications"):
+        shell_shim.prepare_powershell_shims(directory)
+    assert before == {p.name: p.read_bytes() for p in directory.iterdir()}
+    shell_shim.remove_powershell_shims(tmp_path / "profile.ps1")
+    assert list(directory.iterdir()) == [user_file]
+    assert user_file.read_bytes() == b"keep me"
 
 
 def test_powershell_shell_wrapper_preserves_alias_and_function(tmp_path, executable):
@@ -326,6 +576,7 @@ exit 0
         env={
             **os.environ,
             "PATH": str(executable.parent) + os.pathsep + os.environ["PATH"],
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
             "WRAPPER_FILE": str(profile),
         },
     )
@@ -555,7 +806,11 @@ exit 0
 """)
     result = subprocess.run(
         [pwsh, "-NoProfile", "-NonInteractive", "-File", str(script)],
-        env={**os.environ, "WRAPPER_FILE": str(profile)},
+        env={
+            **os.environ,
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+            "WRAPPER_FILE": str(profile),
+        },
         text=True,
         capture_output=True,
         timeout=5,

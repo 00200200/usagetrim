@@ -101,7 +101,7 @@ def generate_shell_wrapper(shell: str) -> str:
     if shell == "fish":
         return _guard_shell_helpers(shell, _generate_fish_wrapper())
     if shell == "powershell":
-        return _guard_shell_helpers(shell, _generate_powershell_wrapper())
+        return _generate_powershell_wrapper()
     if shell not in {"bash", "zsh"}:
         raise ValueError("shell must be bash, zsh, fish or powershell")
     conditions = [
@@ -207,12 +207,6 @@ def generate_shell_wrapper(shell: str) -> str:
 
 def _guard_shell_helpers(shell: str, snippet: str) -> str:
     """Do not redefine another import's helpers or leave wrappers calling them."""
-    if shell == "powershell":
-        return (
-            "if (-not (Microsoft.PowerShell.Core\\Get-Command -Name "
-            "Test-UsageTrimShellIntercept,Invoke-UsageTrimShellDispatch "
-            "-CommandType Alias,Function -ErrorAction SilentlyContinue)) {\n" + snippet + "}\n"
-        )
     names = ("_usagetrim_shell_intercept", "_usagetrim_shell_dispatch")
     if shell == "fish":
         return (
@@ -362,130 +356,32 @@ def _generate_fish_wrapper() -> str:
     return "\n".join(lines) + "\n"
 
 
-def _powershell_strings(values: Sequence[str]) -> str:
-    return "@(" + ", ".join("'" + item.replace("'", "''") + "'" for item in values) + ")"
-
-
-def _powershell_pattern(patterns: Sequence[str]) -> str:
-    # .NET, like PCRE, uses \\z for the absolute end of input.
-    pattern = "|".join(translate(item).replace(r"\Z", r"\z") for item in patterns)
-    return "'" + pattern.replace("'", "''") + "'"
-
-
 def _generate_powershell_wrapper() -> str:
-    lines = [
-        "# usagetrim: conservative high-volume command wrappers (PowerShell Core)",
-        "function global:Test-UsageTrimShellIntercept {",
-        "    param([string[]]$Argv)",
-        "    if ($null -eq $Argv -or $Argv.Count -eq 0) { return $false }",
-        "    $commandName = $Argv[0]",
-        "    $position = 1",
-    ]
-    for command, subcommands in _SHELL_FINITE_SUBCOMMANDS.items():
-        lines.extend(
-            [
-                f"    if ($commandName -ceq '{command}') {{",
-                "        while ($position -lt $Argv.Count -and $Argv[$position].StartsWith('-')) {",
-            ]
-        )
-        value_flags = _SHELL_GLOBAL_VALUE_FLAGS[command]
-        if value_flags:
-            lines.extend(
-                [
-                    f"            if ({_powershell_strings(value_flags)} -ccontains $Argv[$position]) {{",
-                    "                if ($position + 1 -ge $Argv.Count) { return $false }",
-                    "                $position += 2",
-                    "            } elseif ($Argv[$position] -cmatch "
-                    + _powershell_pattern(_SHELL_GLOBAL_INLINE_FLAGS[command])
-                    + ") {",
-                ]
-            )
-        else:
-            lines.append(
-                "            if ($Argv[$position] -cmatch "
-                + _powershell_pattern(_SHELL_GLOBAL_INLINE_FLAGS[command])
-                + ") {"
-            )
-        lines.extend(
-            [
-                "                $position++",
-                "            } else { return $false }",
-                "        }",
-                "        if ($position -ge $Argv.Count -or "
-                + _powershell_strings(subcommands)
-                + " -cnotcontains $Argv[$position]) { return $false }",
-            ]
-        )
-        if command == "terraform":
-            lines.extend(
-                [
-                    "        if ($Argv[$position] -ceq 'plan') {",
-                    "            $hasInputFalse = $false",
-                    "            for ($i = $position + 1; $i -lt $Argv.Count; $i++) {",
-                    "                if ($Argv[$i] -ceq '--') { break }",
-                    "                if ($Argv[$i].StartsWith('-input', [System.StringComparison]::Ordinal)) {",
-                    "                    if ($Argv[$i] -cne '-input=false') { return $false }",
-                    "                    $hasInputFalse = $true",
-                    "                }",
-                    "            }",
-                    "            if (-not $hasInputFalse) { return $false }",
-                    "        }",
-                ]
-            )
-        lines.append("    }")
-    for command, patterns in _SHELL_PASSTHROUGH_ARGS.items():
-        lines.extend(
-            [
-                f"    if ($commandName -ceq '{command}') {{",
-                "        for ($i = $position; $i -lt $Argv.Count; $i++) {",
-                "            if ($Argv[$i] -ceq '--') { break }",
-                "            if ($Argv[$i] -cmatch "
-                + _powershell_pattern(patterns)
-                + ") { return $false }",
-                "        }",
-                "    }",
-            ]
-        )
-    lines.append(
-        "    if ("
-        + _powershell_strings(tuple(_SHELL_FINITE_SUBCOMMANDS))
-        + " -ccontains $commandName) { return $true }"
-    )
-    for prefix in _SHELL_INTERCEPT_PREFIXES:
-        checks = [f"$Argv.Count -ge {len(prefix)}"]
-        checks.extend(f"$Argv[{index}] -ceq '{word}'" for index, word in enumerate(prefix))
-        lines.append("    if (" + " -and ".join(checks) + ") { return $true }")
-    lines.extend(
-        [
-            "    return $false",
-            "}",
-            "function global:Invoke-UsageTrimShellDispatch {",
-            "    param([string]$CommandName, [object[]]$CommandArgs)",
-            "    if ($null -eq $CommandArgs) { $CommandArgs = @() }",
-            "    [string[]]$originalArgv = @($CommandName) + @($CommandArgs)",
-            "    if (Test-UsageTrimShellIntercept -Argv $originalArgv) {",
-            "        $application = @(Microsoft.PowerShell.Core\\Get-Command -Name usagetrim -CommandType Application -ErrorAction Stop)[0]",
-            "        & $application.Path 'run' '--' @originalArgv",
-            "    } else {",
-            "        $application = @(Microsoft.PowerShell.Core\\Get-Command -Name $CommandName -CommandType Application -ErrorAction Stop)[0]",
-            "        & $application.Path @CommandArgs",
-            "    }",
-            "    $global:LASTEXITCODE = $LASTEXITCODE",
-            "}",
-        ]
-    )
-    names = dict.fromkeys(
-        [*(prefix[0] for prefix in _SHELL_INTERCEPT_PREFIXES), *_SHELL_FINITE_SUBCOMMANDS]
-    )
-    for name in names:
-        lines.extend(
-            [
-                f"if (-not (Microsoft.PowerShell.Core\\Get-Command -Name {name} -CommandType Alias,Function -ErrorAction SilentlyContinue)) {{",
-                f"    function global:{name} {{ Invoke-UsageTrimShellDispatch -CommandName '{name}' -CommandArgs $args }}",
-                "}",
-            ]
-        )
-    return "\n".join(lines) + "\n"
+    # Keep command discovery/invocation native: a PowerShell function cannot
+    # transparently preserve pipeline input, $? or quoted native pathspecs.
+    python = str(Path(sys.executable).resolve()).replace("'", "''")
+    return """# usagetrim: native PowerShell PATH interception
+& {
+    if (-not $PSCommandPath) { return }
+    $directory = Join-Path $PSScriptRoot ('.usagetrim-shims-' + [IO.Path]::GetFileName($PSCommandPath))
+    $previousCode = Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+    $savedCode = if ($null -ne $previousCode) { $previousCode.Value } else { $null }
+    try {
+        & '__PYTHON__' -m usagetrim.core.shell_shim --prepare $directory
+        if ($LASTEXITCODE -eq 0) {
+            $separator = [IO.Path]::PathSeparator
+            $remaining = @($env:PATH -split [regex]::Escape([string]$separator) | Where-Object { $_ -ne $directory })
+            $env:PATH = [string]::Join($separator, @($directory) + $remaining)
+        }
+    } finally {
+        if ($null -ne $previousCode) {
+            $global:LASTEXITCODE = $savedCode
+        } else {
+            Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+        }
+    }
+}
+""".replace("__PYTHON__", python)
 
 
 _SHELL_WRAPPER_START = b"# >>> usagetrim shell wrapper >>>"
@@ -625,6 +521,10 @@ def uninstall_shell_wrapper(shell: str, rc_path: str | Path | None = None) -> Pa
             path.unlink()
         else:
             _write_shell_rc(path, updated)
+        if shell == "powershell":
+            from usagetrim.core.shell_shim import remove_powershell_shims
+
+            remove_powershell_shims(path)
     return path
 
 
