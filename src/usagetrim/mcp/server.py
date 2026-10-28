@@ -220,6 +220,11 @@ TOOLS_DEFINITIONS = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                "semantic": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Allow offline semantic fallback for query; cannot combine with lines.",
+                },
                 "query": {
                     "type": "string",
                     "description": "Search words in this cached output; cannot combine with lines.",
@@ -602,6 +607,7 @@ _COMPACT_PROP_DESCRIPTIONS = {
     "expected_revision": "Revision expected before save.",
     "revision": "Specific revision to read.",
     "retention": "Task retention: ephemeral or permanent (save only).",
+    "semantic": "Offline semantic fallback for query.",
     "action": "Action: save, read, list, forget.",
     "task": "Task ID.",
     "checkpoint": "Checkpoint milestone data.",
@@ -950,13 +956,21 @@ def handle_usagetrim_retrieve(arguments: dict[str, Any]) -> str:
     lines = arguments.get("lines")
     cache = ContextCache()
     query = arguments.get("query")
+    semantic = arguments.get("semantic", False)
+    if type(semantic) is not bool:
+        raise ValueError("semantic must be a boolean")
     if query is not None and lines is not None:
         raise ValueError("Choose query or lines, not both")
-    retrieved = (
-        cache.search(ref_id, query)
-        if query is not None
-        else cache.retrieve(ref_id, lines_range=lines)
-    )
+    if semantic and (query is None or lines is not None):
+        raise ValueError("semantic requires query and cannot be combined with lines")
+    if semantic:
+        retrieved = cache.hybrid_search(ref_id, query, budget, token_provider="claude")
+    else:
+        retrieved = (
+            cache.search(ref_id, query)
+            if query is not None
+            else cache.retrieve(ref_id, lines_range=lines)
+        )
     if retrieved.startswith("Error:"):
         return retrieved
     output = _compress(retrieved, budget, source="retrieve")
