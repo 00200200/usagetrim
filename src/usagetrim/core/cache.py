@@ -207,7 +207,7 @@ class ContextCache:
         except ValueError:
             return "Error: lines must be a positive line number or an ascending range (e.g. 10-40)."
 
-    def search(self, ref_id: str, query: str, limit: int = 5) -> str:
+    def _search_snapshot(self, ref_id, query, limit, *, check_complete=False):
         """Search only the requested recovery record; never search conversations.
 
         Index the already-redacted snapshot lazily. FTS data is recovery content,
@@ -234,7 +234,7 @@ class ContextCache:
                 )
                 conn.commit()
         if row is None:
-            return f"Error: ref ID '{ref_id}' not found in usagetrim cache."
+            return None, [], False
         original = redact_secrets(decompress_payload(row[0]))
         checksum = hashlib.sha256(original.encode()).hexdigest()
         with sqlite3.connect(self.db_path) as conn:
@@ -264,12 +264,111 @@ class ContextCache:
                 "SELECT first,last,body FROM recovery_search WHERE recovery_search MATCH ? AND ref=? ORDER BY bm25(recovery_search),CAST(first AS INTEGER) LIMIT ?",
                 (expression, ref_id, limit + 1),
             ).fetchall()
+            # terms() emits quoted words joined by OR; retain FTS token semantics.
+            complete = (
+                check_complete
+                and conn.execute(
+                    "SELECT 1 FROM recovery_search WHERE recovery_search MATCH ? AND ref=? LIMIT 1",
+                    (expression.replace(" OR ", " AND "), ref_id),
+                ).fetchone()
+                is not None
+            )
+        return original, rows, complete
+
+    @staticmethod
+    def _lexical_result(ref_id, rows, limit):
         result = "\n".join(
             f"# {ref_id} lines {first}-{last}\n{body}" for first, last, body in rows[:limit]
         )
         if len(rows) > limit:
             result += "\n[More matching chunks; narrow query or raise limit.]"
         return result or f"No matches in {ref_id}; the original remains available with retrieve."
+
+    def search(self, ref_id: str, query: str, limit: int = 5) -> str:
+        """Lexical search of one redacted recovery record, with legacy output."""
+        original, rows, _ = self._search_snapshot(ref_id, query, limit)
+        if original is None:
+            return f"Error: ref ID '{ref_id}' not found in usagetrim cache."
+        return self._lexical_result(ref_id, rows, limit)
+
+    def hybrid_search(
+        self,
+        ref_id: str,
+        query: str,
+        budget: int = 1000,
+        *,
+        limit: int = 3,
+        token_provider: str = "openai",
+        embedder=None,
+    ) -> str:
+        """Opt-in, offline semantic fallback; vectors live only for this call."""
+        from usagetrim.metrics.tokenizer import count_tokens
+
+        if type(budget) is not int or budget < 1:
+            raise ValueError("budget must be a positive integer")
+        if token_provider not in {"openai", "claude", "gemini"}:
+            raise ValueError("token_provider must be openai, claude or gemini")
+
+        def fits(text):
+            # Include the newline that CLI _emit adds to its stdout.
+            emitted = text + ("\n" if text and not text.endswith("\n") else "")
+            return getattr(count_tokens(emitted), token_provider) <= budget
+
+        original, lexical, complete = self._search_snapshot(
+            ref_id, query, limit, check_complete=True
+        )
+        if original is None:
+            missing = f"Error: ref ID '{ref_id}' not found in usagetrim cache."
+            if not fits(missing):
+                raise ValueError("budget is too small for the recovery status")
+            return missing
+        candidates = lexical
+        semantic_ranges = set()
+        skipped = []
+        if not complete:
+            from usagetrim.core.semantic_search import rank_chunks
+
+            semantic, skipped = rank_chunks(original, redact_secrets(query), embedder)
+            if semantic:
+                semantic_ranges = {(first, last) for first, last, _ in semantic}
+                candidates = semantic + [
+                    row
+                    for row in lexical
+                    if not any(
+                        row[0] <= last and first <= row[1] for first, last in semantic_ranges
+                    )
+                ]
+        legacy = self._lexical_result(ref_id, lexical, limit)
+        if not semantic_ranges and not skipped and fits(legacy):
+            return legacy
+
+        selected = []
+
+        def render(rows):
+            keys = {(first, last) for first, last, _ in rows}
+            omitted = next(((a, b) for a, b, _ in candidates if (a, b) not in keys), None)
+            omitted = omitted or (skipped[0] if skipped else None)
+            blocks = [
+                f"# {ref_id} lines {a}-{b}"
+                + (" [semantic candidate]" if (a, b) in semantic_ranges else "")
+                + "\n"
+                + body
+                for a, b, body in rows
+            ]
+            if omitted:
+                a, b = omitted
+                blocks.append(f"[Omitted; retrieve {ref_id} --lines {a}-{b}]")
+            return "\n".join(blocks) or legacy
+
+        for row in candidates:
+            if len(selected) == limit:
+                break
+            if fits(render([*selected, row])):
+                selected.append(row)
+        result = render(selected)
+        if not fits(result):
+            raise ValueError("budget is too small for the recovery notice")
+        return result
 
     def check_duplicate(self, content: str) -> str | None:
         """Check if identical content was cached recently within last 15 minutes."""

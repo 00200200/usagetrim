@@ -1318,17 +1318,38 @@ def retrieve(
     lines: Annotated[
         str | None, typer.Option("--lines", "-l", help="Line range to inspect (e.g. 20-60)")
     ] = None,
+    semantic: Annotated[
+        bool, typer.Option("--semantic", help="Allow offline semantic fallback for --query.")
+    ] = False,
+    budget: Annotated[
+        int | None,
+        typer.Option(
+            "--budget", min=64, max=32000, help="Token budget for --semantic (default 1000)."
+        ),
+    ] = None,
 ):
     """Retrieve full uncompressed raw output from the local Compress-Cache-Retrieve store."""
     cache = ContextCache()
     if query is not None and lines is not None:
         raise typer.BadParameter("Choose --query or --lines, not both")
+    if semantic and (query is None or lines is not None):
+        raise typer.BadParameter("--semantic requires --query and cannot be combined with --lines")
+    if budget is not None and not semantic:
+        raise typer.BadParameter("--budget requires --semantic")
     try:
-        raw = (
-            cache.search(ref_id, query)
-            if query is not None
-            else cache.retrieve(ref_id, lines_range=lines)
-        )
+        if semantic:
+            raw = cache.hybrid_search(
+                ref_id,
+                query,
+                budget=budget if budget is not None else 1000,
+                token_provider="openai",
+            )
+        else:
+            raw = (
+                cache.search(ref_id, query)
+                if query is not None
+                else cache.retrieve(ref_id, lines_range=lines)
+            )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     emitted = _emit(raw)
