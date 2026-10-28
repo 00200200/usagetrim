@@ -196,6 +196,38 @@ def test_powershell_wrapper_generator_uses_native_path_interception():
     assert "@CommandArgs" not in snippet
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX virtualenv interpreter symlink")
+def test_powershell_wrapper_bootstrap_preserves_virtualenv_python(tmp_path, monkeypatch):
+    python = tmp_path / "virtual env" / "python"
+    python.parent.mkdir()
+    python.symlink_to(sys.executable)
+    monkeypatch.setattr(hooks.sys, "executable", str(python))
+    snippet = hooks.generate_shell_wrapper("powershell")
+    quoted = str(python.absolute()).replace("'", "''")
+    assert f"& '{quoted}' -m usagetrim.core.shell_shim --prepare" in snippet
+    assert str(python.resolve()).replace("'", "''") not in snippet
+
+
+def _powershell_assert_shims_active(*names):
+    commands = ", ".join(f"'{name}'" for name in names)
+    return """
+$shimDirectory = Join-Path ([IO.Path]::GetDirectoryName($env:WRAPPER_FILE)) ('.usagetrim-shims-' + [IO.Path]::GetFileName($env:WRAPPER_FILE))
+$manifestPath = Join-Path $shimDirectory '.usagetrim-native-shims.json'
+if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw 'Shim manifest missing' }
+$manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+$firstPath = ($env:PATH -split [regex]::Escape([string][IO.Path]::PathSeparator))[0]
+if ($firstPath -ne $shimDirectory) { throw "Shim directory is not first in PATH: $firstPath" }
+foreach ($name in @(__COMMANDS__)) {
+    $file = if ($IsWindows) { $name + '.exe' } else { $name }
+    $expected = Join-Path $shimDirectory $file
+    if (-not (Test-Path -LiteralPath $expected -PathType Leaf)) { throw "Shim launcher missing: $expected" }
+    if ($manifest.files.PSObject.Properties.Name -notcontains $file) { throw "Unmanaged launcher: $file" }
+    $application = @(Get-Command -Name $name -CommandType Application -All -ErrorAction Stop)[0]
+    if ($application.Path -ne $expected) { throw "Unexpected application for ${name}: $($application.Path)" }
+}
+""".replace("__COMMANDS__", commands)
+
+
 @pytest.mark.parametrize(
     "platform,relative",
     [
@@ -243,9 +275,14 @@ def test_powershell_shell_wrapper_routes_argv_and_preserves_native_arguments(tmp
         json.dumps([{"argv": argv, "expected": expected} for argv, expected in cases])
     )
     script = tmp_path / "test.ps1"
-    script.write_text("""
+    script.write_text(
+        """
 $ErrorActionPreference = 'Stop'
+$null = Get-Command pytest,git,docker -CommandType Application -All -ErrorAction Stop
 . $env:WRAPPER_FILE
+"""
+        + _powershell_assert_shims_active("pytest", "git", "docker")
+        + """
 $cases = Get-Content -Raw -LiteralPath $env:CASE_FILE | ConvertFrom-Json
 foreach ($case in $cases) {
     [string[]]$commandArgv = @($case.argv)
@@ -256,7 +293,8 @@ foreach ($case in $cases) {
     if ($LASTEXITCODE -ne 17) { throw 'Exit code changed' }
 }
 exit 0
-""")
+"""
+    )
     result = subprocess.run(
         [pwsh, "-NoProfile", "-NonInteractive", "-File", str(script)],
         cwd=tmp_path,
@@ -281,7 +319,7 @@ exit 0
 
 
 @pytest.mark.parametrize("case", ["pipeline", "failure", "quoted_pathspec"])
-def test_powershell_literal_native_command_semantics(tmp_path, case):
+def test_powershell_literal_native_command_semantics(tmp_path, executable, case):
     pwsh = shutil.which("pwsh")
     if pwsh is None:
         pytest.skip(f"pwsh is not installed: literal {case} regression")
@@ -308,7 +346,20 @@ Write-Output ("{0}|{1}" -f $nativeSuccess, $nativeCode)
     outputs = []
     for wrapped in (False, True):
         script = tmp_path / ("wrapped.ps1" if wrapped else "native.ps1")
-        script.write_text((". $env:WRAPPER_FILE\n" if wrapped else "") + commands[case])
+        activation = (
+            "$null = Get-Command git -CommandType Application -All -ErrorAction Stop\n"
+            ". $env:WRAPPER_FILE\n"
+            + _powershell_assert_shims_active("git")
+            + """
+$probe = @(git diff --usagetrim-activation-probe)
+if ($LASTEXITCODE -ne 0 -or ($probe | ConvertTo-Json -Compress) -cne '["run","--","git","diff","--usagetrim-activation-probe"]') {
+    throw 'Interception probe did not pass through usagetrim run'
+}
+"""
+            if wrapped
+            else ""
+        )
+        script.write_text(activation + commands[case])
         result = subprocess.run(
             [pwsh, "-NoProfile", "-NonInteractive", "-File", str(script)],
             cwd=repo,
@@ -317,6 +368,7 @@ Write-Output ("{0}|{1}" -f $nativeSuccess, $nativeCode)
             timeout=15,
             env={
                 **os.environ,
+                "PATH": str(executable.parent) + os.pathsep + os.environ["PATH"],
                 "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
                 "WRAPPER_FILE": str(profile),
             },
@@ -557,17 +609,22 @@ def test_powershell_shell_wrapper_preserves_alias_and_function(tmp_path, executa
     profile = tmp_path / "profile.ps1"
     hooks.install_shell_wrapper("powershell", profile)
     script = tmp_path / "test.ps1"
-    script.write_text("""
+    script.write_text(
+        """
 $ErrorActionPreference = 'Stop'
 function UserGit { 'user-alias' }
 Set-Alias -Name git -Value UserGit
 function pytest { 'user-function' }
 . $env:WRAPPER_FILE
+"""
+        + _powershell_assert_shims_active("docker")
+        + """
 git diff
 pytest -q
 docker build .
 exit 0
-""")
+"""
+    )
     result = subprocess.run(
         [pwsh, "-NoProfile", "-NonInteractive", "-File", str(script)],
         text=True,

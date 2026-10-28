@@ -359,7 +359,8 @@ def _generate_fish_wrapper() -> str:
 def _generate_powershell_wrapper() -> str:
     # Keep command discovery/invocation native: a PowerShell function cannot
     # transparently preserve pipeline input, $? or quoted native pathspecs.
-    python = str(Path(sys.executable).resolve()).replace("'", "''")
+    # Resolving a virtualenv's Python symlink loses its installed dependencies.
+    python = str(Path(sys.executable).absolute()).replace("'", "''")
     return """# usagetrim: native PowerShell PATH interception
 & {
     if (-not $PSCommandPath) { return }
