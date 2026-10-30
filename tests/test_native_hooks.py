@@ -921,15 +921,21 @@ pytest -q
 docker build .
 """
         )
-    result = subprocess.run(
-        [
+    if shell == "zsh":
+        script_path = tmp_path / "test-wrapper.zsh"
+        script_path.write_text(script, encoding="utf-8")
+        command = [shell_executable, str(script_path), str(rc)]
+    else:
+        command = [
             shell_executable,
             *(["--no-config"] if shell == "fish" else []),
             "-c",
             script,
             *([] if shell == "fish" else ["wrapper-test"]),
             str(rc),
-        ],
+        ]
+    result = subprocess.run(
+        command,
         env={**os.environ, "PATH": str(executable.parent) + os.pathsep + os.environ["PATH"]},
         capture_output=True,
         text=True,
