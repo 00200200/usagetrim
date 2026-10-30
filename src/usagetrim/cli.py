@@ -57,7 +57,12 @@ from usagetrim.core.doctor import (
 )
 from usagetrim.core.engines import select_engine
 from usagetrim.core.gain import build_gain_report
-from usagetrim.core.hooks import install_zsh_hook, setup_claude_code_mcp_config
+from usagetrim.core.hooks import (
+    install_shell_wrapper,
+    install_zsh_hook,
+    setup_claude_code_mcp_config,
+    uninstall_shell_wrapper,
+)
 from usagetrim.core.json_slimmer import slim_json
 from usagetrim.core.native_hooks import install_claude_hook, run_hook_filter
 from usagetrim.core.pr_analyzer import analyze_pr_tokens
@@ -1870,14 +1875,40 @@ def install(
 @app.command()
 def hook(
     install: Annotated[
-        bool, typer.Option("--install", "-i", help="Install shell wrapper to ~/.zshrc")
+        bool, typer.Option("--install", "-i", help="Install hooks for the selected client")
+    ] = False,
+    uninstall: Annotated[
+        bool,
+        typer.Option("--uninstall", help="Remove the managed bash/zsh/fish/PowerShell wrapper"),
     ] = False,
     client: Annotated[
         str,
-        typer.Option("--client", help="claude for native output filtering, or shell for aliases"),
+        typer.Option(
+            "--client", help="claude, bash, zsh, fish, powershell, or shell (legacy zsh aliases)"
+        ),
     ] = "shell",
 ):
     """Configure Claude Code or terminal hooks for automatic optimization."""
+    if install and uninstall:
+        raise typer.BadParameter("--install and --uninstall are mutually exclusive")
+    if client not in {"claude", "bash", "zsh", "fish", "powershell", "shell"}:
+        raise typer.BadParameter("client must be claude, bash, zsh, fish, powershell or shell")
+    if uninstall and client not in {"bash", "zsh", "fish", "powershell"}:
+        raise typer.BadParameter("--uninstall is supported only for bash, zsh, fish and powershell")
+    if (install or uninstall) and client in {"bash", "zsh", "fish", "powershell"}:
+        from usagetrim.core.redactor import redact_secrets
+
+        try:
+            rc = install_shell_wrapper(client) if install else uninstall_shell_wrapper(client)
+        except (ValueError, OSError) as exc:
+            raise typer.BadParameter(redact_secrets(str(exc))) from exc
+        action = "Installed" if install else "Removed"
+        console.print(f"{action} {client} shell wrapper: {redact_secrets(str(rc))}.", markup=False)
+        if install:
+            console.print(
+                f"Restart your {client} shell or source this rc file to activate.", markup=False
+            )
+        return
     if install:
         if client == "claude":
             executable = Path(shutil.which("usagetrim") or sys.argv[0])
@@ -1887,8 +1918,6 @@ def hook(
                 markup=False,
             )
             return
-        if client != "shell":
-            raise typer.BadParameter("client must be claude or shell")
         zshrc = install_zsh_hook()
         console.print(f"[green]✓ Successfully installed alias to {zshrc}![/green]")
         console.print("Run [bold cyan]source ~/.zshrc[/bold cyan] to enable [bold]cc-run[/bold].")
@@ -3100,6 +3129,9 @@ def benchmark():
 
 
 def main():
+    from usagetrim.core.shell_shim import dispatch_if_native_shim
+
+    dispatch_if_native_shim()
     app()
 
 
