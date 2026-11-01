@@ -1355,7 +1355,9 @@ def retrieve(
     emitted = _emit(raw)
     # Recovery is additional context, not a second saving of the original log.
     try:
-        record_text("", emitted, operation="retrieve", engine=recovery_engine(ref_id))
+        record_text(
+            "", emitted, operation="retrieve", engine=recovery_engine(ref_id), offline=semantic
+        )
     except Exception:
         pass
 

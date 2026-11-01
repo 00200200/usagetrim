@@ -542,6 +542,96 @@ def test_cli_and_mcp_opt_in_and_legacy_compatibility(monkeypatch):
     }
 
 
+@pytest.mark.parametrize("interface", ["cli", "mcp"])
+@pytest.mark.parametrize(
+    "query,backend", [("HTTP", False), ("auth failure", False), ("auth failure", True)]
+)
+@pytest.mark.parametrize("engine", ["usagetrim", "rtk"])
+def test_semantic_interfaces_and_metrics_stay_offline_with_cold_tokenizer(
+    monkeypatch, tmp_path, interface, query, backend, engine
+):
+    import tiktoken.load
+    import tiktoken.registry
+
+    from usagetrim.core.telemetry import TelemetryStore
+    from usagetrim.mcp import server
+    from usagetrim.metrics import tokenizer
+
+    attempts = []
+
+    def remote_read(*args, **kwargs):
+        attempts.append(args)
+        raise RuntimeError("tokenizer download attempted")
+
+    empty = tmp_path / "empty-tokenizer-cache"
+    empty.mkdir()
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(empty))
+    monkeypatch.setattr(tokenizer, "_O200K_ENC", None)
+    monkeypatch.setattr(tokenizer, "_CL100K_ENC", None)
+    monkeypatch.setattr(tiktoken.registry, "ENCODINGS", {})
+    monkeypatch.setattr(tiktoken.load, "read_file", remote_read)
+    monkeypatch.setattr(semantic, "load_embedder", FakeEmbedder if backend else lambda: None)
+    ref = ContextCache().store("HTTP 401 Unauthorized: JWT claims expired", source=engine)
+    before_session = server._SESSION_SAVED_OPENAI
+    if interface == "cli":
+        result = CliRunner().invoke(
+            app, ["retrieve", ref, "--query", query, "--semantic", "--budget", "256"]
+        )
+        assert result.exit_code == 0, result.exception
+        output = result.stdout
+    else:
+        output = server.handle_usagetrim_retrieve(
+            {"ref_id": ref, "query": query, "semantic": True, "max_tokens": 256}
+        )
+    assert not attempts
+    assert list(empty.iterdir()) == []
+    assert (
+        "401 Unauthorized" in output
+        if query == "HTTP" or backend
+        else output.startswith("No matches")
+    )
+    if backend and query != "HTTP":
+        assert "[semantic candidate]" in output
+    assert len(output.encode("utf-8")) <= 256
+    with TelemetryStore().connect() as conn:
+        event = conn.execute(
+            "SELECT raw_openai, compact_openai, method, engine FROM events WHERE operation='retrieve'"
+        ).fetchone()
+    expected = (
+        (len(output.encode("utf-8")) + 3) // 4 if engine == "rtk" else len(output.encode("utf-8"))
+    )
+    assert event == (
+        0,
+        expected,
+        "bytes/4" if engine == "rtk" else "utf8-bytes-upper-bound",
+        engine,
+    )
+    if interface == "mcp" and engine == "usagetrim":
+        assert server._SESSION_SAVED_OPENAI == before_session - expected
+
+
+@pytest.mark.parametrize("broken_encoding", [False, True])
+def test_offline_telemetry_labels_the_counting_method(monkeypatch, broken_encoding):
+    from usagetrim.core.telemetry import TelemetryStore, record_text
+    from usagetrim.metrics import tokenizer
+
+    if broken_encoding:
+
+        class BrokenEncoding:
+            name = "broken"
+
+            def encode(self, *args, **kwargs):
+                raise ValueError("encoding unavailable")
+
+        monkeypatch.setattr(tokenizer, "_O200K_ENC", BrokenEncoding())
+    text = "żółć 日本語 <|endoftext|>"
+    record_text("", text, operation="retrieve", offline=True)
+    with TelemetryStore().connect() as conn:
+        count, method = conn.execute("SELECT compact_openai, method FROM events").fetchone()
+    assert count == len(text.encode("utf-8"))
+    assert method == ("utf8-bytes-upper-bound" if broken_encoding else "test-byte-encoding")
+
+
 @pytest.mark.parametrize(
     "arguments", [{"semantic": True}, {"semantic": "true"}, {"semantic": True, "lines": "1"}]
 )

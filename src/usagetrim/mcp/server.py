@@ -24,7 +24,7 @@ from usagetrim.core.skeleton import extract_symbol_or_range
 from usagetrim.core.specialized import auto_specialize_command_output
 from usagetrim.core.telemetry import record_text, recovery_engine
 from usagetrim.core.tree_scanner import format_tree_as_text, scan_directory
-from usagetrim.metrics.tokenizer import count_tokens
+from usagetrim.metrics.tokenizer import count_tokens, count_tokens_offline
 
 # Global session metrics accumulator
 _SESSION_SAVED_CLAUDE = 0
@@ -724,9 +724,15 @@ def _timed(handler):
     return wrapped
 
 
-def _record(raw: str, output: str, *, operation="exec", project=None, duration_s=None) -> str:
+def _record(
+    raw: str, output: str, *, operation="exec", project=None, duration_s=None, offline=False
+) -> str:
     global _SESSION_SAVED_CLAUDE, _SESSION_SAVED_OPENAI, _SESSION_SAVED_GEMINI
-    before, after = count_tokens(raw), count_tokens(output)
+    if offline:
+        before, _ = count_tokens_offline(raw)
+        after, _ = count_tokens_offline(output)
+    else:
+        before, after = count_tokens(raw), count_tokens(output)
     # Signed deltas expose expansion and charge subsequent retrievals in full.
     _SESSION_SAVED_CLAUDE += before.claude - after.claude
     _SESSION_SAVED_OPENAI += before.openai - after.openai
@@ -741,6 +747,7 @@ def _record(raw: str, output: str, *, operation="exec", project=None, duration_s
         duration_s=duration_s,
         client=client_name("mcp"),
         engine="none" if paused() else "usagetrim",
+        offline=offline,
     )
     return output
 
@@ -973,11 +980,20 @@ def handle_usagetrim_retrieve(arguments: dict[str, Any]) -> str:
         )
     if retrieved.startswith("Error:"):
         return retrieved
-    output = _compress(retrieved, budget, source="retrieve")
+    # Hybrid search already budgets the complete output without downloading a
+    # tokenizer. Recompressing it would re-enter the legacy online-capable path.
+    output = retrieved if semantic else _compress(retrieved, budget, source="retrieve")
     if recovery_engine(ref_id) == "rtk":
-        record_text("", output, operation="retrieve", client=client_name("mcp"), engine="rtk")
+        record_text(
+            "",
+            output,
+            operation="retrieve",
+            client=client_name("mcp"),
+            engine="rtk",
+            offline=semantic,
+        )
         return output
-    return _record("", output, operation="retrieve")
+    return _record("", output, operation="retrieve", offline=semantic)
 
 
 @_timed
