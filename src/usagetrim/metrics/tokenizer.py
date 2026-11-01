@@ -41,6 +41,30 @@ class TokenCount:
         return (self.claude + self.openai + self.gemini) // 3
 
 
+def count_tokens_offline(text: str) -> tuple[TokenCount, str]:
+    """Use an instantiated encoding or a conservative byte bound, never downloads.
+
+    Return the method alongside the counts so telemetry identifies the fallback.
+    Claude and Gemini retain the same uncalibrated multipliers as count_tokens.
+    """
+    from tiktoken import registry
+
+    ready = getattr(registry, "ENCODINGS", {})
+    ready = ready if isinstance(ready, dict) else {}
+    encoding = _O200K_ENC or ready.get("o200k_base") or _CL100K_ENC or ready.get("cl100k_base")
+    count = len(text.encode("utf-8"))
+    method = "utf8-bytes-upper-bound"
+    if encoding is not None:
+        try:
+            count = len(encoding.encode(text, disallowed_special=()))
+            method = encoding.name
+        except (ValueError, RuntimeError):
+            pass
+    return TokenCount(
+        claude=math.ceil(count * 1.10), openai=count, gemini=math.ceil(count * 1.02)
+    ), method
+
+
 @dataclass(frozen=True)
 class TokenReductionMetrics:
     raw_tokens: TokenCount

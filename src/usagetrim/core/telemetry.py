@@ -213,12 +213,17 @@ def record_text(
     event_id=None,
     client=None,
     engine="usagetrim",
+    offline=False,
 ) -> None:
     """Best effort telemetry must never make a working tool fail."""
     try:
-        from usagetrim.metrics.tokenizer import count_tokens, get_o200k
+        from usagetrim.metrics.tokenizer import count_tokens, count_tokens_offline, get_o200k
 
-        before, after = count_tokens(raw), count_tokens(output)
+        if offline:
+            before, _ = count_tokens_offline(raw)
+            after, method = count_tokens_offline(output)
+        else:
+            before, after = count_tokens(raw), count_tokens(output)
         if engine == "rtk":
             TelemetryStore().record(
                 0,
@@ -250,7 +255,7 @@ def record_text(
             event_id=event_id,
             client=client,
             engine=engine,
-            method=get_o200k().name,
+            method=method if offline else get_o200k().name,
             raw_bytes=len(raw.encode("utf-8")),
             compact_bytes=len(output.encode("utf-8")),
         )
