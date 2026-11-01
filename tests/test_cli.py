@@ -1262,3 +1262,20 @@ def test_rules_cleanup_failure_does_not_mask_original_exception(tmp_path, monkey
     assert "original replace failure" in result.output
     assert "secondary cleanup failure" not in result.output
     assert target.read_bytes() == original
+
+
+def test_cli_tokens_handles_surrogate_text(monkeypatch):
+    import tiktoken.registry
+
+    from usagetrim.metrics import tokenizer
+
+    monkeypatch.setattr(tokenizer, "_O200K_ENC", None)
+    monkeypatch.setattr(tokenizer, "_CL100K_ENC", None)
+    monkeypatch.setattr(tiktoken.registry, "ENCODINGS", {})
+
+    result = runner.invoke(app, ["tokens", "bad-\udcff", "--model", "openai"])
+
+    assert result.exit_code == 0
+    assert "openai" in result.stdout
+    assert "estimate" in result.stdout
+    assert "Unknown model" not in result.output

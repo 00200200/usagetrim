@@ -192,3 +192,47 @@ def test_model_tokens_legacy_contract_unchanged(model_token_backend):
     metrics = compute_metrics("hello world", "hello")
     assert metrics.raw_tokens == result
     assert metrics.compact_tokens == TokenCount(claude=2, openai=1, gemini=2)
+
+
+@pytest.mark.parametrize("model", [item.value for item in ModelFamily])
+def test_model_tokens_surrogate_fallback(monkeypatch, model):
+    import tiktoken.registry
+
+    monkeypatch.setattr(tokenizer, "_O200K_ENC", None)
+    monkeypatch.setattr(tokenizer, "_CL100K_ENC", None)
+    monkeypatch.setattr(tiktoken.registry, "ENCODINGS", {})
+
+    text = "bad-\udcff"
+    result = count_model_tokens(text, model)
+
+    assert result.count > 0
+    assert result.is_estimate
+    assert "utf8-bytes-div4-ceil" in result.method
+
+
+def test_model_tokens_surrogate_reuses_warm_encoding_without_fallback(monkeypatch):
+    import tiktoken.registry
+
+    class SurrogateEncoding:
+        name = "o200k_base"
+
+        def encode(self, text, *, disallowed_special):
+            assert text == "bad-\udcff"
+            assert disallowed_special == ()
+            return [1, 2]
+
+    encoding = SurrogateEncoding()
+    monkeypatch.setattr(tokenizer, "_O200K_ENC", encoding)
+    monkeypatch.setattr(tokenizer, "_CL100K_ENC", None)
+    monkeypatch.setattr(tiktoken.registry, "ENCODINGS", {})
+
+    def forbidden_fallback(text):
+        pytest.fail("UTF-8 fallback must not run when an encoding is already available")
+
+    monkeypatch.setattr(tokenizer, "_utf8_estimate", forbidden_fallback)
+
+    result = count_model_tokens("bad-\udcff", "openai")
+
+    assert result.count == 2
+    assert result.method == "o200k_base"
+    assert result.is_estimate is False

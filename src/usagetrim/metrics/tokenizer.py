@@ -37,7 +37,12 @@ class ModelTokenCount:
 
 def _utf8_estimate(text: str) -> int:
     """Uncalibrated size heuristic: ceil(UTF-8 bytes / 4), not a tokenizer."""
-    return (len(text.encode("utf-8")) + 3) // 4
+    try:
+        encoded = text.encode("utf-8")
+    except UnicodeEncodeError:
+        repaired = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+        encoded = repaired.encode("utf-8")
+    return (len(encoded) + 3) // 4
 
 
 def _model_encoding(name: str):
@@ -74,7 +79,6 @@ def count_model_tokens(text: str, model: str) -> ModelTokenCount:
         supported = ", ".join(item.value for item in ModelFamily)
         raise ValueError(f"Unknown model: {model}. Supported values: {supported}") from None
 
-    count, method = _utf8_estimate(text), "utf8-bytes-div4-ceil"
     if family in {ModelFamily.OPENAI, ModelFamily.CLAUDE, ModelFamily.GEMINI}:
         for name in ("o200k_base", "cl100k_base"):
             try:
@@ -84,12 +88,19 @@ def count_model_tokens(text: str, model: str) -> ModelTokenCount:
                 break
             except (OSError, ValueError, RuntimeError, ImportError):
                 continue
+        else:
+            count = _utf8_estimate(text)
+            method = "utf8-bytes-div4-ceil"
+
         if family is ModelFamily.CLAUDE:
             count = math.ceil(count * 1.10)
             method = f"legacy-{method}-x1.10"
         elif family is ModelFamily.GEMINI:
             count = math.ceil(count * 1.02)
             method = f"legacy-{method}-x1.02"
+    else:
+        count = _utf8_estimate(text)
+        method = "utf8-bytes-div4-ceil"
     return ModelTokenCount(
         count=count,
         model=model,
