@@ -41,6 +41,10 @@ def cli(argv, env):
     )
 
 
+def normalize_cli_newlines(output: bytes) -> bytes:
+    return output.replace(b"\r\n", b"\n")
+
+
 def mcp(command, env):
     request = {
         "jsonrpc": "2.0",
@@ -78,7 +82,9 @@ def mcp(command, env):
 def test_current_combined_text_and_mcp_footer(execution_env, arguments, expected):
     result = cli(producer(*arguments), execution_env)
     assert result.returncode == 0 and result.stderr == b""
-    assert result.stdout == expected + (b"\n" if expected and not expected.endswith(b"\n") else b"")
+    assert normalize_cli_newlines(result.stdout) == expected + (
+        b"\n" if expected and not expected.endswith(b"\n") else b""
+    )
     tool = mcp(shell_command(producer(*arguments)), execution_env)
     assert tool["isError"] is False
     assert tool["content"] == [{"type": "text", "text": expected.decode() + "\n[exit code: 0]"}]
@@ -87,7 +93,11 @@ def test_current_combined_text_and_mcp_footer(execution_env, arguments, expected
 def test_current_nonzero_exit_is_not_automatically_a_tool_error(execution_env):
     argv = producer("--text", "failed", "--exit-code", "7")
     result = cli(argv, execution_env)
-    assert result.returncode == 7 and result.stdout == b"failed\n" and not result.stderr
+    assert (
+        result.returncode == 7
+        and normalize_cli_newlines(result.stdout) == b"failed\n"
+        and not result.stderr
+    )
     tool = mcp(shell_command(argv), execution_env)
     assert tool["isError"] is False
     assert tool["content"][0]["text"] == "failed\n\n[exit code: 7]"
@@ -155,3 +165,8 @@ def test_producer_byte_count_is_exact_and_deterministic(execution_env):
         for _ in range(2)
     ]
     assert results[0] == results[1] and len(results[0]) == 4097
+
+
+def test_cli_newline_normalization():
+    assert normalize_cli_newlines(b"payload\r\nnext\r\n") == b"payload\nnext\n"
+    assert normalize_cli_newlines(b"payload\n") == b"payload\n"
