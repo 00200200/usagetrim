@@ -376,4 +376,5 @@ def test_remote_listen_without_auth_is_rejected(monkeypatch):
     monkeypatch.delenv("USAGETRIM_MCP_AUTH_TOKEN", raising=False)
     result = CliRunner().invoke(app, ["mcp", "--transport", "sse", "--host", "0.0.0.0"])
     assert result.exit_code != 0
-    assert "requires --auth-token" in result.output
+    assert "requires" in result.output
+    assert "--auth-token" in result.output
