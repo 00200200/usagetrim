@@ -2258,6 +2258,12 @@ def mcp(
             help="minimal: 4 tools, smallest schema footprint; coding: 9 core tools with compact schemas (default); desktop: 11 tools; full: all tools",
         ),
     ] = "coding",
+    transport: Annotated[str, typer.Option("--transport", help="stdio or sse")] = "stdio",
+    host: Annotated[str, typer.Option("--host")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", min=1, max=65535)] = 8080,
+    auth_token: Annotated[
+        str | None, typer.Option("--auth-token", envvar="USAGETRIM_MCP_AUTH_TOKEN")
+    ] = None,
 ):
     """Start the Model Context Protocol (MCP) server for Claude Code, Cursor, and Codex."""
     from usagetrim.mcp.server import tool_definitions
@@ -2266,7 +2272,19 @@ def mcp(
         tool_definitions(profile)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    run_mcp_stdio_server(profile)
+    if transport not in {"stdio", "sse"}:
+        raise typer.BadParameter("transport must be stdio or sse")
+    if transport == "stdio":
+        run_mcp_stdio_server(profile)
+    else:
+        from usagetrim.mcp.sse import run_mcp_sse_server
+
+        try:
+            run_mcp_sse_server(profile, host, port, auth_token)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        except ImportError as exc:
+            raise typer.BadParameter("SSE requires: pip install 'usagetrim[mcp]'") from exc
 
 
 @app.command()

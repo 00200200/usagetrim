@@ -489,24 +489,14 @@ TOOLS_DEFINITIONS = [
     },
 ]
 
+# Text stays in CallToolResult.content. Structured output carries only status,
+# so schema-validating clients do not receive a second copy of the text.
 _DEFAULT_OUTPUT_SCHEMA = {
     "type": "object",
-    "properties": {
-        "content": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "type": {"type": "string"},
-                    "text": {"type": "string"},
-                },
-                "required": ["type", "text"],
-            },
-        },
-        "isError": {"type": "boolean"},
-    },
-    "required": ["content"],
+    "properties": {"isError": {"type": "boolean"}},
+    "required": ["isError"],
 }
+
 
 for _tool in TOOLS_DEFINITIONS:
     if "outputSchema" not in _tool:
@@ -1307,10 +1297,9 @@ def _respond(req: Any, *, profile: str = "full") -> dict[str, Any] | None:
         is_error = output.startswith("Error:")
     except Exception as exc:
         output, is_error = f"Error: {redact_secrets(str(exc))[:500]}", True
-    return {
-        **response,
-        "result": {"content": [{"type": "text", "text": output}], "isError": is_error},
-    }
+    result = {"content": [{"type": "text", "text": output}], "isError": is_error}
+    # Match _DEFAULT_OUTPUT_SCHEMA while preserving the legacy text result.
+    return {**response, "result": {**result, "structuredContent": {"isError": is_error}}}
 
 
 def run_mcp_stdio_server(profile: str = "full"):

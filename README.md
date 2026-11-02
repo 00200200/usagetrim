@@ -169,6 +169,38 @@ Manual MCP configuration for Claude Desktop, Cursor, Codex, Windsurf:
 
 Path: `command -v usagetrim`. Use `--profile full` for every tool, `--profile coding` for core terminal tools, or `--profile desktop` for chat apps. [Client setup →](https://github.com/00200200/usagetrim/blob/main/docs/guide.md#connect-clients)
 
+### Legacy HTTP+SSE transport
+
+Install the optional MCP dependencies and start the SSE server:
+
+```sh
+pip install 'usagetrim[mcp]'
+usagetrim mcp --transport sse --profile coding --host 127.0.0.1 --port 8080
+```
+
+Configure a native MCP SSE client with `http://127.0.0.1:8080/sse`. The stream
+advertises `/messages?session_id=...` for client POST requests. This is legacy
+MCP HTTP+SSE (protocol version `2024-11-05`), **not Streamable HTTP**. Browser
+clients are not supported; requests containing `Origin` are rejected.
+
+Both transports support `--profile minimal` (4 tools), `coding` (9, the CLI
+default), `desktop` (11), and `full` (all tools). You can also set
+`USAGETRIM_MCP_PROFILE`. `usagetrim mcp` continues to use stdio by default;
+`--transport stdio` selects it explicitly.
+
+To require authentication, supply `--auth-token` or set the environment variable:
+
+```sh
+export USAGETRIM_MCP_AUTH_TOKEN='replace-with-a-long-random-secret'
+usagetrim mcp --transport sse --profile coding
+```
+
+An explicit `--auth-token` overrides the environment variable. The client must
+send `Authorization: Bearer <token>` on **both** GET `/sse` and POST `/messages`.
+Listening outside localhost (for example, `--host 0.0.0.0`) requires a token.
+For remote access, use HTTPS through a reverse proxy or a secure tunnel; the
+server itself serves plain HTTP, and Bearer authentication does not encrypt it.
+
 ```sh
 # Prepare messy logs or stack traces with prompt-cache prefix stabilization:
 usagetrim prepare --desktop -f error.log
