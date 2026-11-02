@@ -5,9 +5,11 @@ import pytest
 from usagetrim.metrics import tokenizer
 from usagetrim.metrics.pricing import estimate_savings
 from usagetrim.metrics.tokenizer import (
+    CacheBreakpointInfo,
     ModelFamily,
     ModelTokenCount,
     TokenCount,
+    check_cache_breakpoint,
     compute_metrics,
     count_model_tokens,
     count_tokens,
@@ -236,3 +238,102 @@ def test_model_tokens_surrogate_reuses_warm_encoding_without_fallback(monkeypatc
     assert result.count == 2
     assert result.method == "o200k_base"
     assert result.is_estimate is False
+
+
+@pytest.mark.parametrize("count", [0, 1023, 1024, 1025])
+def test_cache_breakpoint_boundaries_and_delegation(monkeypatch, count):
+    def count_stub(text, model):
+        assert text == "sample" and model == "claude"
+        return ModelTokenCount(count, model, ModelFamily.CLAUDE, "test-method", True)
+
+    monkeypatch.setattr(tokenizer, "count_model_tokens", count_stub)
+    result = check_cache_breakpoint("sample")
+    assert result == CacheBreakpointInfo(
+        "claude",
+        ModelFamily.CLAUDE,
+        count,
+        1024,
+        count >= 1024,
+        max(0, 1024 - count),
+        "test-method",
+        True,
+    )
+    with pytest.raises(FrozenInstanceError):
+        result.threshold_reached = True
+
+
+@pytest.mark.parametrize("threshold", [0, -1, True, False, 1.0, "1024", None, [], {}])
+def test_cache_breakpoint_invalid_threshold_before_counting(monkeypatch, threshold):
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid threshold must not invoke token counting")
+
+    monkeypatch.setattr(tokenizer, "count_model_tokens", forbidden)
+    with pytest.raises(ValueError, match="positive integer"):
+        check_cache_breakpoint("sample", min_tokens=threshold)
+
+
+@pytest.mark.parametrize("text", [None, False, 1, b"text", []])
+def test_cache_breakpoint_invalid_text(text):
+    with pytest.raises(TypeError, match="text must be a string"):
+        check_cache_breakpoint(text)
+
+
+@pytest.mark.parametrize("model", [None, False, 1, [], {}])
+def test_cache_breakpoint_invalid_model_type(model):
+    with pytest.raises(TypeError, match="model must be a string"):
+        check_cache_breakpoint("sample", model)
+
+
+@pytest.mark.parametrize("model", ["", "unknown", "gpt-something"])
+def test_cache_breakpoint_unknown_model(model):
+    with pytest.raises(ValueError, match="Unknown model"):
+        check_cache_breakpoint("", model)
+
+
+@pytest.mark.parametrize("model", [item.value for item in ModelFamily])
+@pytest.mark.parametrize(
+    "text,base_count",
+    [
+        ("", 0),
+        ("abcd", 1),
+        ("abcde", 2),
+        ("🦙", 1),
+        ("漢字", 2),
+        ("\udcff", 1),
+        ("\ud83e\udd99", 1),
+    ],
+)
+def test_cache_breakpoint_offline_unicode(monkeypatch, model, text, base_count):
+    import tiktoken.load
+    import tiktoken.registry
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("offline comparison must not load vocabulary or access the network")
+
+    monkeypatch.setattr(tokenizer, "_O200K_ENC", None)
+    monkeypatch.setattr(tokenizer, "_CL100K_ENC", None)
+    monkeypatch.setattr(tiktoken.registry, "ENCODINGS", {})
+    monkeypatch.setattr(tokenizer.tiktoken, "get_encoding", forbidden)
+    monkeypatch.setattr(tiktoken.load, "read_file", forbidden)
+    # For these small counts, each legacy multiplier adds one to nonzero counts.
+    expected = base_count + int(base_count > 0 and model in {"claude", "gemini"})
+    result = check_cache_breakpoint(text, model, min_tokens=1)
+    assert result.token_count == expected
+    assert result.model == model and result.family is ModelFamily(model)
+    assert result.min_tokens == 1
+    assert result.threshold_reached is (expected >= 1)
+    assert result.tokens_missing == max(0, 1 - expected)
+    assert result.is_estimate is True
+    assert "utf8-bytes-div4-ceil" in result.method
+    assert check_cache_breakpoint(text, model, min_tokens=1) == result
+
+
+@pytest.mark.parametrize("model", [item.value for item in ModelFamily])
+def test_cache_breakpoint_preserves_count_metadata(model_token_backend, model):
+    count = count_model_tokens("hello world", model)
+    result = check_cache_breakpoint("hello world", model, min_tokens=count.count)
+    assert result.token_count == count.count
+    assert result.method == count.method
+    assert result.is_estimate is count.is_estimate
+    assert result.threshold_reached is True
+    assert result.tokens_missing == 0

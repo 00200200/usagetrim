@@ -35,6 +35,49 @@ class ModelTokenCount:
             raise ValueError("count must be a nonnegative integer")
 
 
+@dataclass(frozen=True)
+class CacheBreakpointInfo:
+    """Local text threshold comparison, not a guarantee of prompt cache eligibility."""
+
+    model: str
+    family: ModelFamily
+    token_count: int
+    min_tokens: int
+    threshold_reached: bool
+    tokens_missing: int
+    method: str
+    is_estimate: bool
+
+
+def check_cache_breakpoint(
+    text: str, model: str = "claude", min_tokens: int = 1024
+) -> CacheBreakpointInfo:
+    """Compare a local token count with a caller-supplied positive threshold.
+
+    The default threshold is a convenience, not a provider policy. Reaching it
+    does not guarantee prompt cache eligibility or a cache hit: actual model
+    tokenization, request structure and provider requirements also matter.
+    """
+    if type(min_tokens) is not int or min_tokens <= 0:
+        raise ValueError("min_tokens must be a positive integer (not bool)")
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    if not isinstance(model, str):
+        raise TypeError("model must be a string")
+
+    result = count_model_tokens(text, model)
+    return CacheBreakpointInfo(
+        model=result.model,
+        family=result.family,
+        token_count=result.count,
+        min_tokens=min_tokens,
+        threshold_reached=result.count >= min_tokens,
+        tokens_missing=max(0, min_tokens - result.count),
+        method=result.method,
+        is_estimate=result.is_estimate,
+    )
+
+
 def _utf8_estimate(text: str) -> int:
     """Uncalibrated size heuristic: ceil(UTF-8 bytes / 4), not a tokenizer."""
     try:
