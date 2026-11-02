@@ -40,6 +40,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+tui = [
+  "textual>=0.85",
+]
 semantic = [
   "fastembed>=0.7.4,<1",
 ]

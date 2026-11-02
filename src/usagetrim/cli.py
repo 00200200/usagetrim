@@ -122,6 +122,21 @@ def _emit(text: str) -> str:
     return emitted
 
 
+@app.command("tui")
+def tui_command():
+    """Open the local telemetry dashboard (requires the tui extra)."""
+    try:
+        from usagetrim.tui.app import UsageTrimDashboard
+    except ModuleNotFoundError as exc:
+        if exc.name != "textual" and not (exc.name or "").startswith("textual."):
+            raise
+        typer.echo(
+            "The dashboard requires Textual. Install with: pip install 'usagetrim[tui]'", err=True
+        )
+        raise typer.Exit(code=1) from None
+    UsageTrimDashboard().run()
+
+
 @app.command("pricing")
 def pricing_command(
     model: Annotated[

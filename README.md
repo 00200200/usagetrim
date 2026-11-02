@@ -181,6 +181,39 @@ usagetrim rules --optimize --write -f CLAUDE.md # strips filler, aligns prompt c
 
 ---
 
+## Terminal dashboard (TUI)
+
+Install the optional dashboard and launch it locally:
+
+```bash
+pip install 'usagetrim[tui]'
+usagetrim tui
+```
+
+Use Tab and arrow keys to navigate, `q` to quit, `Ctrl+F` to focus filters,
+Enter/Apply to confirm them, and `Ctrl+R` to refresh. Telemetry refreshes every
+5 seconds. Operation/client/project filters use exact values; time ranges are
+24 hours, 7 days, or all time. Global gain totals stay global; history and the
+savings chart respect filters. The all-time chart shows only the last 30 days.
+USD savings are hypothetical GPT-4o and Claude 3.5 Sonnet input-cost estimates
+based on OpenAI token counts and static reference rates, not actual billing
+or subscription savings.
+
+Press `F2` for Cache and Esc/F2 to return. Search by a literal ref ID fragment,
+use Previous/Next or Ctrl+Left/Ctrl+Right for pages of up to 50 entries, and
+select a row for metadata. Browsing does not retrieve log content or increment
+cache hits. Copy ref ID uses a native clipboard helper when available.
+
+Preview, Find lines, and Export read content only on request and re-redact secrets.
+Preview is limited to 100 lines and 16 KiB, with a 256 KiB stored-payload limit.
+Content search returns up to 20 matching numbered lines, each displayed in at most
+300 characters; matching still uses the complete redacted line. Search/export
+refuse payloads exceeding 4 MiB after decompression (stored limit: 4 MiB + 64 KiB).
+Export writes the complete redacted log to the supplied path, never overwrites an
+existing file, and uses private file permissions. Zstd needs optional support;
+unknown-size zstd frames are refused for complete search/export. Missing,
+damaged, or oversized records produce an error instead of a partial export.
+
 ## Desktop companion
 
 Mint robot on your Mac — draggable pet or menu-bar mode. Local measurements, task memory, optional account-limit readings. English UI. No extra AI calls.

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import platform
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from typing import Any
@@ -29,14 +31,39 @@ def get_clipboard() -> str:
 
 
 def set_clipboard(text: str) -> bool:
-    """Write plain text to system clipboard (macOS pbcopy, or fallback)."""
-    if platform.system() == "Darwin":
+    """Write via a native clipboard utility; success requires exit status zero.
+
+    Prefer Wayland in mixed sessions, with X11 fallback when DISPLAY is set.
+    subprocess.run kills and reaps the helper on timeout. No shell is involved.
+    """
+    system = platform.system()
+    commands = []
+    if system == "Darwin":
+        commands = [["pbcopy"]]
+    elif system == "Linux":
+        if os.environ.get("WAYLAND_DISPLAY"):
+            commands.append(["wl-copy"])
+        if os.environ.get("DISPLAY"):
+            commands.extend(
+                [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]
+            )
+    for command in commands:
+        executable = shutil.which(command[0])
+        if executable is None:
+            continue
         try:
-            p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE, text=True)
-            p.communicate(input=text, timeout=2)
-            return p.returncode == 0
-        except Exception:
-            return False
+            result = subprocess.run(
+                [executable, *command[1:]],
+                input=text.encode("utf-8"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired, UnicodeError):
+            continue
+        if result.returncode == 0:
+            return True
     return False
 
 
