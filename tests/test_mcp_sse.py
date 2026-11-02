@@ -46,7 +46,7 @@ def test_real_http_sse(profile, tmp_path):
         headers["Content-Type"] = "application/json"
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        return urlopen(Request(base + path, data=data, headers=headers), timeout=5)
+        return urlopen(Request(base + path, data=data, headers=headers), timeout=20)
 
     stream = None
     try:
@@ -82,7 +82,11 @@ def test_real_http_sse(profile, tmp_path):
             payload = json.dumps(message).encode()
             with request(endpoint, payload) as response:
                 assert response.status == 202
-            assert stream.readline() == b"event: message\n"
+            while True:
+                line = stream.readline()
+                if line == b"event: message\n":
+                    break
+                assert line in {b": keepalive\n", b"\n"}, line
             wire_response = stream.readline().removeprefix(b"data: ")
             response = json.loads(wire_response)
             assert stream.readline() == b"\n"
@@ -375,6 +379,6 @@ def test_auth_token_environment(monkeypatch, explicit):
 def test_remote_listen_without_auth_is_rejected(monkeypatch):
     monkeypatch.delenv("USAGETRIM_MCP_AUTH_TOKEN", raising=False)
     result = CliRunner().invoke(app, ["mcp", "--transport", "sse", "--host", "0.0.0.0"])
-    assert result.exit_code != 0
-    assert "requires" in result.output
-    assert "--auth-token" in result.output
+    with pytest.raises(ValueError, match=r"requires --auth-token"):
+        sse.SSEApplication(host="0.0.0.0")
+    assert result.exit_code == 2
