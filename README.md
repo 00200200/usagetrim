@@ -196,6 +196,14 @@ Python may wait for it before the process exits. This MVP cannot guarantee an
 immediate process exit if local filesystem or database operations stall. It does
 not forcibly terminate threads or apply their results to a closed window.
 
+On Windows, install and launch from PowerShell (the module form does not require
+the Python Scripts directory on `PATH`):
+
+```powershell
+py -3.12 -m pip install "usagetrim[companion]"
+py -3.12 -m usagetrim.cli companion
+```
+
 Drag the standard title bar to move the window. The opaque, normally decorated
 window works through Qt's native Windows, X11 or Wayland support; a working Qt
 platform plugin and system GUI libraries are required. The optional always-on-top
@@ -244,6 +252,23 @@ available. Motion stops when the Pet is hidden, minimized or replaced by the pan
 and resumes when shown. Quit stops all pet timers and animations. There is no
 blinking or eye-layer manipulation of the original PNG, and no notifications or
 account-limit network polling. Animation adds no monitor or provider requests.
+
+CI runs the companion tests on Ubuntu and Windows (Python 3.12 on Windows) using
+Qt's `offscreen` plugin and mocked system tray support. The Windows job installs
+locked dependencies, loads the real Windows Qt bindings, queries native DWM and
+checks the interpreter's final exit status, including failures after tests pass.
+This verifies headless behavior, not the appearance of an interactive desktop.
+The Qt 6.12.0 binding release is excluded because of the observed Python 3.11
+shutdown crash; the lockfile currently selects Essentials/Shiboken 6.11.3.
+
+Manual checks remain necessary on Windows, X11 with/without a compositor, and
+actual Wayland sessions: transparency, native dragging, focus/always-on-top,
+multi-monitor and mixed-DPI placement, tray visibility and disappearance, and Quit
+from a hidden Pet. On Wayland, tests model rejected global positioning; they do
+not establish support for every compositor's move protocol. Tray tests cannot
+confirm whether a particular GNOME/KDE setup or Windows notification area exposes
+the icon. Missing tray support keeps controls accessible as described above.
+
 This command leaves the
 existing macOS application unchanged; on macOS use the application below.
 

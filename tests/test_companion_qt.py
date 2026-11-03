@@ -1,5 +1,6 @@
 """Qt initialization and controls use the offscreen plugin, never a display server."""
 
+import sys
 from concurrent.futures import Future
 
 import pytest
@@ -1050,3 +1051,268 @@ def test_animation_label_describes_preference_while_optimization_paused(
         assert controller.animations_enabled() is True
     finally:
         window.close()
+
+
+@pytest.mark.parametrize(
+    "plugin,expected",
+    [
+        ("windows", True),
+        ("xcb", True),
+        ("wayland", False),
+        ("wayland-egl", False),
+        ("minimal", False),
+        ("offscreen", True),
+        ("unknown", False),
+    ],
+)
+def test_positioning_capabilities_follow_qt_plugin(qt_app, monkeypatch, plugin, expected):
+    from types import SimpleNamespace
+
+    from usagetrim.companion import pet
+
+    monkeypatch.setattr(pet, "QGuiApplication", SimpleNamespace(platformName=lambda: plugin))
+    assert pet.supports_positioning() is expected
+
+
+@pytest.mark.parametrize("status,enabled,expected", [(0, 1, True), (0, 0, False), (-1, 1, False)])
+def test_windows_dwm_results_are_checked_without_changing_host_platform(
+    qt_app, monkeypatch, status, enabled, expected
+):
+    import ctypes
+    from types import SimpleNamespace
+
+    from PySide6.QtGui import QGuiApplication
+
+    from usagetrim.companion import pet
+
+    host_platform = sys.platform
+    calls = []
+
+    def query(pointer):
+        calls.append(True)
+        ctypes.cast(pointer, ctypes.POINTER(ctypes.c_int))[0] = enabled
+        return status
+
+    # Replace module-local adapters only; never mutate sys.platform or Qt's QPA plugin.
+    monkeypatch.setattr(pet, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(pet, "QGuiApplication", SimpleNamespace(platformName=lambda: "windows"))
+    monkeypatch.setattr(
+        pet,
+        "ctypes",
+        SimpleNamespace(
+            c_int=ctypes.c_int,
+            byref=ctypes.byref,
+            windll=SimpleNamespace(dwmapi=SimpleNamespace(DwmIsCompositionEnabled=query)),
+        ),
+    )
+    assert pet.supports_transparency() is expected
+    assert calls == [True]
+    assert sys.platform == host_platform
+    assert QGuiApplication.platformName() == "offscreen"
+
+
+@pytest.mark.parametrize("error", [OSError, AttributeError])
+def test_windows_dwm_unavailable_falls_back_safely(qt_app, monkeypatch, error):
+    import ctypes
+    from types import SimpleNamespace
+
+    from usagetrim.companion import pet
+
+    def query(pointer):
+        raise error("DWM unavailable")
+
+    monkeypatch.setattr(pet, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(pet, "QGuiApplication", SimpleNamespace(platformName=lambda: "windows"))
+    monkeypatch.setattr(
+        pet,
+        "ctypes",
+        SimpleNamespace(
+            c_int=ctypes.c_int,
+            byref=ctypes.byref,
+            windll=SimpleNamespace(dwmapi=SimpleNamespace(DwmIsCompositionEnabled=query)),
+        ),
+    )
+    assert pet.supports_transparency() is False
+
+
+@pytest.mark.parametrize(
+    "library,display,atom,owner,expected",
+    [
+        (None, 123, 7, 42, False),
+        ("X11", None, 7, 42, False),
+        ("X11", 123, 0, 42, False),
+        ("X11", 123, 7, 0, False),
+        ("X11", 123, 7, 42, True),
+    ],
+)
+def test_x11_transparency_requires_compositor_ownership(
+    qt_app, monkeypatch, library, display, atom, owner, expected
+):
+    import ctypes
+    from types import SimpleNamespace
+
+    from usagetrim.companion import pet
+
+    class NativeCall:
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        def __call__(self, *args):
+            self.calls.append(args)
+            return self.result
+
+    x11 = SimpleNamespace(
+        XOpenDisplay=NativeCall(display),
+        XDefaultScreen=NativeCall(0),
+        XInternAtom=NativeCall(atom),
+        XGetSelectionOwner=NativeCall(owner),
+        XCloseDisplay=NativeCall(0),
+    )
+    monkeypatch.setattr(pet, "QGuiApplication", SimpleNamespace(platformName=lambda: "xcb"))
+    monkeypatch.setattr(
+        pet,
+        "ctypes",
+        SimpleNamespace(
+            util=SimpleNamespace(find_library=lambda name: library),
+            CDLL=lambda name: x11,
+            c_char_p=ctypes.c_char_p,
+            c_void_p=ctypes.c_void_p,
+            c_int=ctypes.c_int,
+            c_ulong=ctypes.c_ulong,
+        ),
+    )
+    assert pet.supports_transparency() is expected
+    if library and display:
+        assert x11.XInternAtom.calls == [(display, b"_NET_WM_CM_S0", True)]
+        assert x11.XCloseDisplay.calls == [(display,)]
+    else:
+        assert x11.XGetSelectionOwner.calls == []
+        assert x11.XCloseDisplay.calls == []
+
+
+@pytest.mark.parametrize("position", [[99999, 99999], [-99999, -99999], [-400, -200]])
+def test_restored_pet_position_is_clamped_without_more_monitor_reads(
+    qt_app, tmp_path, monkeypatch, position
+):
+    from types import SimpleNamespace
+
+    from PySide6.QtCore import QPoint, QRect
+
+    from usagetrim.companion import qt
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.core.monitor import Monitor
+
+    area = QRect(-800, -300, 1600, 1200)
+    screen = SimpleNamespace(availableGeometry=lambda: area)
+    monkeypatch.setattr(
+        qt,
+        "QGuiApplication",
+        SimpleNamespace(screenAt=lambda point: None, primaryScreen=lambda: screen),
+    )
+    monkeypatch.setattr(qt, "supports_positioning", lambda: True)
+    monkeypatch.setattr(qt, "supports_transparency", lambda: False)
+    service = Monitor([], tmp_path)
+    original_snapshot = service.snapshot
+    reads = []
+
+    def snapshot():
+        reads.append(True)
+        return original_snapshot()
+
+    monkeypatch.setattr(service, "snapshot", snapshot)
+    controller = CompanionController(service)
+    controller.save_window_preferences("pet", position)
+    window = qt.CompanionWindow(
+        controller, executor=ImmediateExecutor(), preference_executor=ImmediateExecutor()
+    )
+    try:
+        expected = QPoint(
+            max(area.left(), min(position[0], area.right() - window.width() + 1)),
+            max(area.top(), min(position[1], area.bottom() - window.height() + 1)),
+        )
+        assert window.pos() == expected
+        window.poll()
+        assert len(reads) == 1
+        window.restore_pet_position(position)
+        assert window.pos() == expected
+        assert len(reads) == 1
+    finally:
+        window.close()
+
+
+def test_wayland_rejects_manual_drag_without_probing_global_window_apis(
+    qt_app, tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    from usagetrim.companion import pet, qt
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.core.companion_state import settings, update_settings
+    from usagetrim.core.monitor import Monitor
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Wayland must not use global positioning or native compositor probes")
+
+    update_settings(companion_qt_mode="pet", companion_qt_pet_position=[123, 234])
+    monkeypatch.setattr(pet, "QGuiApplication", SimpleNamespace(platformName=lambda: "wayland"))
+    monkeypatch.setattr(
+        qt, "QGuiApplication", SimpleNamespace(screenAt=forbidden, primaryScreen=forbidden)
+    )
+    monkeypatch.setattr(pet.ctypes, "CDLL", forbidden)
+    window = qt.CompanionWindow(
+        CompanionController(Monitor([], tmp_path)),
+        executor=ImmediateExecutor(),
+        preference_executor=ImmediateExecutor(),
+    )
+    try:
+        monkeypatch.setattr(window, "move", forbidden)
+        monkeypatch.setattr(window.artwork, "_start_system_move", lambda: False)
+        window.restore_pet_position([456, 789])
+        press = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(10, 10),
+            QPointF(30, 30),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        move = QMouseEvent(
+            QEvent.Type.MouseMove,
+            QPointF(20, 20),
+            QPointF(40, 40),
+            Qt.MouseButton.NoButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        window.artwork.mousePressEvent(press)
+        window.artwork.mouseMoveEvent(move)
+        window.save_pet_position()
+        window._flush_preferences()
+        assert settings()["companion_qt_pet_position"] == [123, 234]
+        assert not window.windowFlags() & Qt.WindowType.FramelessWindowHint
+        assert not window.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        assert window.autoFillBackground()
+    finally:
+        window.close()
+
+
+# This test is collected only on Windows. All common offscreen tests run on both OSes.
+if sys.platform == "win32":
+
+    def test_native_windows_dwm_probe_matches_system_result(qt_app, monkeypatch):
+        import ctypes
+        from types import SimpleNamespace
+
+        from PySide6.QtGui import QGuiApplication
+
+        from usagetrim.companion import pet
+
+        enabled = ctypes.c_int()
+        status = ctypes.windll.dwmapi.DwmIsCompositionEnabled(ctypes.byref(enabled))
+        monkeypatch.setattr(pet, "QGuiApplication", SimpleNamespace(platformName=lambda: "windows"))
+        assert pet.supports_transparency() is (status == 0 and bool(enabled.value))
+        assert QGuiApplication.platformName() == "offscreen"
