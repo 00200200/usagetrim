@@ -1000,6 +1000,18 @@ def optimize_command(
     _emit(result.text)
 
 
+@app.command("companion")
+def companion_command():
+    """Open the optional Linux/Windows desktop window with local measurements."""
+    from usagetrim.companion import CompanionUnavailable, create_backend
+
+    try:
+        code = create_backend().run()
+    except (CompanionUnavailable, OSError) as exc:
+        raise typer.BadParameter(str(exc)) from None
+    raise typer.Exit(code)
+
+
 @app.command()
 def monitor(stdio: Annotated[bool, typer.Option("--stdio")] = False):
     """Local companion JSON-lines protocol (stdin/stdout; no listening port)."""

@@ -183,6 +183,27 @@ usagetrim rules --optimize --write -f CLAUDE.md # strips filler, aligns prompt c
 
 ## Desktop companion
 
+**Linux / Windows MVP:** install `pip install 'usagetrim[companion]'`, then run
+`usagetrim companion` in a graphical desktop session. The optional PySide6 window
+shows today's actual monitor aggregates (operations, raw/compact token estimates,
+and signed net reduction), refreshes every five seconds and can pause/resume
+optimization using the same local settings as CLI/MCP. An empty history is shown
+as unavailable measurements, not invented savings. After a refresh failure, pause
+controls remain disabled until a successful read restores the current state.
+Closing the window immediately stops UI updates and cancels queued work without
+waiting on the GUI thread. A monitor call already running is allowed to finish;
+Python may wait for it before the process exits. This MVP cannot guarantee an
+immediate process exit if local filesystem or database operations stall. It does
+not forcibly terminate threads or apply their results to a closed window.
+
+Drag the standard title bar to move the window. The opaque, normally decorated
+window works through Qt's native Windows, X11 or Wayland support; a working Qt
+platform plugin and system GUI libraries are required. The optional always-on-top
+hint is saved in `companion.json`, but compositors may ignore it (especially on
+Wayland); the normal window remains usable. No transparency, tray, animations or
+account-limit network polling is included in this MVP. This command leaves the
+existing macOS application unchanged; on macOS use the application below.
+
 Mint robot on your Mac — draggable pet or menu-bar mode. Local measurements, task memory, optional account-limit readings. English UI. No extra AI calls.
 
 <p align="center">
