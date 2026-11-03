@@ -114,6 +114,15 @@ def check_cache_breakpoint(
     )
 
 
+def align_to_cache_boundary(
+    text: str, target_boundary: int = 1024, *, model: str = "claude"
+) -> str:
+    """Delegate safe prefix alignment; estimated counts do not guarantee cache hits."""
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary as align
+
+    return align(text, target_boundary, model=model)
+
+
 def _utf8_estimate(text: str) -> int:
     """Uncalibrated size heuristic: ceil(UTF-8 bytes / 4), not a tokenizer."""
     try:

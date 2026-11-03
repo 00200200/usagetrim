@@ -5,6 +5,97 @@ import pytest
 from usagetrim.core.prompt_optimizer import align_prompt, lint_prompt, minify_prompt
 
 
+@pytest.mark.parametrize("length,reached", [(12, False), (13, True), (17, True)])
+def test_align_boundary_measures_static_prefix_only(length, reached):
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary
+
+    static = "x" * length
+    text = "session_id: abcdef0123456789\n" + static + "\n"
+    result = align_to_cache_boundary(text, 4, model="generic")
+    if reached:
+        assert result == align_prompt(text, model="generic").aligned_text
+        assert result.startswith(static)
+        assert "session_id: abcdef0123456789" in result
+    else:
+        assert result == text
+
+
+@pytest.mark.parametrize("boundary", [0, -1, True, 1.5, "1024", None])
+def test_align_boundary_rejects_invalid_threshold(boundary):
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary
+
+    with pytest.raises(ValueError, match="positive integer"):
+        align_to_cache_boundary("", boundary)
+
+
+@pytest.mark.parametrize("key", ["request", "session", "turn", "conversation"])
+def test_align_boundary_preserves_ambiguous_instruction_fields(key):
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary
+
+    text = f"{key}: deploy\n" + "Keep all safety constraints.\n" * 30
+    assert align_to_cache_boundary(text, 4, model="generic") == text
+
+
+@pytest.mark.parametrize("key", ["session_id", "request_id", "turn_id", "conversation_id"])
+def test_align_boundary_can_relocate_unambiguous_identifiers(key):
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary
+
+    static = "Keep all safety constraints.\n" * 30
+    text = f"{key}: abc123\n" + static
+    result = align_to_cache_boundary(text, 4, model="generic")
+    assert result == align_prompt(text, model="generic").aligned_text
+    assert result.startswith(static.rstrip())
+    assert f"{key}: abc123" in result
+
+
+def test_align_boundary_rejects_unknown_model():
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary
+
+    with pytest.raises(ValueError, match="Unknown model"):
+        align_to_cache_boundary("", model="unknown")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "session_id: " + "a" * 200 + "\nx\n",
+        "If current time is unknown, do not deploy.\n" + "Keep rules.\n" * 20,
+        "# Staging\nsession_id: abc\n" + "Keep rules.\n" * 20,
+        "session_id: abc\nKeep this hard break.  \n",
+    ],
+)
+def test_align_boundary_preserves_insufficient_or_unsafe_input(text):
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary
+
+    assert align_to_cache_boundary(text, 4, model="generic") == text
+
+
+@pytest.mark.parametrize("model", ["openai", "claude", "gemini", "llama", "generic"])
+def test_align_boundary_unicode_offline_without_padding(monkeypatch, model):
+    import tiktoken.load
+    import tiktoken.registry
+
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary
+    from usagetrim.metrics import tokenizer
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("network or vocabulary loading attempted")
+
+    monkeypatch.setattr(tiktoken.load, "read_file", forbidden)
+    monkeypatch.setattr(tokenizer.tiktoken, "get_encoding", forbidden)
+    monkeypatch.setattr(tokenizer, "_O200K_ENC", None)
+    monkeypatch.setattr(tokenizer, "_CL100K_ENC", None)
+    monkeypatch.setattr(tiktoken.registry, "ENCODINGS", {})
+    text = "Current time: 2026-11-03T12:00:00Z\n" + "🦙漢字" * 20 + "\n"
+    result = align_to_cache_boundary(text, 20, model=model)
+    assert result == align_prompt(text, model=model).aligned_text
+    assert result.startswith("🦙漢字" * 20)
+    assert sorted(line for line in text.splitlines() if line) == sorted(
+        line for line in result.splitlines() if line and not line.startswith("<!--")
+    )
+
+
 @pytest.mark.parametrize("model", ["openai", "claude", "gemini", "llama", "generic"])
 @pytest.mark.parametrize(
     "text",

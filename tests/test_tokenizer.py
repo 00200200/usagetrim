@@ -81,6 +81,47 @@ def test_model_tokens_metadata(model_token_backend, model, count, method, estima
     assert count_model_tokens("", model).count == 0
 
 
+def test_tokenizer_cache_boundary_delegates_arguments_and_result(monkeypatch):
+    from usagetrim.core import prompt_optimizer
+
+    calls = []
+
+    def align(text, target_boundary=1024, *, model="claude"):
+        calls.append((text, target_boundary, model))
+        return "delegated result"
+
+    monkeypatch.setattr(prompt_optimizer, "align_to_cache_boundary", align)
+    assert tokenizer.align_to_cache_boundary("prompt") == "delegated result"
+    assert tokenizer.align_to_cache_boundary("🦙", 128, model="llama") == "delegated result"
+    assert calls == [("prompt", 1024, "claude"), ("🦙", 128, "llama")]
+
+
+@pytest.mark.parametrize("boundary", [0, -1, True])
+def test_tokenizer_cache_boundary_preserves_validation(boundary):
+    with pytest.raises(ValueError, match="positive integer"):
+        tokenizer.align_to_cache_boundary("prompt", boundary)
+
+
+def test_tokenizer_cache_boundary_offline_and_unknown_model(monkeypatch):
+    import tiktoken.load
+    import tiktoken.registry
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("network or vocabulary loading attempted")
+
+    monkeypatch.setattr(tiktoken.load, "read_file", forbidden)
+    monkeypatch.setattr(tokenizer.tiktoken, "get_encoding", forbidden)
+    monkeypatch.setattr(tokenizer, "_O200K_ENC", None)
+    monkeypatch.setattr(tokenizer, "_CL100K_ENC", None)
+    monkeypatch.setattr(tiktoken.registry, "ENCODINGS", {})
+    text = "session_id: abc123\n" + "Keep 漢字🙂.\n" * 30
+    result = tokenizer.align_to_cache_boundary(text, 4)
+    assert result.startswith("Keep 漢字🙂.\n" * 30)
+    assert "session_id: abc123" in result
+    with pytest.raises(ValueError, match="Unknown model"):
+        tokenizer.align_to_cache_boundary(text, model="unknown")
+
+
 def test_model_tokens_unknown_rejected_before_backend(monkeypatch):
     def fail():
         pytest.fail("unknown model must not load a backend")

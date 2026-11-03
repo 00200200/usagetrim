@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from usagetrim.metrics.tokenizer import count_model_tokens, count_tokens
+from usagetrim.metrics.tokenizer import check_cache_breakpoint, count_model_tokens, count_tokens
 
 _TIMESTAMP_PATTERN = re.compile(
     r"\b(?:today(?:'s)? date|current time|timestamp|date is|time is|utc|iso8601)\b[^\n]*|"
@@ -144,6 +144,54 @@ def align_prompt(text: str, *, model: str | None = None) -> PromptAlignResult:
         issues_found=issues,
         aligned_text=aligned_text,
     )
+
+
+def align_to_cache_boundary(
+    text: str, target_boundary: int = 1024, *, model: str = "claude"
+) -> str:
+    """Align a sufficiently long stable prefix without padding or dropping content.
+
+    Counts may be estimates; reaching the threshold does not guarantee cache hits.
+    Only a leading run of standalone runtime metadata may be relocated here.
+    """
+    check_cache_breakpoint("", model=model, min_tokens=target_boundary)
+    metadata = re.compile(
+        r"(?:session_id|request_id|turn_id|conversation_id)"
+        r"\s*[:=]\s*[A-Za-z0-9_-]+|"
+        r"(?:current time|timestamp|today's date)\s*:\s*"
+        r"(?:\d{4}-\d{2}-\d{2}(?:T| )?)?\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?",
+        re.IGNORECASE,
+    )
+    static_started = False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if metadata.fullmatch(line):
+            if static_started:
+                return text
+        else:
+            static_started = True
+            if (
+                _TIMESTAMP_PATTERN.search(line)
+                or _UUID_PATTERN.search(line)
+                or _DYNAMIC_SESSION_PATTERN.search(line)
+            ):
+                return text
+
+    aligned = align_prompt(text, model=model).aligned_text
+    marker = "<!-- DYNAMIC RUNTIME CONTEXT (ISOLATED TO PRESERVE PROMPT CACHE) -->"
+    if marker in text:
+        return text
+    # Reject normalization that would alter any nonempty source line (including
+    # significant trailing spaces). The only new content is the section marker.
+    if sorted(line for line in text.splitlines() if line) != sorted(
+        line for line in aligned.splitlines() if line and line != marker
+    ):
+        return text
+    prefix = aligned.partition(marker)[0].rstrip()
+    if check_cache_breakpoint(prefix, model=model, min_tokens=target_boundary).threshold_reached:
+        return aligned
+    return text
 
 
 _FILLER_PHRASES: list[tuple[re.Pattern[str], str]] = [
