@@ -6,7 +6,7 @@ import os
 import platform
 from concurrent.futures import Executor, ThreadPoolExecutor
 
-from PySide6.QtCore import QPoint, Qt, QTimer
+from PySide6.QtCore import QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -21,9 +21,12 @@ from usagetrim.companion import CompanionUnavailable
 from usagetrim.companion.controller import CompanionController
 from usagetrim.companion.pet import MintArtwork, supports_positioning, supports_transparency
 from usagetrim.companion.preferences import PreferencesWriter
+from usagetrim.companion.tray import CompanionTray
 
 
 class CompanionWindow(QWidget):
+    shutdown_requested = Signal()
+
     def __init__(
         self,
         controller: CompanionController | None = None,
@@ -44,6 +47,10 @@ class CompanionWindow(QWidget):
         self._mode = "panel"
         self._pet_position = None
         self._applying_mode = False
+        self.tray = None
+        self._tray_available = False
+        self._pet_controls_visible = True
+        self._user_hidden = False
         self.setWindowTitle("UsageTrim Desktop Companion")
         self.resize(360, 260)
         root = QVBoxLayout(self)
@@ -76,6 +83,9 @@ class CompanionWindow(QWidget):
         self.mode_button = QPushButton("Desktop Pet")
         self.mode_button.clicked.connect(self.toggle_mode)
         layout.addWidget(self.mode_button)
+        self.hide_controls_button = QPushButton("Hide Controls (use Mint menu or tray to restore)")
+        self.hide_controls_button.clicked.connect(lambda: self.set_pet_controls_visible(False))
+        layout.addWidget(self.hide_controls_button)
         self.quit_button = QPushButton("Quit")
         self.quit_button.clicked.connect(self.close)
         layout.addWidget(self.quit_button)
@@ -102,6 +112,9 @@ class CompanionWindow(QWidget):
         self.poll_timer.setInterval(100)
         self.poll_timer.timeout.connect(self.poll)
         self.poll_timer.start()
+        self.tray = CompanionTray(self)
+        self.artwork.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.artwork.customContextMenuRequested.connect(self._pet_context_menu)
         self.refresh()
 
     def _submit(self, function, *args):
@@ -111,9 +124,80 @@ class CompanionWindow(QWidget):
         self.top.setEnabled(False)
         self.refresh_button.setEnabled(False)
         self._pending = self.executor.submit(function, *args)
+        self._sync_tray()
 
     def refresh(self):
+        if self._closed:
+            return
+        if self.tray is not None:
+            self.tray.refresh_availability()
         self._submit(self.controller.snapshot)
+
+    def _sync_tray(self):
+        if self.tray is not None and not self._closed:
+            self.tray.sync()
+
+    def _pet_context_menu(self, position):
+        if self.tray is not None and not self._closed:
+            self.tray.popup(self.artwork.mapToGlobal(position))
+
+    def _apply_controls_visibility(self, *, resize: bool = False):
+        visible = self._mode != "pet" or self._pet_controls_visible or not self._tray_available
+        hide_button = self._mode == "pet" and self._tray_available
+        changed = (
+            self.controls.isHidden() == visible
+            or self.hide_controls_button.isHidden() == hide_button
+        )
+        self.controls.setVisible(visible)
+        self.hide_controls_button.setVisible(hide_button)
+        if changed or resize:
+            self.layout().activate()
+            self.adjustSize()
+
+    def tray_availability_changed(self, available: bool):
+        if self._closed:
+            return
+        self._tray_available = available
+        if not available:
+            self._pet_controls_visible = True
+        self._apply_controls_visibility()
+        if not available and self._user_hidden:
+            self._user_hidden = False
+            self.showNormal()
+
+    def set_pet_controls_visible(self, visible: bool):
+        if self._closed:
+            return
+        if self.tray is not None:
+            self.tray.refresh_availability()
+        self._pet_controls_visible = bool(visible) if self._tray_available else True
+        self._apply_controls_visibility()
+        self._sync_tray()
+
+    def show_pet(self):
+        if not self._closed:
+            self._user_hidden = False
+            self.set_mode("pet")
+            self.showNormal()
+            self._sync_tray()
+
+    def hide_pet(self):
+        if self._closed:
+            return
+        if self.tray is not None:
+            self.tray.refresh_availability()
+        if self._tray_available and self._mode == "pet":
+            self.save_pet_position()
+            self._user_hidden = True
+            self.hide()
+        self._sync_tray()
+
+    def show_statistics(self):
+        if not self._closed:
+            self._user_hidden = False
+            self.set_mode("panel")
+            self.showNormal()
+            self._sync_tray()
 
     def toggle_mode(self):
         self.set_mode("panel" if self._mode == "pet" else "pet")
@@ -149,7 +233,7 @@ class CompanionWindow(QWidget):
             if pet
             else ""
         )
-        self.adjustSize()
+        self._apply_controls_visibility(resize=True)
         if pet and self._pet_position is not None:
             self.restore_pet_position(self._pet_position)
         if was_visible:
@@ -157,6 +241,7 @@ class CompanionWindow(QWidget):
         self._applying_mode = False
         if persist:
             self._queue_preferences()
+        self._sync_tray()
 
     def restore_pet_position(self, position: list[int]):
         if not supports_positioning():
@@ -277,11 +362,27 @@ class CompanionWindow(QWidget):
             self.top.setChecked(on_top)
             self.top.blockSignals(False)
             if bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint) != on_top:
+                was_visible = self.isVisible()
+                position = self.pos()
                 self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on_top)
-                self.show()
+                if supports_positioning():
+                    self.move(position)
+                if was_visible:
+                    self.show()
         self.pause_button.setEnabled(self._snapshot is not None)
         self.top.setEnabled(True)
         self.refresh_button.setEnabled(True)
+        self._sync_tray()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if hasattr(self, "tray"):
+            self._sync_tray()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        if hasattr(self, "tray"):
+            self._sync_tray()
 
     def closeEvent(self, event):
         if self._closed:
@@ -293,10 +394,16 @@ class CompanionWindow(QWidget):
         try:
             self._preferences.close()
         except Exception:
+            self._pet_controls_visible = True
+            self._user_hidden = False
+            self._apply_controls_visibility()
             self._preference_error()
+            self.showNormal()
             event.ignore()
             return
         self._closed = True
+        if self.tray is not None:
+            self.tray.close()
         self.refresh_timer.stop()
         self.poll_timer.stop()
         self.position_timer.stop()
@@ -318,6 +425,7 @@ class CompanionWindow(QWidget):
             # immediate process exit or attempt unsafe thread termination.
             self.executor.shutdown(wait=False, cancel_futures=True)
         super().closeEvent(event)
+        self.shutdown_requested.emit()
 
 
 class QtBackend:
@@ -328,5 +436,12 @@ class QtBackend:
             raise CompanionUnavailable("Desktop Companion requires a graphical desktop session.")
         app = QApplication.instance() or QApplication(["usagetrim-companion"])
         window = CompanionWindow()
+        window.shutdown_requested.connect(app.quit)
+        previous_quit_policy = app.quitOnLastWindowClosed()
+        app.setQuitOnLastWindowClosed(False)
         window.show()
-        return app.exec()
+        try:
+            return app.exec()
+        finally:
+            window.close()
+            app.setQuitOnLastWindowClosed(previous_quit_policy)

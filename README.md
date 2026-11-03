@@ -215,8 +215,20 @@ captures the final mode and position even before the drag timer fires, and drain
 the final atomic settings write without waiting for a monitor read in the GUI.
 Normal Python process shutdown waits for that settings worker. This does not
 guarantee persistence after a process/system crash or a filesystem write failure.
-The Pet retains actual telemetry, pause/resume, always-on-top, Panel and Quit
-controls. There is no tray, animation or account-limit network polling.
+The Mint tray icon provides Show/Hide Desktop Pet, Show Statistics, Pause/Resume,
+Always on Top and Quit. **Hide Controls** leaves just Mint; restore controls with
+**Show Pet Controls** in the tray menu or Mint's right-click menu. Hiding the Pet
+keeps monitoring active. Quit removes the icon, stops GUI timers and exits the Qt
+event loop; running monitor work finishes safely as described above.
+
+Tray support depends on the desktop shell (including GNOME/Wayland). No GNOME
+extension is required: without a detected tray, all controls remain available and
+hiding the whole Pet is disabled. If tray support disappears, controls and a
+previously hidden Pet are restored on the next availability check (every five
+seconds). Mint's right-click menu provides another route to statistics and Quit.
+Control visibility and hidden-window state are session-only; startup always keeps
+controls accessible. No animations, notifications or account-limit network
+polling are included.
 This command leaves the
 existing macOS application unchanged; on macOS use the application below.
 

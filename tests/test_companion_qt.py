@@ -11,6 +11,15 @@ def qt_app(monkeypatch):
     pytest.importorskip("PySide6")
     from PySide6.QtWidgets import QApplication
 
+    from usagetrim.companion import tray
+
+    class NoTray:
+        @staticmethod
+        def isSystemTrayAvailable():
+            return False
+
+    monkeypatch.setattr(tray, "QSystemTrayIcon", NoTray)
+
     app = QApplication.instance() or QApplication(["companion-test"])
     yield app
     app.processEvents()
@@ -24,6 +33,46 @@ class ImmediateExecutor:
         except Exception as exc:
             future.set_exception(exc)
         return future
+
+
+@pytest.fixture
+def mock_system_tray(qt_app, monkeypatch):
+    from usagetrim.companion import tray
+
+    class FakeTray:
+        available = True
+        instances = []
+
+        @classmethod
+        def isSystemTrayAvailable(cls):
+            return cls.available
+
+        def __init__(self, icon, parent):
+            self.icon = icon
+            self.parent = parent
+            self.visible = False
+            self.deleted = False
+            self.menu = None
+            self.tooltip = ""
+            self.instances.append(self)
+
+        def setContextMenu(self, menu):
+            self.menu = menu
+
+        def setToolTip(self, value):
+            self.tooltip = value
+
+        def show(self):
+            self.visible = True
+
+        def hide(self):
+            self.visible = False
+
+        def deleteLater(self):
+            self.deleted = True
+
+    monkeypatch.setattr(tray, "QSystemTrayIcon", FakeTray)
+    return FakeTray
 
 
 def test_qt_initialization_real_monitor_and_settings(qt_app, tmp_path, monkeypatch):
@@ -441,3 +490,319 @@ def test_preference_result_is_not_a_telemetry_snapshot(qt_app, tmp_path, monkeyp
         assert window.pause_button.isEnabled()
     finally:
         window.close()
+
+
+def test_tray_initialization_show_hide_and_statistics_share_monitor(
+    qt_app, tmp_path, mock_system_tray
+):
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.companion.qt import CompanionWindow
+    from usagetrim.core.monitor import Monitor
+
+    class RecordingExecutor(ImmediateExecutor):
+        def __init__(self):
+            self.calls = []
+
+        def submit(self, function, *args):
+            self.calls.append((function, args))
+            return super().submit(function, *args)
+
+    service = Monitor([], tmp_path)
+    service.store.record(100, 30, 100, 30, event_id="tray-real")
+    controller = CompanionController(service)
+    executor = RecordingExecutor()
+    window = CompanionWindow(controller, executor=executor, preference_executor=ImmediateExecutor())
+    try:
+        window.show()
+        window.poll()
+        assert len(mock_system_tray.instances) == 1
+        icon = mock_system_tray.instances[0]
+        assert icon.visible and icon.menu is window.tray.menu
+        assert not icon.icon.isNull()
+        assert "+70" in window.summary.text()
+        actions = window.tray.actions
+        assert actions["pause"].isEnabled()
+        actions["show_pet"].trigger()
+        assert window.isVisible() and window._mode == "pet"
+        assert window.artwork.isVisible()
+        assert actions["hide_pet"].isEnabled()
+        actions["hide_pet"].trigger()
+        assert not window.isVisible()
+        assert not window._closed
+        assert window.refresh_timer.isActive() and window.poll_timer.isActive()
+        assert icon.visible
+        assert actions["show_pet"].isEnabled()
+        actions["statistics"].trigger()
+        assert window.isVisible() and window._mode == "panel"
+        assert window.controls.isVisible()
+        assert window.artwork.isHidden()
+        window.showMinimized()
+        window.tray.sync()
+        assert actions["statistics"].isEnabled()
+        actions["statistics"].trigger()
+        assert not window.isMinimized()
+        assert window.controller is controller and controller._monitor is service
+        assert window.executor is executor
+        assert len(executor.calls) == 1  # Show/hide/menu state performs no monitor reads.
+        window.tray.refresh_availability()
+        assert len(mock_system_tray.instances) == 1
+    finally:
+        window.close()
+
+
+def test_robot_only_controls_and_context_menu_restore(qt_app, tmp_path, mock_system_tray):
+    from PySide6.QtCore import QPoint
+
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.companion.qt import CompanionWindow
+    from usagetrim.core.monitor import Monitor
+
+    window = CompanionWindow(
+        CompanionController(Monitor([], tmp_path)),
+        executor=ImmediateExecutor(),
+        preference_executor=ImmediateExecutor(),
+    )
+    try:
+        window.show_pet()
+        window.poll()
+        assert window.hide_controls_button.isVisible()
+        window.hide_controls_button.click()
+        assert window.artwork.isVisible()
+        assert window.controls.isHidden()
+        assert not window.tray.actions["controls"].isChecked()
+        assert window.refresh_timer.isActive()
+        # The same QMenu is available from Mint's right-click handler.
+        popup_calls = []
+        window.tray.popup = lambda position: popup_calls.append(position)
+        window.artwork.customContextMenuRequested.emit(QPoint(10, 10))
+        assert len(popup_calls) == 1
+        window.tray.actions["controls"].trigger()
+        assert window.controls.isVisible()
+        assert window.tray.actions["controls"].isChecked()
+        window.tray.actions["statistics"].trigger()
+        assert window._mode == "panel" and window.controls.isVisible()
+    finally:
+        window.close()
+
+
+def test_no_tray_preserves_access_to_panel_and_quit(qt_app, tmp_path, mock_system_tray):
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.companion.qt import CompanionWindow
+    from usagetrim.core.monitor import Monitor
+
+    mock_system_tray.available = False
+    window = CompanionWindow(
+        CompanionController(Monitor([], tmp_path)),
+        executor=ImmediateExecutor(),
+        preference_executor=ImmediateExecutor(),
+    )
+    try:
+        window.show_pet()
+        window.poll()
+        assert window.tray.icon is None
+        assert mock_system_tray.instances == []
+        window.set_pet_controls_visible(False)
+        window.hide_pet()
+        assert window.isVisible() and window.controls.isVisible()
+        assert window.quit_button.isVisible() and window.mode_button.isVisible()
+        assert not window.tray.actions["hide_pet"].isEnabled()
+        assert not window.tray.actions["controls"].isEnabled()
+        window.mode_button.click()
+        assert window._mode == "panel" and window.controls.isVisible()
+    finally:
+        window.close()
+
+
+def test_tray_disappearance_restores_hidden_window_and_controls(qt_app, tmp_path, mock_system_tray):
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.companion.qt import CompanionWindow
+    from usagetrim.core.monitor import Monitor
+
+    window = CompanionWindow(
+        CompanionController(Monitor([], tmp_path)),
+        executor=ImmediateExecutor(),
+        preference_executor=ImmediateExecutor(),
+    )
+    try:
+        window.show_pet()
+        window.poll()
+        window.set_pet_controls_visible(False)
+        window.hide_pet()
+        icon = mock_system_tray.instances[0]
+        mock_system_tray.available = False
+        window.refresh()
+        window.poll()
+        assert window.isVisible() and window.controls.isVisible()
+        assert not icon.visible and icon.deleted
+        assert window.tray.icon is None
+        mock_system_tray.available = True
+        window.tray.refresh_availability()
+        assert window.tray.icon is not None
+        assert len(mock_system_tray.instances) == 2
+    finally:
+        window.close()
+
+
+def test_tray_pause_and_top_track_real_settings_without_unhiding(
+    qt_app, tmp_path, mock_system_tray, monkeypatch
+):
+    from PySide6.QtCore import Qt
+
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.companion.qt import CompanionWindow
+    from usagetrim.core.companion_state import settings
+    from usagetrim.core.monitor import Monitor
+
+    service = Monitor([], tmp_path)
+    window = CompanionWindow(
+        CompanionController(service),
+        executor=ImmediateExecutor(),
+        preference_executor=ImmediateExecutor(),
+    )
+    top_writes = []
+    original_set_top = window.controller.set_always_on_top
+
+    def record_top(value):
+        top_writes.append(value)
+        original_set_top(value)
+
+    monkeypatch.setattr(window.controller, "set_always_on_top", record_top)
+    try:
+        window.show_pet()
+        window.poll()
+        actions = window.tray.actions
+        actions["pause"].trigger()
+        assert not actions["pause"].isEnabled()
+        window.poll()
+        assert settings()["paused"] is True
+        assert actions["pause"].text() == "Resume Optimization"
+        actions["pause"].trigger()
+        window.poll()
+        assert settings()["paused"] is False
+        assert actions["pause"].text() == "Pause Optimization"
+        window.hide_pet()
+        actions["top"].trigger()
+        assert window.top.isChecked()
+        window.poll()
+        assert not window.isVisible()
+        assert actions["top"].isChecked() and window.top.isChecked()
+        assert settings()["companion_qt_always_on_top"] is True
+        assert window.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
+        assert top_writes == [True]
+        # Checkbox -> QAction synchronization must not trigger another save.
+        window.top.setChecked(False)
+        assert not actions["top"].isChecked()
+        window.poll()
+        assert not settings()["companion_qt_always_on_top"]
+        assert not window.isVisible()
+        assert not window.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
+        window.tray.sync()
+        window.tray.sync()
+        assert top_writes == [True, False]
+
+        def unavailable():
+            raise OSError("monitor unavailable")
+
+        window.controller.snapshot = unavailable
+        window.refresh()
+        window.poll()
+        assert not actions["pause"].isEnabled()
+        assert window._snapshot is None
+    finally:
+        window.close()
+
+
+def test_tray_quit_closes_hidden_window_and_detaches_active_work(qt_app, mock_system_tray):
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.companion.qt import CompanionWindow
+
+    class PendingExecutor:
+        def __init__(self):
+            self.future = Future()
+            self.future.set_running_or_notify_cancel()
+
+        def submit(self, *args):
+            return self.future
+
+    executor = PendingExecutor()
+    window = CompanionWindow(
+        CompanionController(), executor=executor, preference_executor=ImmediateExecutor()
+    )
+    window.show_pet()
+    window.hide_pet()
+    shutdowns = []
+    window.shutdown_requested.connect(lambda: shutdowns.append(True))
+    icon = mock_system_tray.instances[0]
+    window.tray.actions["quit"].trigger()
+    assert shutdowns == [True]
+    assert window._closed and not window.isVisible()
+    assert not icon.visible and icon.deleted
+    assert window.tray._closed and window._preferences._closed
+    assert all(
+        not timer.isActive()
+        for timer in (
+            window.refresh_timer,
+            window.poll_timer,
+            window.position_timer,
+            window.preferences_timer,
+        )
+    )
+    assert not executor.future.done()
+    before = window.summary.text()
+    executor.future.set_result({"today": None, "paused": True, "issues": []})
+    window.poll()
+    assert window.summary.text() == before
+    window.close()
+    assert shutdowns == [True]
+
+
+def test_backend_quit_exits_event_loop_even_when_window_hidden(
+    qt_app, tmp_path, monkeypatch, mock_system_tray
+):
+    from types import SimpleNamespace
+
+    from usagetrim.companion import qt
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.core.monitor import Monitor
+
+    window_type = qt.CompanionWindow
+    windows = []
+
+    def create_window():
+        window = window_type(
+            CompanionController(Monitor([], tmp_path)),
+            executor=ImmediateExecutor(),
+            preference_executor=ImmediateExecutor(),
+        )
+        windows.append(window)
+        return window
+
+    class Application:
+        quit_policy = True
+        quit_calls = 0
+
+        def quitOnLastWindowClosed(self):
+            return self.quit_policy
+
+        def setQuitOnLastWindowClosed(self, value):
+            self.quit_policy = value
+
+        def quit(self):
+            self.quit_calls += 1
+
+        def exec(self):
+            assert not self.quit_policy
+            window = windows[0]
+            window.show_pet()
+            window.hide_pet()
+            window.tray.actions["quit"].trigger()
+            assert self.quit_calls == 1
+            return 0
+
+    application = Application()
+    monkeypatch.setattr(qt, "QApplication", SimpleNamespace(instance=lambda: application))
+    monkeypatch.setattr(qt, "CompanionWindow", create_window)
+    assert qt.QtBackend().run() == 0
+    assert application.quit_policy is True
+    assert application.quit_calls == 1
+    assert len(windows) == 1 and windows[0]._closed
