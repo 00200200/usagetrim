@@ -520,6 +520,10 @@ def prepare_command(
     json_output: Annotated[
         bool, typer.Option("--json", help="Include local preview measurements")
     ] = False,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Token-count family: openai, claude, gemini, llama, generic"),
+    ] = None,
 ):
     """Preview shorter input before pasting it into any chat; never sends or counts usage."""
     from usagetrim.core.prepare import MAX_INPUT_BYTES, prepare_text
@@ -544,7 +548,10 @@ def prepare_command(
             )
         if len(raw) > MAX_INPUT_BYTES:
             raise ValueError("Draft exceeds 128 KiB; select a smaller relevant excerpt")
-        result = prepare_text(raw.decode("utf-8"), mode=selected_mode, budget=budget)
+        model_options = {} if model is None else {"model": model}
+        result = prepare_text(
+            raw.decode("utf-8"), mode=selected_mode, budget=budget, **model_options
+        )
     except (OSError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     if json_output:
@@ -558,8 +565,12 @@ def prepare_command(
             err_console.print(
                 "[bold green]✓ Copied prepared text to system clipboard (ready to paste)![/bold green]"
             )
+        counting_label = "local o200k estimate"
+        if model is not None:
+            accuracy = "estimate" if result["is_estimate"] else "encoding count"
+            counting_label = f"{result['family']} · {result['method']} · {accuracy}"
         err_console.print(
-            f"Tokens: {result['counts']}  ·  local o200k estimate · not usage savings. "
+            f"Tokens: {result['counts']}  ·  {counting_label} · not usage savings. "
             "Review before pasting into Claude Desktop / Codex. "
             "Credentials are redacted; compaction may cache a redacted original."
         )
