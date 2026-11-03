@@ -4,7 +4,7 @@ from usagetrim.core.cache import ContextCache
 from usagetrim.core.cleaner import CleanerOptions, compact_terminal_output, strip_ansi
 from usagetrim.core.redactor import redact_secrets
 from usagetrim.core.safe_filter import recovery_notice
-from usagetrim.metrics.tokenizer import count_tokens
+from usagetrim.metrics.tokenizer import count_model_tokens, count_tokens
 
 
 def compress_to_budget(
@@ -15,19 +15,26 @@ def compress_to_budget(
     *,
     original_text: str | None = None,
     suffix: str = "",
+    model: str | None = None,
 ) -> str:
     """Bound the complete text, including recovery metadata, using a local estimator.
 
     Truncated content is recoverable after secret redaction. Tiny budgets that
     cannot hold a recovery reference raise rather than silently losing content.
     Provider estimates are not billing counts for any particular model.
+    An explicit model selects model-family counting, which may also be estimated.
     """
     if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
         raise ValueError("max_tokens must be a positive integer")
     if provider not in {"claude", "openai", "gemini"}:
         raise ValueError("provider must be claude, openai, or gemini")
+    if model is not None:
+        # Reject unsupported models before constructing or writing to the cache.
+        count_model_tokens("", model)
 
     def size(value: str) -> int:
+        if model is not None:
+            return count_model_tokens(value, model).count
         return getattr(count_tokens(value), provider)
 
     original = redact_secrets(text if original_text is None else original_text)
