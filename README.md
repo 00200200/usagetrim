@@ -190,8 +190,8 @@ and signed net reduction), refreshes every five seconds and can pause/resume
 optimization using the same local settings as CLI/MCP. An empty history is shown
 as unavailable measurements, not invented savings. After a refresh failure, pause
 controls remain disabled until a successful read restores the current state.
-Closing the window immediately stops UI updates and cancels queued work without
-waiting on the GUI thread. A monitor call already running is allowed to finish;
+Closing the window immediately stops UI updates and cancels queued monitor work
+without waiting on the GUI thread. A monitor call already running is allowed to finish;
 Python may wait for it before the process exits. This MVP cannot guarantee an
 immediate process exit if local filesystem or database operations stall. It does
 not forcibly terminate threads or apply their results to a closed window.
@@ -200,8 +200,24 @@ Drag the standard title bar to move the window. The opaque, normally decorated
 window works through Qt's native Windows, X11 or Wayland support; a working Qt
 platform plugin and system GUI libraries are required. The optional always-on-top
 hint is saved in `companion.json`, but compositors may ignore it (especially on
-Wayland); the normal window remains usable. No transparency, tray, animations or
-account-limit network polling is included in this MVP. This command leaves the
+Wayland); the normal window remains usable.
+
+Use **Desktop Pet** to show the bundled Mint robot (the same artwork as macOS),
+and **Statistics panel** to return. Drag Mint or the standard title bar. Pet mode
+uses a frameless transparent window only when Windows composition or an X11
+compositor can be confirmed. Otherwise it keeps normal window decorations and an
+opaque background, including on Wayland. On Wayland global coordinates are not
+saved or restored; placement and dragging remain under compositor control.
+Mode and supported Pet coordinates are stored in the existing `companion.json`;
+restored positions are clamped to an available screen. Preference writes use an
+independent, serialized worker and are coalesced during dragging. Normal closing
+captures the final mode and position even before the drag timer fires, and drains
+the final atomic settings write without waiting for a monitor read in the GUI.
+Normal Python process shutdown waits for that settings worker. This does not
+guarantee persistence after a process/system crash or a filesystem write failure.
+The Pet retains actual telemetry, pause/resume, always-on-top, Panel and Quit
+controls. There is no tray, animation or account-limit network polling.
+This command leaves the
 existing macOS application unchanged; on macOS use the application below.
 
 Mint robot on your Mac — draggable pet or menu-bar mode. Local measurements, task memory, optional account-limit readings. English UI. No extra AI calls.

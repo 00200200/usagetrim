@@ -93,6 +93,82 @@ def test_controller_empty_history_has_no_invented_counters(tmp_path):
     assert controller.snapshot()["today"] is None
 
 
+def test_pet_preferences_roundtrip_and_validation(tmp_path):
+    update_settings(paused=True, custom="preserved")
+    controller = CompanionController(Monitor([], tmp_path))
+    assert controller.window_preferences() == {"mode": "panel", "position": None}
+    controller.save_window_preferences("pet", [100, 200])
+    assert CompanionController().window_preferences() == {"mode": "pet", "position": [100, 200]}
+    controller.save_window_preferences("panel", None)
+    assert settings()["companion_qt_pet_position"] == [100, 200]
+    assert settings()["paused"] is True
+    assert settings()["custom"] == "preserved"
+    with pytest.raises(ValueError):
+        controller.save_window_preferences("invalid", None)
+    with pytest.raises(ValueError):
+        controller.save_window_preferences("pet", [True, 3])
+    update_settings(companion_qt_pet_position=["bad", 2])
+    assert controller.window_preferences()["position"] is None
+
+
+def test_window_preference_save_never_reads_monitor(monkeypatch):
+    controller = CompanionController()
+
+    def forbidden():
+        pytest.fail("saving preferences must not initialize or read the monitor")
+
+    monkeypatch.setattr(controller, "snapshot", forbidden)
+    assert controller.save_window_preferences("pet", [42, 73]) == {
+        "mode": "pet",
+        "position": [42, 73],
+    }
+    assert controller._monitor is None
+
+
+def test_preferences_coalesce_and_drain_final_write_without_monitor(monkeypatch):
+    from concurrent.futures import Future
+
+    from usagetrim.companion import preferences
+
+    class ControlledExecutor:
+        def __init__(self):
+            self.jobs = []
+            self.shutdown_calls = []
+
+        def submit(self, function, *args):
+            future = Future()
+            self.jobs.append((future, function, args))
+            return future
+
+        def shutdown(self, *, wait, cancel_futures):
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    executor = ControlledExecutor()
+    monkeypatch.setattr(preferences, "ThreadPoolExecutor", lambda **kwargs: executor)
+    controller = CompanionController()
+
+    def forbidden():
+        pytest.fail("settings writer must never read telemetry")
+
+    monkeypatch.setattr(controller, "snapshot", forbidden)
+    writer = preferences.PreferencesWriter(controller)
+    writer.queue("pet", [1, 2])
+    writer.flush()
+    for value in range(100):
+        writer.queue("pet", [value, value + 1])
+        writer.flush()
+    assert len(executor.jobs) == 1
+    writer.close()
+    assert len(executor.jobs) == 2
+    assert executor.shutdown_calls == [(False, False)]
+    writer.close()
+    assert len(executor.jobs) == 2
+    # Deterministically execute the serialized writes, without threads or waits.
+    for future, function, args in executor.jobs:
+        future.set_result(function(*args))
+    assert CompanionController().window_preferences() == {"mode": "pet", "position": [99, 100]}
+
+
 def test_companion_cli_launch_and_exit_code(monkeypatch):
     from usagetrim import companion
 
