@@ -13,6 +13,7 @@ from usagetrim.metrics.tokenizer import (
     compute_metrics,
     count_model_tokens,
     count_tokens,
+    detect_model_family,
 )
 
 
@@ -87,6 +88,44 @@ def test_model_tokens_unknown_rejected_before_backend(monkeypatch):
     monkeypatch.setattr(tokenizer, "get_o200k", fail)
     with pytest.raises(ValueError, match="openai, claude, gemini, llama, generic"):
         count_model_tokens("hello", "gpt-something")
+
+
+@pytest.mark.parametrize(
+    "variable,model,expected",
+    [
+        ("LLM_MODEL", "gpt-4o", ModelFamily.OPENAI),
+        ("LLM_MODEL", "claude-sonnet-4", ModelFamily.CLAUDE),
+        ("ANTHROPIC_MODEL", "claude-3-7-sonnet", ModelFamily.CLAUDE),
+        ("OPENAI_MODEL", "o3-mini", ModelFamily.OPENAI),
+        ("LLM_MODEL", "gemini-2.5-pro", ModelFamily.GEMINI),
+        ("LLM_MODEL", "meta-llama/Llama-3.1-8B", ModelFamily.LLAMA),
+    ],
+)
+def test_detect_model_family_recognizes_explicit_families(variable, model, expected):
+    assert detect_model_family({variable: model}) is expected
+
+
+def test_detect_model_family_priority_and_unknown_do_not_fall_through():
+    assert (
+        detect_model_family(
+            {
+                "LLM_MODEL": "claude-3-sonnet",
+                "ANTHROPIC_MODEL": "claude-3-haiku",
+                "OPENAI_MODEL": "gpt-4o",
+            }
+        )
+        is ModelFamily.CLAUDE
+    )
+    assert detect_model_family({"LLM_MODEL": "custom-model", "OPENAI_MODEL": "gpt-4o"}) is None
+    assert (
+        detect_model_family({"ANTHROPIC_MODEL": " ", "OPENAI_MODEL": "gpt-4o"})
+        is ModelFamily.OPENAI
+    )
+
+
+def test_detect_model_family_empty_environment_is_unset():
+    assert detect_model_family({}) is None
+    assert detect_model_family({"LLM_MODEL": " ", "ANTHROPIC_MODEL": ""}) is None
 
 
 def test_model_tokens_cl100k_fallback_and_cached_fallback_identity(

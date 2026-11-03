@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
@@ -20,6 +22,40 @@ class ModelFamily(Enum):
     GEMINI = "gemini"
     LLAMA = "llama"
     GENERIC = "generic"
+
+
+def detect_model_family(
+    environment: Mapping[str, str] | None = None,
+) -> ModelFamily | None:
+    """Detect a known family; precedence is LLM_MODEL, ANTHROPIC_MODEL, OPENAI_MODEL.
+
+    An unknown value in the highest-priority configured variable returns None
+    rather than guessing or falling through to a lower-priority variable.
+    """
+    values = os.environ if environment is None else environment
+    model = next(
+        (
+            values.get(key, "").strip().lower()
+            for key in ("LLM_MODEL", "ANTHROPIC_MODEL", "OPENAI_MODEL")
+            if values.get(key, "").strip()
+        ),
+        "",
+    )
+    if not model:
+        return None
+    if model == "claude" or model.startswith(("claude-", "claude/")):
+        return ModelFamily.CLAUDE
+    if model == "gemini" or model.startswith(("gemini-", "gemini/", "models/gemini-")):
+        return ModelFamily.GEMINI
+    if model == "llama" or model.startswith(("llama-", "llama/", "meta-llama/")):
+        return ModelFamily.LLAMA
+    if (
+        model.startswith(("gpt-", "chatgpt-"))
+        or model in {"o1", "o3", "o4"}
+        or model.startswith(("o1-", "o3-", "o4-"))
+    ):
+        return ModelFamily.OPENAI
+    return None
 
 
 @dataclass(frozen=True)
