@@ -219,6 +219,24 @@ class CompanionWindow(QWidget):
             self._queue_preferences()
             self._sync_tray()
 
+    def _configure_surface(self, transparent: bool):
+        """Set surface attributes before native creation, also on mode changes.
+
+        Qt does not portably support toggling WA_TranslucentBackground on an
+        existing native surface. QWidget.destroy() releases platform resources
+        without deleting this widget or its logical children. The next show (or
+        native creation caused by window flags) uses the new attributes.
+        """
+        changed = self.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground) != transparent
+        if changed and self.windowHandle() is not None:
+            self.hide()
+            self.destroy()
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, transparent)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, transparent)
+        self.setAutoFillBackground(not transparent)
+        # Apply attributes first: changing flags can recreate native resources.
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, transparent)
+
     def set_mode(self, mode: str, *, persist: bool = True):
         if self._closed:
             return
@@ -226,15 +244,15 @@ class CompanionWindow(QWidget):
             raise ValueError("invalid companion mode")
         self._applying_mode = True
         was_visible = self.isVisible()
+        position = self.pos()
         if self._mode == "pet" and supports_positioning():
             self._pet_position = [self.x(), self.y()]
         self._mode = mode
         pet = mode == "pet"
         transparent = pet and supports_transparency()
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, transparent)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, transparent)
-        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, transparent)
-        self.setAutoFillBackground(not transparent)
+        self._configure_surface(transparent)
+        if supports_positioning():
+            self.move(position)
         self.artwork.setVisible(pet)
         self.refresh_button.setVisible(not pet)
         self.status.setVisible(not pet)

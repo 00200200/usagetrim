@@ -280,6 +280,182 @@ def test_pet_panel_switching_and_transparency_fallback(qt_app, tmp_path, monkeyp
         window.close()
 
 
+@pytest.mark.parametrize("initial_mode", ["panel", "pet"])
+def test_surface_attributes_are_configured_before_initial_native_window(
+    qt_app, tmp_path, monkeypatch, initial_mode
+):
+    from PySide6.QtCore import Qt
+
+    from usagetrim.companion import qt
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.core.monitor import Monitor
+
+    monkeypatch.setattr(qt, "supports_transparency", lambda: True)
+    controller = CompanionController(Monitor([], tmp_path))
+    controller.save_window_preferences(initial_mode, None)
+    configurations = []
+
+    class RecordingWindow(qt.CompanionWindow):
+        def _configure_surface(self, transparent):
+            configurations.append((transparent, self.windowHandle() is None))
+            super()._configure_surface(transparent)
+
+    window = RecordingWindow(
+        controller, executor=ImmediateExecutor(), preference_executor=ImmediateExecutor()
+    )
+    try:
+        transparent = initial_mode == "pet"
+        assert configurations == [(transparent, True)]
+        assert window.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground) is transparent
+        assert window.testAttribute(Qt.WidgetAttribute.WA_NoSystemBackground) is transparent
+        assert window.autoFillBackground() is (not transparent)
+        window.show()
+        window.poll()
+        assert window.windowHandle() is not None
+        assert window.isVisible() and not window._closed
+        assert bool(window.windowFlags() & Qt.WindowType.FramelessWindowHint) is transparent
+    finally:
+        window.close()
+
+
+def test_shown_panel_pet_switches_recreate_surface_and_keep_shared_state(
+    qt_app, tmp_path, mock_system_tray, monkeypatch
+):
+    from PySide6.QtCore import Qt
+
+    from usagetrim.companion import qt
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.core.monitor import Monitor
+
+    monkeypatch.setattr(qt, "supports_transparency", lambda: True)
+    service = Monitor([], tmp_path)
+    controller = CompanionController(service)
+    controller.set_always_on_top(True)
+    controller.save_window_preferences("panel", [60, 70], animations=True)
+    original_snapshot = service.snapshot
+    reads = []
+
+    def snapshot():
+        reads.append(True)
+        return original_snapshot()
+
+    monkeypatch.setattr(service, "snapshot", snapshot)
+    monitor_executor = ImmediateExecutor()
+    window = qt.CompanionWindow(
+        controller, executor=monitor_executor, preference_executor=ImmediateExecutor()
+    )
+    resets = []
+    flag_attributes = []
+    shutdowns = []
+    original_destroy = window.destroy
+    original_set_flag = window.setWindowFlag
+
+    def destroy(*args, **kwargs):
+        resets.append(
+            (
+                window.windowHandle() is not None,
+                window.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground),
+            )
+        )
+        original_destroy(*args, **kwargs)
+
+    def set_flag(flag, enabled=True):
+        if flag == Qt.WindowType.FramelessWindowHint:
+            flag_attributes.append(
+                (
+                    enabled,
+                    window.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground),
+                    window.testAttribute(Qt.WidgetAttribute.WA_NoSystemBackground),
+                    window.autoFillBackground(),
+                )
+            )
+        original_set_flag(flag, enabled)
+
+    monkeypatch.setattr(window, "destroy", destroy)
+    monkeypatch.setattr(window, "setWindowFlag", set_flag)
+    window.shutdown_requested.connect(lambda: shutdowns.append(True))
+    try:
+        window.show()
+        window.poll()
+        assert window._mode == "panel" and window.windowHandle() is not None
+        controls, artwork = window.controls, window.artwork
+        tray, writer = window.tray, window._preferences
+        icon = tray.icon
+        pixmap_key = artwork.pixmap().cacheKey()
+        for index, mode in enumerate(("pet", "panel", "pet", "panel", "pet"), 1):
+            transparent = mode == "pet"
+            # These paths also exercise the public tray/menu mode commands.
+            window.tray.actions["show_pet" if transparent else "statistics"].trigger()
+            assert window._mode == mode and window.isVisible()
+            assert window.windowHandle() is not None
+            assert len(resets) == index
+            assert resets[-1] == (True, not transparent)
+            # Attributes are installed before flags can create another surface.
+            assert flag_attributes[-1] == (transparent, transparent, transparent, not transparent)
+            assert bool(window.windowFlags() & Qt.WindowType.FramelessWindowHint) is transparent
+            assert window.autoFillBackground() is (not transparent)
+            assert window.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
+            assert window.controls is controls and controls.objectName() == "pet-controls"
+            assert window.artwork is artwork and not artwork._shutdown
+            assert artwork.pixmap().cacheKey() == pixmap_key
+            assert artwork.motion_timer.isActive() is transparent
+            assert window.tray is tray and tray.icon is icon and icon.visible
+            assert window.executor is monitor_executor and window._preferences is writer
+            assert window.controller is controller and controller._monitor is service
+            assert window.refresh_timer.isActive() and window.poll_timer.isActive()
+            assert window.refresh_timer.interval() == 5000
+            assert shutdowns == []
+            assert len(reads) == 1
+        window._flush_preferences()
+        window.poll()
+        assert len(reads) == 1
+        assert controller.window_preferences() == {
+            "mode": "pet",
+            "position": [window.x(), window.y()],
+        }
+        assert controller.always_on_top() and controller.animations_enabled()
+        window.set_mode("pet")
+        assert len(resets) == 5  # No surface reset when the format is unchanged.
+    finally:
+        window.close()
+    assert shutdowns == [True]
+    assert not icon.visible
+
+
+def test_shown_pet_fallback_never_enables_translucency_or_resets_surface(
+    qt_app, tmp_path, monkeypatch
+):
+    from PySide6.QtCore import Qt
+
+    from usagetrim.companion import qt
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.core.monitor import Monitor
+
+    monkeypatch.setattr(qt, "supports_transparency", lambda: False)
+    window = qt.CompanionWindow(
+        CompanionController(Monitor([], tmp_path)),
+        executor=ImmediateExecutor(),
+        preference_executor=ImmediateExecutor(),
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("an unchanged opaque format must not need a native surface reset")
+
+    try:
+        window.show()
+        window.poll()
+        monkeypatch.setattr(window, "destroy", forbidden)
+        for mode in ("pet", "panel", "pet"):
+            window.set_mode(mode)
+            assert not window.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            assert not window.testAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+            assert not window.windowFlags() & Qt.WindowType.FramelessWindowHint
+            assert window.autoFillBackground() and window.isVisible()
+            assert window.refresh_timer.isActive()
+    finally:
+        window.close()
+
+
 def test_pet_manual_drag_saves_and_restores_position(qt_app, tmp_path, monkeypatch):
     from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
     from PySide6.QtGui import QMouseEvent
