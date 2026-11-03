@@ -54,6 +54,66 @@ class FakeEncoding:
         return text.split()
 
 
+@pytest.mark.parametrize("model", [item.value for item in ModelFamily])
+@pytest.mark.parametrize(
+    "text,base_count",
+    [
+        ("", 0),
+        ("hello", 2),
+        ("🦙漢字", 3),
+        ("x = 1\n", 2),
+        ('{"ok":true}', 3),
+        (" \t\r\n", 1),
+        ("\udcff", 1),
+        ("\ud83e\udd99", 1),
+    ],
+)
+def test_model_api_imports_and_runs_without_tiktoken(monkeypatch, model, text, base_count):
+    import builtins
+    import runpy
+    import socket
+
+    original_import = builtins.__import__
+    attempted_imports = []
+
+    def without_tiktoken(name, *args, **kwargs):
+        if name == "tiktoken" or name.startswith("tiktoken."):
+            attempted_imports.append(name)
+            raise ModuleNotFoundError("No module named 'tiktoken'", name="tiktoken")
+        return original_import(name, *args, **kwargs)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("network access attempted without tiktoken")
+
+    monkeypatch.setattr(builtins, "__import__", without_tiktoken)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    namespace = runpy.run_path(tokenizer.__file__)
+    assert namespace["tiktoken"] is None
+    expected = base_count + int(base_count > 0 and model in {"claude", "gemini"})
+    count = namespace["count_model_tokens"](text, model)
+    assert count.count == expected
+    assert count.is_estimate is True
+    assert "utf8-bytes-div4-ceil" in count.method
+    assert namespace["count_model_tokens"](text, model) == count
+    breakpoint = namespace["check_cache_breakpoint"](text, model, min_tokens=1)
+    assert breakpoint.token_count == expected
+    assert breakpoint.method == count.method
+    assert namespace["detect_model_family"]({"LLM_MODEL": "claude-sonnet-4"}).value == "claude"
+    # Only the initial optional import is attempted; no loader or registry import.
+    assert attempted_imports == ["tiktoken"]
+
+
+@pytest.mark.parametrize("name", ["o200k_base", "cl100k_base"])
+def test_model_tokens_reuses_warm_encoding_when_backend_unavailable(monkeypatch, name):
+    monkeypatch.setattr(tokenizer, "tiktoken", None)
+    monkeypatch.setattr(tokenizer, "_O200K_ENC", FakeEncoding(name))
+    monkeypatch.setattr(tokenizer, "_CL100K_ENC", None)
+    result = count_model_tokens("hello world", "openai")
+    assert result.count == 2
+    assert result.method == name
+    assert result.is_estimate is (name != "o200k_base")
+
+
 @pytest.fixture
 def model_token_backend(monkeypatch):
     monkeypatch.setattr(tokenizer, "get_o200k", lambda: FakeEncoding("o200k_base"))

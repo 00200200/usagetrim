@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
 
-import tiktoken
+try:
+    import tiktoken
+except ImportError:
+    # Model-aware estimates remain usable without the optional runtime backend.
+    # This does not change the project's installation dependencies.
+    tiktoken = None
 
 Provider = Literal["claude", "openai", "gemini"]
 
@@ -142,6 +147,8 @@ def _model_encoding(name: str):
     for encoding in (_O200K_ENC, _CL100K_ENC):
         if encoding is not None and getattr(encoding, "name", None) == name:
             return encoding
+    if tiktoken is None:
+        raise ValueError("tiktoken is unavailable")
     from tiktoken import registry
 
     # Isolated optional integration with tiktoken's in-memory registry. If its
