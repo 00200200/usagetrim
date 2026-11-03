@@ -229,6 +229,15 @@ Always on Top and Quit. **Hide Controls** leaves just Mint; restore controls wit
 keeps monitoring active. Quit removes the icon, stops GUI timers and exits the Qt
 event loop; running monitor work finishes safely as described above.
 
+The tray menu also has a read-only summary: Active/Paused/Unavailable status,
+today's returned UsageTrim operation count and signed net token reduction.
+These are existing local OpenAI token estimates, not AI-provider billing or
+account balances. Negative net reduction remains negative and indicates expansion,
+not savings. Empty history is shown as no measurements; initial loading and
+monitor errors show unavailable values. The summary follows the same five-second
+monitor updates even while Mint is hidden; opening the menu adds no data reads
+or network requests.
+
 Tray support depends on the desktop shell (including GNOME/Wayland). No GNOME
 extension is required: without a detected tray, all controls remain available and
 hiding the whole Pet is disabled. If tray support disappears, controls and a

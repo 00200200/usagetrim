@@ -13,6 +13,18 @@ class CompanionTray:
         self.icon = None
         self.available = False
         self._closed = False
+        self.information = {}
+        for key, label in (
+            ("title", "UsageTrim Mint"),
+            ("status", "Status: Unavailable"),
+            ("operations", "Today: Unavailable"),
+            ("net", "Net reduction: Unavailable"),
+        ):
+            item = QAction(label, self.menu)
+            item.setEnabled(False)
+            self.menu.addAction(item)
+            self.information[key] = item
+        self.menu.addSeparator()
         self.actions = {}
         for key, label, callback in (
             ("show_pet", "Show Desktop Pet", window.show_pet),
@@ -71,6 +83,7 @@ class CompanionTray:
         if self._closed:
             return
         window = self.window
+        self._sync_information(window._snapshot)
         visible = window.isVisible() and not window.isMinimized()
         visible_pet = visible and window._mode == "pet"
         self.actions["show_pet"].setEnabled(not window._closed and not visible_pet)
@@ -97,6 +110,25 @@ class CompanionTray:
                 else ("Optimization paused" if paused else "Local monitor active")
             )
             self.icon.setToolTip(f"UsageTrim Mint — {state}")
+
+    def _sync_information(self, snapshot):
+        """Format only the existing snapshot, including signed net expansion."""
+        if snapshot is None:
+            self.information["status"].setText("Status: Unavailable")
+            self.information["operations"].setText("Today: Unavailable")
+            self.information["net"].setText("Net reduction: Unavailable")
+            return
+        status = "Paused" if snapshot["paused"] else "Active"
+        self.information["status"].setText(f"Status: {status}")
+        today = snapshot.get("today")
+        if today is None:
+            self.information["operations"].setText("Today: No measurements")
+            self.information["net"].setText("Net reduction: No measurements")
+            return
+        count = today["events"]
+        noun = "operation" if count == 1 else "operations"
+        self.information["operations"].setText(f"Today: {count:,} {noun}")
+        self.information["net"].setText(f"Net reduction: {today['net']:+,} tokens (estimate)")
 
     def popup(self, global_position):
         if not self._closed:

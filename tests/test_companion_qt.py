@@ -1053,6 +1053,162 @@ def test_animation_label_describes_preference_while_optimization_paused(
         window.close()
 
 
+def test_tray_information_uses_real_snapshots_and_updates_while_hidden(
+    qt_app, tmp_path, mock_system_tray, monkeypatch
+):
+    from PySide6.QtCore import QTimer
+
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.companion.qt import CompanionWindow
+    from usagetrim.core.monitor import Monitor
+
+    service = Monitor([], tmp_path)
+    service.store.record(2000, 460, 2000, 460, event_id="tray-summary-first")
+    original_snapshot = service.snapshot
+    reads = []
+
+    def snapshot():
+        reads.append(True)
+        return original_snapshot()
+
+    monkeypatch.setattr(service, "snapshot", snapshot)
+    window = CompanionWindow(
+        CompanionController(service),
+        executor=ImmediateExecutor(),
+        preference_executor=ImmediateExecutor(),
+    )
+    try:
+        info = window.tray.information
+        assert info["status"].text() == "Status: Unavailable"
+        assert info["operations"].text() == "Today: Unavailable"
+        assert info["net"].text() == "Net reduction: Unavailable"
+        assert window.tray.menu.actions()[:4] == list(info.values())
+        assert window.tray.menu.actions()[4].isSeparator()
+        assert all(not item.isEnabled() and not item.isCheckable() for item in info.values())
+        assert set(window.tray.actions) == {
+            "show_pet",
+            "hide_pet",
+            "statistics",
+            "controls",
+            "pause",
+            "top",
+            "animations",
+            "quit",
+        }
+        timer_count = len(window.findChildren(QTimer))
+        window.poll()
+        assert info["title"].text() == "UsageTrim Mint"
+        assert info["status"].text() == "Status: Active"
+        assert info["operations"].text() == "Today: 1 operation"
+        assert info["net"].text() == "Net reduction: +1,540 tokens (estimate)"
+        assert len(reads) == 1
+        window.show_pet()
+        window.hide_pet()
+        window.tray.menu.aboutToShow.emit()
+        window.tray.sync()
+        assert len(reads) == 1
+        assert not window.isVisible()
+        service.store.record(100, 50, 100, 50, event_id="tray-summary-second")
+        window.refresh_timer.timeout.emit()
+        window.poll()
+        assert not window.isVisible()
+        assert info["operations"].text() == "Today: 2 operations"
+        assert info["net"].text() == "Net reduction: +1,590 tokens (estimate)"
+        assert len(reads) == 2
+        window.tray.menu.aboutToShow.emit()
+        window.tray.sync()
+        assert len(reads) == 2
+        assert window.refresh_timer.interval() == 5000
+        assert len(window.findChildren(QTimer)) == timer_count
+        assert window.tray.actions["show_pet"].isEnabled()
+        assert window.tray.actions["pause"].isEnabled()
+    finally:
+        window.close()
+
+
+def test_tray_information_no_measurements_pause_error_and_recovery(
+    qt_app, tmp_path, mock_system_tray, monkeypatch
+):
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.companion.qt import CompanionWindow
+    from usagetrim.core.monitor import Monitor
+
+    service = Monitor([], tmp_path)
+    original_snapshot = service.snapshot
+    window = CompanionWindow(
+        CompanionController(service),
+        executor=ImmediateExecutor(),
+        preference_executor=ImmediateExecutor(),
+    )
+    try:
+        window.poll()
+        info = window.tray.information
+        assert info["status"].text() == "Status: Active"
+        assert info["operations"].text() == "Today: No measurements"
+        assert info["net"].text() == "Net reduction: No measurements"
+        window.tray.actions["pause"].trigger()
+        window.poll()
+        assert info["status"].text() == "Status: Paused"
+        assert window.tray.actions["pause"].text() == "Resume Optimization"
+        assert info["operations"].text() == "Today: No measurements"
+
+        def unavailable():
+            raise OSError("monitor unavailable")
+
+        monkeypatch.setattr(service, "snapshot", unavailable)
+        window.refresh()
+        window.poll()
+        assert info["status"].text() == "Status: Unavailable"
+        assert info["operations"].text() == "Today: Unavailable"
+        assert info["net"].text() == "Net reduction: Unavailable"
+        assert not window.tray.actions["pause"].isEnabled()
+        monkeypatch.setattr(service, "snapshot", original_snapshot)
+        window.refresh()
+        window.poll()
+        assert info["status"].text() == "Status: Paused"
+        window.tray.actions["pause"].trigger()
+        window.poll()
+        assert info["status"].text() == "Status: Active"
+        assert window.tray.actions["pause"].text() == "Pause Optimization"
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize("compact,net", [(150, "-150"), (0, "+0")])
+def test_tray_information_preserves_net_expansion_and_actual_zero(
+    qt_app, tmp_path, mock_system_tray, monkeypatch, compact, net
+):
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.companion.qt import CompanionWindow
+    from usagetrim.core.monitor import Monitor
+
+    service = Monitor([], tmp_path)
+    service.store.record(0, compact, 0, compact, operation="retrieve", event_id="tray-net")
+    window = CompanionWindow(
+        CompanionController(service),
+        executor=ImmediateExecutor(),
+        preference_executor=ImmediateExecutor(),
+    )
+    try:
+        window.poll()
+        info = window.tray.information
+        assert info["operations"].text() == "Today: 1 operation"
+        assert info["net"].text() == f"Net reduction: {net} tokens (estimate)"
+        assert "saving" not in info["net"].text().lower()
+
+        # An error must clear previous figures, not retain stale signed numbers.
+        def unavailable():
+            raise OSError("monitor unavailable")
+
+        monkeypatch.setattr(service, "snapshot", unavailable)
+        window.refresh()
+        window.poll()
+        assert info["net"].text() == "Net reduction: Unavailable"
+        assert info["operations"].text() == "Today: Unavailable"
+    finally:
+        window.close()
+
+
 @pytest.mark.parametrize(
     "plugin,expected",
     [
