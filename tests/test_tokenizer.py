@@ -133,6 +133,7 @@ def model_token_backend(monkeypatch):
         ("gemini", 3, "legacy-o200k_base-x1.02", True),
         ("llama", 3, "utf8-bytes-div4-ceil", True),
         ("generic", 3, "utf8-bytes-div4-ceil", True),
+        ("deepseek", 3, "utf8-bytes-div4-ceil", True),
     ],
 )
 def test_model_tokens_metadata(model_token_backend, model, count, method, estimate):
@@ -227,6 +228,41 @@ def test_detect_model_family_priority_and_unknown_do_not_fall_through():
 def test_detect_model_family_empty_environment_is_unset():
     assert detect_model_family({}) is None
     assert detect_model_family({"LLM_MODEL": " ", "ANTHROPIC_MODEL": ""}) is None
+
+
+@pytest.mark.parametrize("family", list(ModelFamily))
+def test_detect_model_family_accepts_canonical_family_names(family):
+    assert detect_model_family({"LLM_MODEL": family.value}) is family
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "deepseek",
+        "deepseek-chat",
+        "deepseek-reasoner",
+        "deepseek-v3",
+        "deepseek-r1",
+        "deepseek-ai/DeepSeek-R1",
+        " DeepSeek-V3 ",
+    ],
+)
+def test_detect_deepseek_model_names(name):
+    assert detect_model_family({"LLM_MODEL": name}) is ModelFamily.DEEPSEEK
+    assert detect_model_family({"LLM_MODEL": "unknown-deepseek-model"}) is None
+
+
+@pytest.mark.parametrize("text", ["", "hello world", "漢字🦙", "x = 1\n", "\udcff"])
+def test_deepseek_uses_only_utf8_estimate(monkeypatch, text):
+    def forbidden(*args, **kwargs):
+        pytest.fail("DeepSeek must not load or consult a tokenizer backend")
+
+    monkeypatch.setattr(tokenizer, "_model_encoding", forbidden)
+    result = count_model_tokens(text, "deepseek")
+    assert result.count == count_model_tokens(text, "generic").count
+    assert result.family is ModelFamily.DEEPSEEK
+    assert result.is_estimate is True
+    assert result.method == "utf8-bytes-div4-ceil"
 
 
 def test_model_tokens_cl100k_fallback_and_cached_fallback_identity(

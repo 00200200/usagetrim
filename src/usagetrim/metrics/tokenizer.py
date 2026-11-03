@@ -27,6 +27,7 @@ class ModelFamily(Enum):
     GEMINI = "gemini"
     LLAMA = "llama"
     GENERIC = "generic"
+    DEEPSEEK = "deepseek"
 
 
 def detect_model_family(
@@ -48,6 +49,14 @@ def detect_model_family(
     )
     if not model:
         return None
+    try:
+        return ModelFamily(model)
+    except ValueError:
+        pass
+    if model in {"deepseek-chat", "deepseek-reasoner", "deepseek-v3", "deepseek-r1"} or (
+        model.startswith("deepseek-ai/") and len(model) > len("deepseek-ai/")
+    ):
+        return ModelFamily.DEEPSEEK
     if model == "claude" or model.startswith(("claude-", "claude/")):
         return ModelFamily.CLAUDE
     if model == "gemini" or model.startswith(("gemini-", "gemini/", "models/gemini-")):
@@ -166,7 +175,7 @@ def count_model_tokens(text: str, model: str) -> ModelTokenCount:
 
     Family selection is not selection of a particular provider model version.
     Only o200k_base counts are unestimated encoding counts. Claude, Gemini,
-    Llama and generic results never claim to implement those models' tokenizers.
+    Llama, DeepSeek and generic results never claim to implement those models' tokenizers.
     """
     try:
         family = ModelFamily(model)

@@ -126,12 +126,19 @@ def _emit(text: str) -> str:
 def tokens_command(
     text: Annotated[str, typer.Argument(help="Plain text to count.")],
     model: Annotated[
-        str, typer.Option(help="Model family: openai, claude, gemini, llama, generic.")
-    ] = "openai",
+        str | None,
+        typer.Option(
+            help="Family: openai, claude, gemini, llama, generic, deepseek. "
+            "Default: LLM_MODEL > ANTHROPIC_MODEL > OPENAI_MODEL, then openai."
+        ),
+    ] = None,
 ):
     """Count text with an explicit tokenizer or a labeled size estimate."""
-    from usagetrim.metrics.tokenizer import count_model_tokens
+    from usagetrim.metrics.tokenizer import count_model_tokens, detect_model_family
 
+    if model is None:
+        detected = detect_model_family()
+        model = detected.value if detected is not None else "openai"
     try:
         result = count_model_tokens(text, model)
     except ValueError as exc:
@@ -522,12 +529,20 @@ def prepare_command(
     ] = False,
     model: Annotated[
         str | None,
-        typer.Option("--model", help="Token-count family: openai, claude, gemini, llama, generic"),
+        typer.Option(
+            "--model",
+            help="Family: openai, claude, gemini, llama, generic, deepseek. "
+            "Default: LLM_MODEL > ANTHROPIC_MODEL > OPENAI_MODEL, then legacy counting.",
+        ),
     ] = None,
 ):
     """Preview shorter input before pasting it into any chat; never sends or counts usage."""
     from usagetrim.core.prepare import MAX_INPUT_BYTES, prepare_text
+    from usagetrim.metrics.tokenizer import detect_model_family
 
+    if model is None:
+        detected = detect_model_family()
+        model = detected.value if detected is not None else None
     selected_mode = "desktop" if desktop else mode
     try:
         if file is not None:
