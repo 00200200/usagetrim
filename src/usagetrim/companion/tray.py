@@ -21,10 +21,11 @@ class CompanionTray:
             ("controls", "Show Pet Controls", self._controls_triggered),
             ("pause", "Pause Optimization", window.toggle_pause),
             ("top", "Always on Top", self._top_triggered),
+            ("animations", "Mint Animations", self._animations_triggered),
             ("quit", "Quit", window.close),
         ):
             action = QAction(label, self.menu)
-            if key in {"controls", "top"}:
+            if key in {"controls", "top", "animations"}:
                 action.setCheckable(True)
                 # Explicit bool overload and Python handlers avoid Qt treating
                 # a bound native method as a zero-argument callback.
@@ -45,6 +46,10 @@ class CompanionTray:
     def _controls_triggered(self, checked: bool):
         if not self._closed:
             self.window.set_pet_controls_visible(checked)
+
+    def _animations_triggered(self, checked: bool):
+        if not self._closed:
+            self.window.animations.setChecked(checked)
 
     def refresh_availability(self):
         if self._closed:
@@ -82,6 +87,8 @@ class CompanionTray:
         self.actions["pause"].setEnabled(not window._closed and window.pause_button.isEnabled())
         self.actions["top"].setChecked(window.top.isChecked())
         self.actions["top"].setEnabled(not window._closed and window.top.isEnabled())
+        self.actions["animations"].setChecked(window.animations.isChecked())
+        self.actions["animations"].setEnabled(not window._closed)
         self.actions["quit"].setEnabled(not window._closed)
         if self.icon is not None:
             state = (

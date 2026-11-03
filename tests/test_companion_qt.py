@@ -806,3 +806,247 @@ def test_backend_quit_exits_event_loop_even_when_window_hidden(
     assert application.quit_policy is True
     assert application.quit_calls == 1
     assert len(windows) == 1 and windows[0]._closed
+
+
+def test_mint_states_follow_real_measurements_without_extra_reads(qt_app, tmp_path, monkeypatch):
+    from PySide6.QtCore import QAbstractAnimation
+
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.companion.pet import PetState
+    from usagetrim.companion.qt import CompanionWindow
+    from usagetrim.core.monitor import Monitor
+
+    service = Monitor([], tmp_path)
+    original_snapshot = service.snapshot
+    reads = []
+
+    def snapshot():
+        reads.append(True)
+        return original_snapshot()
+
+    monkeypatch.setattr(service, "snapshot", snapshot)
+    window = CompanionWindow(
+        CompanionController(service),
+        executor=ImmediateExecutor(),
+        preference_executor=ImmediateExecutor(),
+    )
+    try:
+        window.show_pet()
+        window.poll()
+        mint = window.artwork
+        assert mint.state is PetState.IDLE  # An empty history is not an error.
+        assert mint.motion_timer.isActive()
+        service.store.record(100, 20, 100, 20, event_id="mint-activity")
+        window.refresh()
+        window.poll()
+        assert mint.state is PetState.ACTIVE
+        assert mint.activity_timer.isActive()
+        assert "New local measurements" in mint.toolTip()
+        position = window.pos()
+        pixmap_key = mint.pixmap().cacheKey()
+        read_count = len(reads)
+        for _ in range(20):
+            mint.motion_timer.timeout.emit()
+        assert -3 <= mint.vertical_offset < 0
+        assert window.pos() == position
+        assert mint.pixmap().cacheKey() == pixmap_key
+        assert len(reads) == read_count
+        mint.activity_timer.timeout.emit()
+        assert mint.state is PetState.IDLE
+        window.pause_button.click()
+        window.poll()
+        assert mint.state is PetState.PAUSED
+        assert not mint.motion_timer.isActive()
+        assert mint.return_animation.state() == QAbstractAnimation.State.Running
+        mint.return_animation.setCurrentTime(mint.return_animation.duration())
+        assert mint.vertical_offset == 0
+        window.pause_button.click()
+        window.poll()
+        assert mint.state is PetState.IDLE
+        assert mint.motion_timer.isActive()
+        # Prepared previews are not new returned-operation measurements.
+        service.store.record(10, 2, 10, 2, delivery="prepared", event_id="mint-preview")
+        window.refresh()
+        window.poll()
+        assert mint.state is PetState.IDLE
+
+        def unavailable():
+            raise OSError("monitor unavailable")
+
+        monkeypatch.setattr(service, "snapshot", unavailable)
+        window.refresh()
+        window.poll()
+        assert mint.state is PetState.UNAVAILABLE
+        assert not mint.motion_timer.isActive()
+        assert not window.pause_button.isEnabled()
+        monkeypatch.setattr(service, "snapshot", snapshot)
+        window.refresh()
+        window.poll()
+        assert mint.state is PetState.IDLE
+        assert mint.motion_timer.isActive()
+        assert window.refresh_timer.interval() == 5000
+    finally:
+        window.close()
+
+
+def test_mint_activity_baseline_handles_history_reset_and_day_change(qt_app):
+    from usagetrim.companion.pet import MintArtwork, PetState
+
+    mint = MintArtwork()
+
+    def snapshot(count, date="2026-11-03", paused=False):
+        return {
+            "paused": paused,
+            "today": {"events": count} if count else None,
+            "days": [{"date": date}],
+        }
+
+    try:
+        mint.update_snapshot(snapshot(50))
+        assert mint.state is PetState.IDLE  # Existing history at startup is not activity.
+        mint.update_snapshot(snapshot(51))
+        assert mint.state is PetState.ACTIVE
+        mint.update_snapshot(snapshot(52, date="2026-11-04"))
+        assert mint.state is PetState.IDLE
+        mint.update_snapshot(snapshot(0, date="2026-11-04"))
+        assert mint.state is PetState.IDLE
+        mint.update_snapshot(snapshot(1, date="2026-11-04", paused=True))
+        assert mint.state is PetState.PAUSED
+        mint.update_snapshot(snapshot(1, date="2026-11-04"))
+        assert mint.state is PetState.IDLE
+    finally:
+        mint.close()
+
+
+def test_mint_motion_visibility_and_quit(qt_app, tmp_path, mock_system_tray):
+    from PySide6.QtCore import QAbstractAnimation
+
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.companion.pet import PetState
+    from usagetrim.companion.qt import CompanionWindow
+    from usagetrim.core.monitor import Monitor
+
+    service = Monitor([], tmp_path)
+    window = CompanionWindow(
+        CompanionController(service),
+        executor=ImmediateExecutor(),
+        preference_executor=ImmediateExecutor(),
+    )
+    try:
+        window.show_pet()
+        window.poll()
+        mint = window.artwork
+        assert mint.motion_timer.isActive()
+        window.hide_pet()
+        assert not mint.motion_timer.isActive()
+        assert not mint.activity_timer.isActive()
+        assert mint.vertical_offset == 0
+        mint.motion_timer.timeout.emit()  # Late delivery must not move hidden content.
+        assert mint.vertical_offset == 0
+        window.show_pet()
+        assert mint.motion_timer.isActive()
+        window.show_statistics()
+        assert not mint.motion_timer.isActive()
+        window.show_pet()
+        assert mint.motion_timer.isActive()
+        window.showMinimized()
+        assert not mint.motion_timer.isActive()
+        window.showNormal()
+        assert mint.motion_timer.isActive()
+        service.store.record(100, 10, 100, 10, event_id="mint-before-quit")
+        window.refresh()
+        window.poll()
+        assert mint.state is PetState.ACTIVE
+        window.tray.actions["quit"].trigger()
+        assert window._closed
+        assert not mint.motion_timer.isActive()
+        assert not mint.activity_timer.isActive()
+        assert mint.return_animation.state() == QAbstractAnimation.State.Stopped
+        mint.resume_motion()
+        mint.motion_timer.timeout.emit()
+        mint.activity_timer.timeout.emit()
+        assert not mint.motion_timer.isActive()
+        assert mint.vertical_offset == 0
+    finally:
+        window.close()
+
+
+def test_animation_preference_persists_and_tray_stays_in_sync(qt_app, tmp_path, mock_system_tray):
+    from PySide6.QtCore import QAbstractAnimation
+
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.companion.qt import CompanionWindow
+    from usagetrim.core.monitor import Monitor
+
+    controller = CompanionController(Monitor([], tmp_path / "first"))
+    window = CompanionWindow(
+        controller, executor=ImmediateExecutor(), preference_executor=ImmediateExecutor()
+    )
+    try:
+        window.show_pet()
+        window.poll()
+        assert window.animations.text() == "Mint animations: On"
+        assert window.artwork.motion_timer.isActive()
+        window.animations.setChecked(False)
+        assert window.animations.text() == "Mint animations: Off"
+        assert not window.artwork.motion_timer.isActive()
+        assert window.artwork.return_animation.state() == QAbstractAnimation.State.Stopped
+        assert window.artwork.vertical_offset == 0
+        assert not window.tray.actions["animations"].isChecked()
+    finally:
+        window.close()  # Flush the preference without delivering a debounce timer.
+    assert CompanionController().animations_enabled() is False
+    restored = CompanionWindow(
+        CompanionController(Monitor([], tmp_path / "second")),
+        executor=ImmediateExecutor(),
+        preference_executor=ImmediateExecutor(),
+    )
+    try:
+        restored.show_pet()
+        restored.poll()
+        assert not restored.animations.isChecked()
+        assert restored.animations.text() == "Mint animations: Off"
+        assert not restored.artwork.motion_timer.isActive()
+        restored.tray.actions["animations"].trigger()
+        assert restored.animations.isChecked()
+        assert restored.animations.text() == "Mint animations: On"
+        assert restored.artwork.motion_timer.isActive()
+        restored._flush_preferences()
+        restored.poll()
+        assert CompanionController().animations_enabled() is True
+    finally:
+        restored.close()
+
+
+def test_animation_label_describes_preference_while_optimization_paused(
+    qt_app, tmp_path, mock_system_tray
+):
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.companion.pet import PetState
+    from usagetrim.companion.qt import CompanionWindow
+    from usagetrim.core.monitor import Monitor
+
+    controller = CompanionController(Monitor([], tmp_path))
+    controller.set_paused(True)
+    window = CompanionWindow(
+        controller, executor=ImmediateExecutor(), preference_executor=ImmediateExecutor()
+    )
+    try:
+        window.show_pet()
+        window.poll()
+        assert window.artwork.state is PetState.PAUSED
+        assert not window.artwork.motion_timer.isActive()
+        assert window.animations.isChecked()
+        assert window.animations.text() == "Mint animations: On"
+        assert window.tray.actions["animations"].isChecked()
+        window.animations.setChecked(False)
+        assert window.animations.text() == "Mint animations: Off"
+        window.tray.actions["animations"].trigger()
+        assert window.animations.text() == "Mint animations: On"
+        assert window.artwork.state is PetState.PAUSED
+        assert not window.artwork.motion_timer.isActive()
+        window._flush_preferences()
+        window.poll()
+        assert controller.animations_enabled() is True
+    finally:
+        window.close()

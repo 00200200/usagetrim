@@ -227,8 +227,23 @@ hiding the whole Pet is disabled. If tray support disappears, controls and a
 previously hidden Pet are restored on the next availability check (every five
 seconds). Mint's right-click menu provides another route to statistics and Quit.
 Control visibility and hidden-window state are session-only; startup always keeps
-controls accessible. No animations, notifications or account-limit network
-polling are included.
+controls accessible.
+
+Mint gently floats by 2–3 pixels inside its widget, with a cached bitmap and at
+most ten idle redraws per second. The window itself does not move. A small status
+indicator and tooltip distinguish idle, paused, new measurements and unavailable
+monitor data. Activity means an increase in today's returned UsageTrim operation
+count between existing snapshots, not a running command or invented savings.
+Existing history at startup, a day rollover or a cleared history does not trigger
+activity. Missing history is idle; read errors are unavailable. Activity feedback
+is brief, and a paused pet is muted and returns gently to its neutral position.
+
+Turn off **Mint animations** in the panel or tray/right-click menu to keep Mint
+still; the preference is saved in `companion.json`. Static state indicators remain
+available. Motion stops when the Pet is hidden, minimized or replaced by the panel,
+and resumes when shown. Quit stops all pet timers and animations. There is no
+blinking or eye-layer manipulation of the original PNG, and no notifications or
+account-limit network polling. Animation adds no monitor or provider requests.
 This command leaves the
 existing macOS application unchanged; on macOS use the application below.
 

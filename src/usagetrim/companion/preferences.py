@@ -20,19 +20,22 @@ class PreferencesWriter:
         )
         self._owns_executor = executor is None
         initial = controller.window_preferences()
-        self._saved = self._value(initial["mode"], initial["position"])
+        self._saved = self._value(
+            initial["mode"], initial["position"], controller.animations_enabled()
+        )
         self._latest = self._saved
         self._pending = None
         self._inflight = None
         self._closed = False
 
     @staticmethod
-    def _value(mode, position):
-        return mode, None if position is None else tuple(position)
+    def _value(mode, position, animations):
+        return mode, None if position is None else tuple(position), animations
 
-    def queue(self, mode: str, position: list[int] | None):
+    def queue(self, mode: str, position: list[int] | None, *, animations: bool | None = None):
         if not self._closed:
-            self._latest = self._value(mode, position)
+            enabled = self._latest[2] if animations is None else animations
+            self._latest = self._value(mode, position, enabled)
 
     def poll(self):
         """Observe write success only; results are preferences, never telemetry."""
@@ -46,12 +49,13 @@ class PreferencesWriter:
             self.flush()
 
     def _submit(self, value):
-        mode, position = value
+        mode, position, animations = value
         # Only a controller and immutable argument snapshot reach the worker.
         return self._executor.submit(
             self._controller.save_window_preferences,
             mode,
             None if position is None else list(position),
+            animations,
         )
 
     def flush(self):

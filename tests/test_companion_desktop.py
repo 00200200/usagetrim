@@ -125,6 +125,22 @@ def test_window_preference_save_never_reads_monitor(monkeypatch):
     assert controller._monitor is None
 
 
+def test_animation_preferences_use_existing_atomic_settings_without_monitor(monkeypatch):
+    controller = CompanionController()
+    update_settings(custom="preserved", paused=True)
+
+    def forbidden():
+        pytest.fail("animation preferences must not read telemetry")
+
+    monkeypatch.setattr(controller, "snapshot", forbidden)
+    assert controller.animations_enabled() is True
+    controller.save_window_preferences("pet", [42, 73], animations=False)
+    assert CompanionController().animations_enabled() is False
+    assert settings()["paused"] is True and settings()["custom"] == "preserved"
+    with pytest.raises(ValueError):
+        controller.save_window_preferences("pet", None, animations="yes")
+
+
 def test_preferences_coalesce_and_drain_final_write_without_monitor(monkeypatch):
     from concurrent.futures import Future
 

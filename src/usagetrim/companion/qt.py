@@ -6,7 +6,7 @@ import os
 import platform
 from concurrent.futures import Executor, ThreadPoolExecutor
 
-from PySide6.QtCore import QPoint, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -77,6 +77,12 @@ class CompanionWindow(QWidget):
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, self.top.isChecked())
         self.top.toggled.connect(self.change_top)
         layout.addWidget(self.top)
+        self.animations = QCheckBox("Mint animations")
+        self.animations.setChecked(self.controller.animations_enabled())
+        self._update_animation_label()
+        self.artwork.set_animations_enabled(self.animations.isChecked())
+        self.animations.toggled.connect(self.change_animations)
+        layout.addWidget(self.animations)
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.clicked.connect(self.refresh)
         layout.addWidget(self.refresh_button)
@@ -202,6 +208,17 @@ class CompanionWindow(QWidget):
     def toggle_mode(self):
         self.set_mode("panel" if self._mode == "pet" else "pet")
 
+    def _update_animation_label(self):
+        state = "On" if self.animations.isChecked() else "Off"
+        self.animations.setText(f"Mint animations: {state}")
+
+    def change_animations(self, enabled: bool):
+        if not self._closed:
+            self._update_animation_label()
+            self.artwork.set_animations_enabled(enabled)
+            self._queue_preferences()
+            self._sync_tray()
+
     def set_mode(self, mode: str, *, persist: bool = True):
         if self._closed:
             return
@@ -263,7 +280,7 @@ class CompanionWindow(QWidget):
         if self._mode == "pet" and supports_positioning():
             position = [self.x(), self.y()]
             self._pet_position = position
-        self._preferences.queue(self._mode, position)
+        self._preferences.queue(self._mode, position, animations=self.animations.isChecked())
         self.preferences_timer.start()
 
     def _flush_preferences(self):
@@ -328,6 +345,7 @@ class CompanionWindow(QWidget):
             # The GUI boundary must survive monitor/storage failures. Do not show
             # raw exception payloads, which may contain private filesystem paths.
             self._snapshot = None
+            self.artwork.update_snapshot(None)
             self.pause_button.setText("Pause unavailable")
             self.summary.setText("Local measurements unavailable until the next refresh.")
             self.status.setText("Local monitor unavailable. Retrying on the next refresh.")
@@ -336,6 +354,7 @@ class CompanionWindow(QWidget):
             self.top.blockSignals(False)
         else:
             self._snapshot = snapshot
+            self.artwork.update_snapshot(snapshot)
             today = snapshot.get("today")
             if today is None:
                 self.summary.setText("No returned UsageTrim measurements today.")
@@ -376,13 +395,25 @@ class CompanionWindow(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        if hasattr(self, "artwork"):
+            self.artwork.resume_motion()
         if hasattr(self, "tray"):
             self._sync_tray()
 
     def hideEvent(self, event):
         super().hideEvent(event)
+        if hasattr(self, "artwork"):
+            self.artwork.suspend_motion()
         if hasattr(self, "tray"):
             self._sync_tray()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "artwork"):
+            if self.isMinimized():
+                self.artwork.suspend_motion()
+            else:
+                self.artwork.resume_motion()
 
     def closeEvent(self, event):
         if self._closed:
@@ -402,6 +433,8 @@ class CompanionWindow(QWidget):
             event.ignore()
             return
         self._closed = True
+        self.artwork.shutdown()
+        self.animations.setEnabled(False)
         if self.tray is not None:
             self.tray.close()
         self.refresh_timer.stop()

@@ -32,6 +32,9 @@ class CompanionController:
     def always_on_top(self) -> bool:
         return settings().get("companion_qt_always_on_top") is True
 
+    def animations_enabled(self) -> bool:
+        return settings().get("companion_qt_animations") is not False
+
     def set_always_on_top(self, value: bool) -> None:
         if type(value) is not bool:
             raise ValueError("always_on_top must be boolean")
@@ -52,10 +55,16 @@ class CompanionController:
             "position": position,
         }
 
-    def save_window_preferences(self, mode: str, position: list[int] | None) -> dict:
+    def save_window_preferences(
+        self, mode: str, position: list[int] | None, animations: bool | None = None
+    ) -> dict:
         if mode not in {"panel", "pet"}:
             raise ValueError("invalid companion mode")
         changes = {"companion_qt_mode": mode}
+        if animations is not None:
+            if type(animations) is not bool:
+                raise ValueError("animations must be boolean")
+            changes["companion_qt_animations"] = animations
         if position is not None:
             if not (
                 isinstance(position, list)
