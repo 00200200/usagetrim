@@ -1,6 +1,66 @@
 from __future__ import annotations
 
+import pytest
+
 from usagetrim.core.prompt_optimizer import align_prompt, lint_prompt, minify_prompt
+
+
+@pytest.mark.parametrize("model", ["openai", "claude", "gemini", "llama", "generic"])
+@pytest.mark.parametrize(
+    "text",
+    ["", "   ", "Keep 漢字🙂.\n", "Current time: 12:00\nPlease ensure you run tests.\n"],
+)
+def test_prompt_model_statistics_transforms_and_offline(monkeypatch, model, text):
+    import tiktoken.load
+    import tiktoken.registry
+
+    from usagetrim.core import prompt_optimizer as prompts
+    from usagetrim.metrics import tokenizer
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("model prompt counting must not load vocabulary or use legacy counting")
+
+    monkeypatch.setattr(
+        prompts,
+        "count_tokens",
+        lambda value: tokenizer.TokenCount(len(value), len(value), len(value)),
+    )
+    legacy_aligned = prompts.align_prompt(text)
+    legacy_minified = prompts.minify_prompt(text)
+    legacy_stabilized = prompts.stabilize_cache_prefix(text)
+    assert prompts.align_prompt(text, model=None) == legacy_aligned
+    assert prompts.minify_prompt(text, model=None) == legacy_minified
+    assert prompts.stabilize_cache_prefix(text, model=None) == legacy_stabilized
+
+    monkeypatch.setattr(prompts, "count_tokens", forbidden)
+    monkeypatch.setattr(tiktoken.load, "read_file", forbidden)
+    monkeypatch.setattr(tokenizer.tiktoken, "get_encoding", forbidden)
+    monkeypatch.setattr(tokenizer, "_O200K_ENC", None)
+    monkeypatch.setattr(tokenizer, "_CL100K_ENC", None)
+    monkeypatch.setattr(tiktoken.registry, "ENCODINGS", {})
+    aligned = prompts.align_prompt(text, model=model)
+    minified = prompts.minify_prompt(text, model=model)
+    assert aligned.aligned_text == legacy_aligned.aligned_text
+    assert minified.minified_text == legacy_minified.minified_text
+    assert prompts.stabilize_cache_prefix(text, model=model) == legacy_stabilized
+    before = tokenizer.count_model_tokens(text, model).count
+    after = tokenizer.count_model_tokens(minified.minified_text, model).count
+    assert aligned.original_tokens == minified.original_tokens == before
+    assert aligned.aligned_tokens == tokenizer.count_model_tokens(aligned.aligned_text, model).count
+    assert minified.minified_tokens == after
+    assert minified.saved_tokens == max(0, before - after)
+    assert minified.reduction_pct == (
+        round(100 * minified.saved_tokens / before, 1) if before else 0.0
+    )
+
+
+@pytest.mark.parametrize("text", ["", "Keep instructions."])
+@pytest.mark.parametrize("function", ["align_prompt", "minify_prompt", "stabilize_cache_prefix"])
+def test_prompt_functions_reject_unknown_model(function, text):
+    from usagetrim.core import prompt_optimizer as prompts
+
+    with pytest.raises(ValueError, match="Unknown model"):
+        getattr(prompts, function)(text, model="unknown")
 
 
 def test_lint_clean_prompt():

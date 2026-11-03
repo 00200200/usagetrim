@@ -99,6 +99,22 @@ def test_optimizer_model_recounts_candidates_instead_of_foreign_statistics(
     assert result.optimized_tokens == tokenizer.count_model_tokens(result.text, "generic").count
 
 
+def test_optimizer_passes_model_to_prompt_alignment(monkeypatch, model_optimizer):
+    from types import SimpleNamespace
+
+    optimizer, _, _ = model_optimizer
+    calls = []
+
+    def align(text, *, model):
+        calls.append(model)
+        return SimpleNamespace(aligned_text=text)
+
+    monkeypatch.setattr(optimizer, "lint_prompt", lambda text: {"issues": ["dynamic prefix"]})
+    monkeypatch.setattr(optimizer, "align_prompt", align)
+    optimizer.optimize_context("Current time: 12:00\n" + "Keep rules.\n" * 20, model="llama")
+    assert calls == ["llama"]
+
+
 def test_optimizer_unknown_model_precedes_cache(monkeypatch):
     from usagetrim.core import optimizer
 

@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from usagetrim.metrics.tokenizer import count_tokens
+from usagetrim.metrics.tokenizer import count_model_tokens, count_tokens
 
 _TIMESTAMP_PATTERN = re.compile(
     r"\b(?:today(?:'s)? date|current time|timestamp|date is|time is|utc|iso8601)\b[^\n]*|"
@@ -86,10 +86,17 @@ def lint_prompt(text: str) -> dict[str, Any]:
     }
 
 
-def align_prompt(text: str) -> PromptAlignResult:
+def _prompt_size(text: str, model: str | None) -> int:
+    """Use local model-family counting (possibly estimated) or the legacy counter."""
+    if model is not None:
+        return count_model_tokens(text, model).count
+    return count_tokens(text).openai
+
+
+def align_prompt(text: str, *, model: str | None = None) -> PromptAlignResult:
     """Restructure prompt: static invariants at the top, volatile variables at the bottom."""
     lines = text.splitlines(keepends=True)
-    orig_tokens = count_tokens(text).openai
+    orig_tokens = _prompt_size(text, model)
 
     lint_res = lint_prompt(text)
     issues = lint_res["issues"]
@@ -125,7 +132,7 @@ def align_prompt(text: str) -> PromptAlignResult:
         )
 
     aligned_text = "\n".join(sections).strip() + "\n"
-    aligned_tokens = count_tokens(aligned_text).openai
+    aligned_tokens = _prompt_size(aligned_text, model)
 
     # Post-check score
     new_lint = lint_prompt(aligned_text)
@@ -200,15 +207,16 @@ class PromptMinifyResult:
         }
 
 
-def minify_prompt(text: str) -> PromptMinifyResult:
+def minify_prompt(text: str, *, model: str | None = None) -> PromptMinifyResult:
     """Minify system prompts, CLAUDE.md, and AGENTS.md instructions without semantic loss.
 
     Removes markdown comments, collapses hyper-verbose phrasing, strips excessive blank lines,
     and normalizes list indentation to save 20-40% prompt tokens.
     """
-    orig_tokens = count_tokens(text).openai
+    orig_tokens = _prompt_size(text, model)
     if not text.strip():
-        return PromptMinifyResult(0, 0, 0, 0.0, text)
+        unchanged_tokens = 0 if model is None else orig_tokens
+        return PromptMinifyResult(unchanged_tokens, unchanged_tokens, 0, 0.0, text)
 
     # 1. Strip HTML comments (<!-- ... -->)
     content = re.sub(r"<!--[\s\S]*?-->", "", text)
@@ -243,7 +251,7 @@ def minify_prompt(text: str) -> PromptMinifyResult:
         cleaned_lines.append(stripped)
 
     minified_text = "\n".join(cleaned_lines).strip() + "\n"
-    minified_tokens = count_tokens(minified_text).openai
+    minified_tokens = _prompt_size(minified_text, model)
     saved = max(0, orig_tokens - minified_tokens)
     pct = round((saved / orig_tokens * 100.0), 1) if orig_tokens > 0 else 0.0
 
@@ -262,7 +270,7 @@ _VOLATILE_PATH_PATTERN = re.compile(
 )
 
 
-def stabilize_cache_prefix(text: str) -> str:
+def stabilize_cache_prefix(text: str, *, model: str | None = None) -> str:
     """Normalize volatile elements in text prefixes to protect prompt cache hits.
 
     1. Normalizes CRLF \\r\\n to \\n and strips trailing whitespace.
@@ -270,13 +278,16 @@ def stabilize_cache_prefix(text: str) -> str:
        to dynamic context sections so that Anthropic (1024-token) and OpenAI (128-token)
        prompt caching achieves optimal hit rates.
     """
+    if model is not None:
+        count_model_tokens("", model)
     if not text.strip():
         return text
 
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     normalized = re.sub(r"\n{3,}", "\n\n", normalized)
 
-    aligned = align_prompt(normalized).aligned_text
+    model_options = {} if model is None else {"model": model}
+    aligned = align_prompt(normalized, **model_options).aligned_text
     stabilized = _VOLATILE_PATH_PATTERN.sub("<tmpdir>", aligned)
 
     return stabilized

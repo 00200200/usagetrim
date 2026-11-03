@@ -214,7 +214,7 @@ def model_prepare_backend(monkeypatch):
     monkeypatch.setattr(optimizer, "optimize_context", optimize)
     monkeypatch.setattr(specialized, "filter_traceback", lambda text: text)
     monkeypatch.setattr(specialized, "filter_dev_server_logs", lambda text: text)
-    monkeypatch.setattr(prompt_optimizer, "stabilize_cache_prefix", lambda text: text)
+    monkeypatch.setattr(prompt_optimizer, "stabilize_cache_prefix", lambda text, **kwargs: text)
     return prepare, tokenizer, stored, calls
 
 
@@ -320,6 +320,20 @@ def test_prepare_model_compares_candidates_with_selected_counter(
         lambda *args, **kwargs: SimpleNamespace(text="expanded " * 100, distilled_tokens=0),
     )
     assert prepare_text(raw, mode="summary", model="generic")["text"] == raw
+
+
+def test_prepare_passes_model_to_prefix_stabilization(monkeypatch, model_prepare_backend):
+    from usagetrim.core import prompt_optimizer
+
+    calls = []
+
+    def stabilize(text, *, model):
+        calls.append(model)
+        return text
+
+    monkeypatch.setattr(prompt_optimizer, "stabilize_cache_prefix", stabilize)
+    prepare_text("Keep every instruction.", mode="desktop", model="llama")
+    assert calls == ["llama"]
 
 
 def test_prepare_unknown_model_precedes_transforms_and_cache(monkeypatch):

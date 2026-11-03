@@ -58,7 +58,7 @@ def prepare_text(
 
         tb_filtered = filter_traceback(redacted)
         dev_filtered = filter_dev_server_logs(tb_filtered)
-        stabilized = stabilize_cache_prefix(dev_filtered)
+        stabilized = stabilize_cache_prefix(dev_filtered, **model_options)
         candidate = optimize_context(stabilized, budget=budget, **model_options).text
     elif mode == "optimize" and redacted.strip():
         from usagetrim.core.optimizer import optimize_context

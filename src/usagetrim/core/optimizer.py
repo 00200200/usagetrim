@@ -256,7 +256,8 @@ def optimize_context(
     elif preserve_prompt_prefix:
         lint = lint_prompt(working_text)
         if lint["issues"]:
-            align_res = align_prompt(working_text)
+            model_options = {} if model is None else {"model": model}
+            align_res = align_prompt(working_text, **model_options)
             working_text = align_res.aligned_text
             primary_mode = "prompt_cache_align"
             pipeline_stages.append("prompt_cache_alignment")
