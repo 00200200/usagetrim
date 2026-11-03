@@ -41,7 +41,7 @@ dependencies = [
 
 [project.optional-dependencies]
 companion = [
-  "PySide6-Essentials>=6.6,<7",
+  "PySide6-Essentials>=6.6,!=6.12.0,<7",
 ]
 semantic = [
   "fastembed>=0.7.4,<1",
