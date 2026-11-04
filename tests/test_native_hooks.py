@@ -6,6 +6,8 @@ import shutil
 import stat
 import subprocess
 import sys
+import sysconfig
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -208,6 +210,45 @@ def test_powershell_wrapper_bootstrap_preserves_virtualenv_python(tmp_path, monk
     assert str(python.resolve()).replace("'", "''") not in snippet
 
 
+def _write_native_test_command(path, source):
+    """Use a real console launcher on Windows and a shebang script on POSIX."""
+    if os.name == "nt":
+        launcher = Path(sysconfig.get_path("scripts")) / "usagetrim.exe"
+        assert launcher.is_file(), "Install UsageTrim before testing Windows native hooks"
+        payload = launcher.read_bytes()
+        # Both distlib and uv launchers contain a ZIP entry point. uv embeds it
+        # in PE resources, so preserve its size and every surrounding byte rather
+        # than truncating the executable as for an appended distlib archive.
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            archive_start = min(info.header_offset for info in archive.infolist())
+            end_record = payload.index(b"PK\x05\x06", archive.start_dir)
+            archive_end = end_record + 22 + len(archive.comment)
+        archive_size = archive_end - archive_start
+        entry_point = io.BytesIO()
+        with zipfile.ZipFile(entry_point, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("__main__.py", source)
+        padding = archive_size - len(entry_point.getvalue())
+        assert 0 <= padding <= 65535, "Test entry point must fit the installed launcher ZIP"
+        with zipfile.ZipFile(entry_point, "a") as archive:
+            archive.comment = b"\0" * padding
+        path = path.with_suffix(".exe")
+        path.write_bytes(payload[:archive_start] + entry_point.getvalue() + payload[archive_end:])
+    else:
+        path.write_text(f"#!{sys.executable}\n" + source)
+        path.chmod(0o755)
+    return path
+
+
+@pytest.fixture
+def powershell_executable(tmp_path):
+    bin_dir = tmp_path / "native test bin"
+    bin_dir.mkdir()
+    source = "import sys\nprint('\\n'.join(sys.argv[1:]))\n"
+    executable = _write_native_test_command(bin_dir / "usagetrim", source)
+    _write_native_test_command(bin_dir / "docker", source)
+    return executable
+
+
 def _powershell_assert_shims_active(*names):
     commands = ", ".join(f"'{name}'" for name in names)
     return """
@@ -257,13 +298,13 @@ def test_powershell_shell_wrapper_routes_argv_and_preserves_native_arguments(tmp
     for name in {argv[0] for argv, _ in _SHELL_ROUTING_CASES if argv} | {"usagetrim"}:
         if "/" in name or name == "cd":
             continue
-        path = bin_dir / name
-        path.write_text(
-            f"#!{sys.executable}\nimport json, os, sys\n"
-            "print(json.dumps([os.path.basename(sys.argv[0]), *sys.argv[1:]]))\n"
-            "sys.exit(17)\n"
+        _write_native_test_command(
+            bin_dir / name,
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            "print(json.dumps([Path(sys.argv[0]).stem, *sys.argv[1:]]))\n"
+            "sys.exit(17)\n",
         )
-        path.chmod(0o755)
     special = ["space name", "$(touch PWNED)", "; touch PWNED", "", "a\nb", "'\"\\"]
     cases = [
         *_SHELL_ROUTING_CASES,
@@ -300,7 +341,7 @@ exit 0
         cwd=tmp_path,
         text=True,
         capture_output=True,
-        timeout=30,
+        timeout=120,
         env={
             **os.environ,
             "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
@@ -318,8 +359,8 @@ exit 0
     assert not (tmp_path / "PWNED").exists()
 
 
-@pytest.mark.parametrize("case", ["pipeline", "failure", "quoted_pathspec"])
-def test_powershell_literal_native_command_semantics(tmp_path, executable, case):
+@pytest.mark.parametrize("case", ["pipeline", "failure", "success", "quoted_pathspec"])
+def test_powershell_literal_native_command_semantics(tmp_path, powershell_executable, case):
     pwsh = shutil.which("pwsh")
     if pwsh is None:
         pytest.skip(f"pwsh is not installed: literal {case} regression")
@@ -337,6 +378,11 @@ def test_powershell_literal_native_command_semantics(tmp_path, executable, case)
     commands = {
         "pipeline": "'review-pipeline-payload' | git hash-object --stdin\n",
         "failure": """git definitely-invalid-review-command 2>$null && Write-Output 'WRONG-SUCCESS-BRANCH'
+$nativeSuccess = $?
+$nativeCode = $LASTEXITCODE
+Write-Output ("{0}|{1}" -f $nativeSuccess, $nativeCode)
+""",
+        "success": """git ls-files root.py && Write-Output 'SUCCESS-BRANCH'
 $nativeSuccess = $?
 $nativeCode = $LASTEXITCODE
 Write-Output ("{0}|{1}" -f $nativeSuccess, $nativeCode)
@@ -368,7 +414,7 @@ if ($LASTEXITCODE -ne 0 -or ($probe | ConvertTo-Json -Compress) -cne '["run","--
             timeout=15,
             env={
                 **os.environ,
-                "PATH": str(executable.parent) + os.pathsep + os.environ["PATH"],
+                "PATH": str(powershell_executable.parent) + os.pathsep + os.environ["PATH"],
                 "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
                 "WRAPPER_FILE": str(profile),
             },
@@ -377,11 +423,73 @@ if ($LASTEXITCODE -ne 0 -or ($probe | ConvertTo-Json -Compress) -cne '["run","--
         outputs.append(result.stdout.splitlines())
     assert outputs[1] == outputs[0]
     if case == "pipeline":
-        assert len(outputs[0]) == 1 and len(outputs[0][0]) == 40
+        expected = subprocess.run(
+            [git, "hash-object", "--stdin"],
+            input=("review-pipeline-payload" + os.linesep).encode("utf-8"),
+            capture_output=True,
+            check=True,
+            timeout=5,
+        )
+        assert outputs[0] == expected.stdout.decode("utf-8").splitlines()
     elif case == "failure":
         assert outputs[0] == ["False|1"]
+    elif case == "success":
+        assert outputs[0] == ["root.py", "SUCCESS-BRANCH", "True|0"]
     else:
         assert outputs[0] == ["nested/child.py", "root.py"]
+
+
+@pytest.mark.parametrize("exit_code", [0, 17])
+def test_powershell_intercepted_native_command_semantics(tmp_path, exit_code):
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        pytest.skip("pwsh is not installed")
+    bin_dir = tmp_path / "native test bin"
+    bin_dir.mkdir()
+    source = (
+        "import json, sys\n"
+        "print(json.dumps({'argv': sys.argv[1:], 'stdin': sys.stdin.read()}))\n"
+        f"sys.exit({exit_code})\n"
+    )
+    for name in ("docker", "usagetrim"):
+        _write_native_test_command(bin_dir / name, source)
+    (tmp_path / "root.py").write_text("root = True\n")
+    profile = tmp_path / "profile.ps1"
+    hooks.install_shell_wrapper("powershell", profile)
+    script = tmp_path / "test.ps1"
+    script.write_text(
+        "$ErrorActionPreference = 'Stop'\n. $env:WRAPPER_FILE\n"
+        + _powershell_assert_shims_active("docker")
+        + """
+'intercepted-pipeline-payload' | docker build '*.py' && Write-Output 'SUCCESS-BRANCH'
+$nativeSuccess = $?
+$nativeCode = $LASTEXITCODE
+Write-Output ("{0}|{1}" -f $nativeSuccess, $nativeCode)
+exit 0
+"""
+    )
+    result = subprocess.run(
+        [pwsh, "-NoProfile", "-NonInteractive", "-File", str(script)],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+            "WRAPPER_FILE": str(profile),
+        },
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    # The run prefix proves interception: the original docker launcher emits
+    # only build/*.py, even if a shim directory happens to exist on PATH.
+    assert json.loads(lines[0]) == {
+        "argv": ["run", "--", "docker", "build", "*.py"],
+        "stdin": "intercepted-pipeline-payload\n",
+    }
+    assert lines[1:] == (["SUCCESS-BRANCH", "True|0"] if exit_code == 0 else ["False|17"])
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX native exec bootstrap")
@@ -602,10 +710,15 @@ def test_native_powershell_shim_refuses_user_modifications_and_preserves_user_fi
     assert user_file.read_bytes() == b"keep me"
 
 
-def test_powershell_shell_wrapper_preserves_alias_and_function(tmp_path, executable):
+def test_powershell_shell_wrapper_preserves_alias_and_function(tmp_path, powershell_executable):
     pwsh = shutil.which("pwsh")
     if pwsh is None:
         pytest.skip("pwsh is not installed")
+    for name in ("git", "pytest"):
+        _write_native_test_command(
+            powershell_executable.parent / name,
+            "raise SystemExit('Original application shadowed a user command')\n",
+        )
     profile = tmp_path / "profile.ps1"
     hooks.install_shell_wrapper("powershell", profile)
     script = tmp_path / "test.ps1"
@@ -617,7 +730,7 @@ Set-Alias -Name git -Value UserGit
 function pytest { 'user-function' }
 . $env:WRAPPER_FILE
 """
-        + _powershell_assert_shims_active("docker")
+        + _powershell_assert_shims_active("git", "pytest", "docker")
         + """
 git diff
 pytest -q
@@ -629,10 +742,10 @@ exit 0
         [pwsh, "-NoProfile", "-NonInteractive", "-File", str(script)],
         text=True,
         capture_output=True,
-        timeout=5,
+        timeout=20,
         env={
             **os.environ,
-            "PATH": str(executable.parent) + os.pathsep + os.environ["PATH"],
+            "PATH": str(powershell_executable.parent) + os.pathsep + os.environ["PATH"],
             "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
             "WRAPPER_FILE": str(profile),
         },
