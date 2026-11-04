@@ -30,6 +30,35 @@ def test_startup(monkeypatch):
     sse.SSEApplication(host="0.0.0.0", auth_token="secret")
 
 
+def read_message(stream, timeout=10):
+    """Bound the entire response wait, even if keepalives or partial lines arrive."""
+    connection = stream.fp.raw._sock
+
+    def expire():
+        try:
+            connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass  # The test may already have closed the connection.
+
+    timer = threading.Timer(timeout, expire)
+    timer.daemon = True
+    timer.start()
+    try:
+        while True:
+            line = stream.readline()
+            if line == b"event: message\n":
+                break
+            assert line in {b": keepalive\n", b"\n"}, line
+        payload = stream.readline()
+        assert payload.startswith(b"data: "), payload
+        assert stream.readline() == b"\n"
+        return payload.removeprefix(b"data: ")
+    finally:
+        timer.cancel()
+        timer.join(timeout=2)
+        assert not timer.is_alive()
+
+
 @pytest.mark.parametrize("profile", ["minimal", "coding", "desktop", "full"])
 def test_real_http_sse(profile, tmp_path):
     uvicorn = pytest.importorskip("uvicorn")
@@ -82,14 +111,8 @@ def test_real_http_sse(profile, tmp_path):
             payload = json.dumps(message).encode()
             with request(endpoint, payload) as response:
                 assert response.status == 202
-            while True:
-                line = stream.readline()
-                if line == b"event: message\n":
-                    break
-                assert line in {b": keepalive\n", b"\n"}, line
-            wire_response = stream.readline().removeprefix(b"data: ")
+            wire_response = read_message(stream)
             response = json.loads(wire_response)
-            assert stream.readline() == b"\n"
             assert response["id"] == index
             if method == "initialize":
                 assert response["result"]["protocolVersion"] == "2024-11-05"
@@ -127,71 +150,89 @@ def test_limits_and_disconnect(monkeypatch):
             "method": "GET",
             "path": "/sse",
             "headers": [(b"host", b"localhost")],
+            "client": ("127.0.0.1", 12345),
         }
         task = asyncio.create_task(application(scope, received.get, send))
-        await sent.get()
-        endpoint = (await sent.get())["body"].decode().split("data: ")[1].strip()
+        try:
+            await asyncio.wait_for(sent.get(), 2)
+            endpoint = (
+                (await asyncio.wait_for(sent.get(), 2))["body"].decode().split("data: ")[1].strip()
+            )
 
-        async def post(body, headers=()):
+            async def post(body, headers=()):
+                events = []
+
+                async def receive():
+                    return {"type": "http.request", "body": body}
+
+                async def collect(event):
+                    events.append(event)
+
+                await asyncio.wait_for(
+                    application(
+                        {
+                            **scope,
+                            "method": "POST",
+                            "path": "/messages",
+                            "query_string": endpoint.split("?")[1].encode(),
+                            "headers": [
+                                *scope["headers"],
+                                (b"content-type", b"application/json"),
+                                *headers,
+                            ],
+                        },
+                        receive,
+                        collect,
+                    ),
+                    2,
+                )
+                return events[0]["status"]
+
+            monkeypatch.setattr(sse, "MAX_REQUEST_BYTES", 10)
+            assert await post(b"x" * 11) == 413
+            assert await post(b"{") == 400
+            session = next(iter(application.sessions.values()))
+            for _ in range(sse.QUEUE_SIZE):
+                session.incoming.put_nowait(b"{}")
+                application.pending_request_bytes += sse.MAX_REQUEST_BYTES
+            assert await post(b"{}") == 429
+            await received.put({"type": "http.disconnect"})
+            await asyncio.wait_for(task, 2)
+            assert not application.sessions
+            assert await post(b"{}") == 404
             events = []
-
-            async def receive():
-                return {"type": "http.request", "body": body}
 
             async def collect(event):
                 events.append(event)
 
             await application(
-                {
-                    **scope,
-                    "method": "POST",
-                    "path": "/messages",
-                    "query_string": endpoint.split("?")[1].encode(),
-                    "headers": [
-                        *scope["headers"],
-                        (b"content-type", b"application/json"),
-                        *headers,
-                    ],
-                },
-                receive,
-                collect,
+                {**scope, "headers": [(b"host", b"evil.example")]}, received.get, collect
             )
-            return events[0]["status"]
-
-        monkeypatch.setattr(sse, "MAX_REQUEST_BYTES", 10)
-        assert await post(b"x" * 11) == 413
-        assert await post(b"{") == 400
-        session = next(iter(application.sessions.values()))
-        for _ in range(sse.QUEUE_SIZE):
-            session.incoming.put_nowait(b"{}")
-            application.pending_request_bytes += sse.MAX_REQUEST_BYTES
-        assert await post(b"{}") == 429
-        await received.put({"type": "http.disconnect"})
-        await asyncio.wait_for(task, 2)
-        assert not application.sessions
-        assert await post(b"{}") == 404
-        events = []
-
-        async def collect(event):
-            events.append(event)
-
-        await application({**scope, "headers": [(b"host", b"evil.example")]}, received.get, collect)
-        assert events[0]["status"] == 403
+            assert events[0]["status"] == 403
+        finally:
+            await received.put({"type": "http.disconnect"})
+            await asyncio.wait_for(task, 2)
 
     asyncio.run(scenario())
 
 
 @asynccontextmanager
-async def asgi_session(application):
+async def asgi_session(application, message_send=None):
     received, sent = asyncio.Queue(), asyncio.Queue()
-    scope = {"type": "http", "method": "GET", "path": "/sse", "headers": [(b"host", b"localhost")]}
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/sse",
+        "headers": [(b"host", b"localhost")],
+        "client": ("127.0.0.1", 12345),
+    }
 
     async def send(event):
+        if message_send is not None and event.get("body", b"").startswith(b"event: message"):
+            await message_send(event)
         await sent.put(event)
 
     task = asyncio.create_task(application(scope, received.get, send))
-    await asyncio.wait_for(sent.get(), 2)
-    endpoint = (await sent.get())["body"].decode().split("data: ")[1].strip()
 
     async def post(message):
         events = []
@@ -202,20 +243,27 @@ async def asgi_session(application):
         async def collect(event):
             events.append(event)
 
-        await application(
-            {
-                **scope,
-                "method": "POST",
-                "path": "/messages",
-                "query_string": endpoint.split("?")[1].encode(),
-                "headers": [*scope["headers"], (b"content-type", b"application/json")],
-            },
-            receive,
-            collect,
+        await asyncio.wait_for(
+            application(
+                {
+                    **scope,
+                    "method": "POST",
+                    "path": "/messages",
+                    "query_string": endpoint.split("?")[1].encode(),
+                    "headers": [*scope["headers"], (b"content-type", b"application/json")],
+                },
+                receive,
+                collect,
+            ),
+            2,
         )
         return events[0]["status"]
 
     try:
+        await asyncio.wait_for(sent.get(), 2)
+        endpoint = (
+            (await asyncio.wait_for(sent.get(), 2))["body"].decode().split("data: ")[1].strip()
+        )
         yield post, received, sent, task
     finally:
         await received.put({"type": "http.disconnect"})
@@ -382,3 +430,304 @@ def test_remote_listen_without_auth_is_rejected(monkeypatch):
     with pytest.raises(ValueError, match=r"requires --auth-token"):
         sse.SSEApplication(host="0.0.0.0")
     assert result.exit_code == 2
+
+
+def test_execute_cancellation_keeps_lock_until_thread_finishes(monkeypatch):
+    started, release = threading.Event(), threading.Event()
+
+    def respond(request, **kwargs):
+        started.set()
+        assert release.wait(5), "Test did not release synchronous handler"
+        return {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+    monkeypatch.setattr(sse, "_respond", respond)
+
+    async def scenario():
+        application = sse.SSEApplication()
+        application.pending_request_bytes = sse.MAX_REQUEST_BYTES
+        await application.execution_lock.acquire()
+        execution = asyncio.create_task(application._execute(b"{}"))
+        attempted, entered = asyncio.Event(), asyncio.Event()
+
+        async def next_handler():
+            attempted.set()
+            async with application.execution_lock:
+                entered.set()
+
+        waiter = None
+        try:
+            assert await asyncio.to_thread(started.wait, 2)
+            execution.cancel()
+            waiter = asyncio.create_task(next_handler())
+            await asyncio.wait_for(attempted.wait(), 2)
+            assert application.execution_lock.locked()
+            assert application.pending_request_bytes == sse.MAX_REQUEST_BYTES
+            assert not entered.is_set()
+            assert not execution.done()
+            execution.cancel()  # Repeated cancellation must not release ownership either.
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.gather(execution, return_exceptions=True), 2)
+            if waiter is not None:
+                await asyncio.wait_for(waiter, 2)
+        assert execution.cancelled()
+        assert entered.is_set()
+        assert application.pending_request_bytes == 0
+        assert not application.execution_lock.locked()
+
+    asyncio.run(scenario())
+
+
+def test_response_limit_closes_session_without_partial_json(monkeypatch):
+    def respond(request, **kwargs):
+        return {"jsonrpc": "2.0", "id": 1, "result": "x" * 1024}
+
+    monkeypatch.setattr(sse, "_respond", respond)
+
+    async def scenario():
+        application = sse.SSEApplication(max_response_bytes=128, max_pending_response_bytes=1024)
+        async with asgi_session(application) as session:
+            assert await session[0]({"id": 1}) == 202
+            await asyncio.wait_for(asyncio.shield(session[3]), 2)
+            final = await asyncio.wait_for(session[2].get(), 2)
+            assert final == {"type": "http.response.body", "body": b"", "more_body": False}
+            assert session[2].empty()
+            assert not application.sessions
+            assert application.pending_request_bytes == 0
+            assert application.pending_response_bytes == 0
+
+    asyncio.run(scenario())
+
+
+def test_response_budget_counts_sending_and_queued_frames_and_disconnect(monkeypatch):
+    monkeypatch.setattr(sse, "_respond", lambda request, **kwargs: {"id": request["id"]})
+
+    async def scenario():
+        limit = 128
+        maximum = 2 * (limit + sse.SSE_MESSAGE_OVERHEAD)
+        application = sse.SSEApplication(
+            max_response_bytes=limit, max_pending_response_bytes=maximum
+        )
+        sending, release = asyncio.Event(), asyncio.Event()
+
+        async def blocked_send(event):
+            sending.set()
+            await release.wait()
+
+        async with asgi_session(application, blocked_send) as first:
+            assert await first[0]({"id": 1}) == 202
+            await asyncio.wait_for(sending.wait(), 2)
+            assert application.pending_response_bytes > 0
+            # A sending frame leaves too little room for the next full reservation.
+            async with asgi_session(application) as second:
+                assert await second[0]({"id": 2}) == 202
+                await asyncio.wait_for(asyncio.shield(second[3]), 2)
+                final = await asyncio.wait_for(second[2].get(), 2)
+                assert final == {"type": "http.response.body", "body": b"", "more_body": False}
+                assert second[2].empty()
+                assert 0 < application.pending_response_bytes <= maximum
+            await first[1].put({"type": "http.disconnect"})
+            await asyncio.wait_for(asyncio.shield(first[3]), 2)
+        assert application.pending_response_bytes == 0
+        assert application.pending_request_bytes == 0
+
+    asyncio.run(scenario())
+
+
+def test_response_reservations_release_after_send_and_queue_disconnect(monkeypatch):
+    monkeypatch.setattr(sse, "_respond", lambda request, **kwargs: {"id": request["id"]})
+
+    async def scenario():
+        application = sse.SSEApplication(max_response_bytes=128, max_pending_response_bytes=2048)
+        async with asgi_session(application) as session:
+            assert await session[0]({"id": 1}) == 202
+            event = await asyncio.wait_for(session[2].get(), 2)
+            assert json.loads(event["body"].split(b"data: ")[1]) == {"id": 1}
+            assert application.pending_response_bytes == 0
+
+        sending, release, queued = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def blocked_send(event):
+            sending.set()
+            await release.wait()
+
+        async with asgi_session(application, blocked_send) as session:
+            assert await session[0]({"id": 2}) == 202
+            await asyncio.wait_for(sending.wait(), 2)
+            stored = next(iter(application.sessions.values()))
+            original_put = stored.outgoing.put
+
+            async def record_put(value):
+                await original_put(value)
+                queued.set()
+
+            monkeypatch.setattr(stored.outgoing, "put", record_put)
+            assert await session[0]({"id": 3}) == 202
+            await asyncio.wait_for(queued.wait(), 2)
+            assert stored.outgoing.qsize() == 1
+            assert application.pending_response_bytes > 0
+        assert application.pending_response_bytes == 0
+        assert application.pending_request_bytes == 0
+
+    asyncio.run(scenario())
+
+
+def test_serialization_runs_off_loop_and_releases_response_object(monkeypatch):
+    import weakref
+
+    class Response(dict):
+        pass
+
+    async def scenario():
+        loop_thread = threading.get_ident()
+        references = []
+
+        def respond(request, **kwargs):
+            assert threading.get_ident() != loop_thread
+            response = Response(id=1, result="Unicode: żółw")
+            references.append(weakref.ref(response))
+            return response
+
+        original_iterencode = json.JSONEncoder.iterencode
+
+        serialized = []
+
+        def iterencode(encoder, value, *args, **kwargs):
+            if isinstance(value, Response):
+                assert threading.get_ident() != loop_thread
+                serialized.append(True)
+            return original_iterencode(encoder, value, *args, **kwargs)
+
+        monkeypatch.setattr(sse, "_respond", respond)
+        application = sse.SSEApplication()
+        monkeypatch.setattr(json.JSONEncoder, "iterencode", iterencode)
+        async with asgi_session(application) as session:
+            assert await session[0]({"id": 1}) == 202
+            event = await asyncio.wait_for(session[2].get(), 2)
+            assert serialized == [True]
+            assert json.loads(event["body"].split(b"data: ")[1])["result"] == "Unicode: żółw"
+            assert references[0]() is None
+            assert application.pending_response_bytes == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("client", [None, ("203.0.113.7", 1234)])
+def test_unauthenticated_asgi_deployment_requires_real_loopback_peer(client):
+    async def scenario():
+        application = sse.SSEApplication()
+        events = []
+
+        async def receive():
+            raise AssertionError("Rejected requests must not read a body")
+
+        async def send(event):
+            events.append(event)
+
+        await asyncio.wait_for(
+            application(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/sse",
+                    "headers": [(b"host", b"localhost")],
+                    "client": client,
+                },
+                receive,
+                send,
+            ),
+            2,
+        )
+        assert events[0]["status"] == 403
+        assert not application.sessions
+
+    asyncio.run(scenario())
+
+
+def test_disconnect_and_cancelled_execution_hold_response_reservation(monkeypatch):
+    started, release = threading.Event(), threading.Event()
+
+    def respond(request, **kwargs):
+        started.set()
+        assert release.wait(5)
+        return {"id": 1}
+
+    monkeypatch.setattr(sse, "_respond", respond)
+
+    async def scenario():
+        application = sse.SSEApplication(max_response_bytes=128, max_pending_response_bytes=1024)
+        try:
+            async with asgi_session(application) as session:
+                assert await session[0]({"id": 1}) == 202
+                assert await asyncio.to_thread(started.wait, 2)
+                execution = next(iter(application.executions))
+                execution.cancel()
+                await session[1].put({"type": "http.disconnect"})
+                await asyncio.wait_for(asyncio.shield(session[3]), 2)
+                assert application.execution_lock.locked()
+                assert application.pending_response_bytes > 0
+                assert application.pending_request_bytes == sse.MAX_REQUEST_BYTES
+                assert session[2].empty()
+        finally:
+            release.set()
+            await asyncio.wait_for(
+                asyncio.gather(*application.executions, return_exceptions=True), 2
+            )
+        assert application.pending_response_bytes == 0
+        assert application.pending_request_bytes == 0
+        assert not application.execution_lock.locked()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+def test_response_limits_require_positive_integers(value):
+    with pytest.raises(ValueError, match="positive integers"):
+        sse.SSEApplication(max_response_bytes=value)
+    with pytest.raises(ValueError, match="positive integers"):
+        sse.SSEApplication(max_pending_response_bytes=value)
+
+
+def test_global_response_limit_must_allow_serialization_copy():
+    with pytest.raises(ValueError, match="buffer copy"):
+        sse.SSEApplication(max_response_bytes=128, max_pending_response_bytes=128)
+
+
+def test_execution_cancelled_before_start_releases_request_and_lock(monkeypatch):
+    def respond(*args, **kwargs):
+        raise AssertionError("A cancelled-before-start execution must not run")
+
+    monkeypatch.setattr(sse, "_respond", respond)
+
+    async def scenario():
+        application = sse.SSEApplication()
+        application.pending_request_bytes = sse.MAX_REQUEST_BYTES
+        await application.execution_lock.acquire()
+        started = [False]
+        execution = asyncio.create_task(application._execute(b"{}", started))
+        application.executions.add(execution)
+        execution.add_done_callback(lambda task: application._execution_done(task, started))
+        execution.cancel()
+        await asyncio.wait_for(asyncio.gather(execution, return_exceptions=True), 2)
+        assert not started[0]
+        assert not application.executions
+        assert not application.execution_lock.locked()
+        assert application.pending_request_bytes == 0
+
+    asyncio.run(scenario())
+
+
+def test_response_limit_exact_boundary(monkeypatch):
+    response = {"id": 1, "result": "Unicode: żółw"}
+    monkeypatch.setattr(sse, "_respond", lambda request, **kwargs: response)
+    size = len(json.dumps(response).encode("ascii"))
+
+    async def scenario():
+        application = sse.SSEApplication(max_response_bytes=size, max_pending_response_bytes=1024)
+        async with asgi_session(application) as session:
+            assert await session[0]({"id": 1}) == 202
+            event = await asyncio.wait_for(session[2].get(), 2)
+            assert json.loads(event["body"].split(b"data: ")[1]) == response
+            assert application.pending_response_bytes == 0
+
+    asyncio.run(scenario())

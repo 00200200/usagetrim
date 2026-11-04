@@ -201,6 +201,26 @@ Listening outside localhost (for example, `--host 0.0.0.0`) requires a token.
 For remote access, use HTTPS through a reverse proxy or a secure tunnel; the
 server itself serves plain HTTP, and Bearer authentication does not encrypt it.
 
+Without a token, both the Host and the actual ASGI peer must be loopback.
+Remote reverse-proxy deployments must configure Bearer authentication; do not
+trust forwarded client headers as authentication.
+
+SSE buffers default to a 4 MiB JSON response limit and a global 32 MiB response
+budget, including SSE framing. `SSEApplication` accepts keyword-only
+`max_response_bytes` and `max_pending_response_bytes` overrides. The budget is
+reserved before serialization (including room for the temporary buffer copy)
+and held through queueing and sending. The global limit must fit two maximum
+framed responses to allow that copy. Exceeding either limit closes the affected session without sending truncated JSON; clients
+must reconnect. These limits bound transport buffering, not the memory used by
+synchronous MCP handlers or temporary JSON encoder allocations. Serialization
+runs outside the event loop. A disconnected or cancelled request cannot forcibly
+stop an already running Python handler; execution remains serialized until it
+actually returns.
+
+The stats tool's legacy “Session Savings” label means **process-wide** counters,
+shared by all SSE clients, not per-HTTP-session or per-user accounting. Clients
+share the server's tools, operating-system permissions, and cache.
+
 ```sh
 # Prepare messy logs or stack traces with prompt-cache prefix stabilization:
 usagetrim prepare --desktop -f error.log

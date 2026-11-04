@@ -17,6 +17,9 @@ from usagetrim.mcp.server import _respond, tool_definitions
 
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_PENDING_REQUEST_BYTES = 16 * 1024 * 1024
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_PENDING_RESPONSE_BYTES = 32 * 1024 * 1024
+SSE_MESSAGE_OVERHEAD = len(b"event: message\ndata: \n\n")
 QUEUE_SIZE = 32
 MAX_SESSIONS = 128
 REQUEST_TIMEOUT = 10
@@ -31,6 +34,23 @@ def _loopback(host: str) -> bool:
         return False
 
 
+class _ResponseLimit(Exception):
+    """Close a slow/oversized session without emitting a partial JSON response."""
+
+
+@dataclass
+class _Reservation:
+    app: SSEApplication
+    size: int
+
+    def resize(self, size):
+        self.app.pending_response_bytes += size - self.size
+        self.size = size
+
+    def release(self):
+        self.resize(0)
+
+
 @dataclass
 class _Session:
     incoming: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(QUEUE_SIZE))
@@ -38,12 +58,30 @@ class _Session:
 
 
 class SSEApplication:
-    def __init__(self, profile="coding", host="127.0.0.1", auth_token=None):
+    def __init__(
+        self,
+        profile="coding",
+        host="127.0.0.1",
+        auth_token=None,
+        *,
+        max_response_bytes=MAX_RESPONSE_BYTES,
+        max_pending_response_bytes=MAX_PENDING_RESPONSE_BYTES,
+    ):
         tool_definitions(profile)
         if auth_token is not None and (not auth_token or any(c.isspace() for c in auth_token)):
             raise ValueError("auth-token must be nonempty and contain no whitespace")
         if not _loopback(host) and not auth_token:
             raise ValueError("Listening outside localhost requires --auth-token")
+        for value in (max_response_bytes, max_pending_response_bytes):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError("Response limits must be positive integers")
+        if max_pending_response_bytes < 2 * (max_response_bytes + SSE_MESSAGE_OVERHEAD):
+            raise ValueError(
+                "Global response budget must fit a maximum SSE response and its buffer copy"
+            )
+        self.max_response_bytes = max_response_bytes
+        self.max_pending_response_bytes = max_pending_response_bytes
+        self.pending_response_bytes = 0
         self.profile = profile
         self.auth_token = auth_token
         self.sessions: dict[str, _Session] = {}
@@ -83,6 +121,9 @@ class SSEApplication:
                 hostname = urlsplit("//" + headers.get(b"host", b"").decode()).hostname
             except (ValueError, UnicodeError):
                 hostname = None
+            client = scope.get("client")
+            if client is None or not _loopback(client[0]):
+                return await reply(403, "Loopback peer or Bearer authentication required")
             if not hostname or not _loopback(hostname):
                 return await reply(403, "Invalid Host")
         path, method = scope["path"], scope["method"]
@@ -142,16 +183,52 @@ class SSEApplication:
             if not queued:
                 self.pending_request_bytes -= MAX_REQUEST_BYTES
 
-    async def _execute(self, body):
-        # Own the lock and reservation until the synchronous call actually ends.
-        # The HTTP handler may leave immediately without cancelling this task.
+    def _respond_frame(self, body):
+        # Run both the synchronous handler and serialization outside the event loop.
+        # iterencode limits retained serialized output, not handler/encoder temporaries.
+        response = _respond(json.loads(body), profile=self.profile)
+        if response is None:
+            return None
+        data = bytearray(b"event: message\ndata: ")
+        payload_size = 0
+        for chunk in json.JSONEncoder().iterencode(response):
+            payload_size += len(chunk)  # ensure_ascii=True: one byte per character.
+            if payload_size > self.max_response_bytes:
+                raise _ResponseLimit("SSE response size limit exceeded")
+            data.extend(chunk.encode("ascii"))
+        data.extend(b"\n\n")
+        return bytes(data)
+
+    async def _execute(self, body, started=None):
+        if started is not None:
+            started[0] = True
+        # Cancellation cannot stop a Python thread. Keep ownership until it ends,
+        # including repeated cancellations during application shutdown.
         try:
-            return await asyncio.to_thread(_respond, json.loads(body), profile=self.profile)
+            work = asyncio.get_running_loop().run_in_executor(None, self._respond_frame, body)
+            body = None
+            cancelled = False
+            while not work.done():
+                try:
+                    await asyncio.shield(work)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    break  # Retrieve and propagate the handler exception below.
+            if cancelled:
+                if not work.cancelled():
+                    work.exception()
+                raise asyncio.CancelledError
+            return work.result()
         finally:
             self.pending_request_bytes -= MAX_REQUEST_BYTES
             self.execution_lock.release()
 
-    def _execution_done(self, task):
+    def _execution_done(self, task, started):
+        # A coroutine cancelled before its first step never enters its finally.
+        if not started[0]:
+            self.pending_request_bytes -= MAX_REQUEST_BYTES
+            self.execution_lock.release()
         self.executions.discard(task)
         if not task.cancelled():
             task.exception()  # Retrieve exceptions even when the client has disconnected.
@@ -160,19 +237,46 @@ class SSEApplication:
         while True:
             body = await session.incoming.get()
             transferred = False
+            reservation = None
+            task = None
+            frame = None
+            acquired = False
             try:
                 await self.execution_lock.acquire()
-                task = asyncio.create_task(self._execute(body))
-                body = None  # Do not retain the last request in an idle worker.
+                acquired = True
+                # Account for bytearray -> bytes conversion during serialization.
+                size = 2 * (self.max_response_bytes + SSE_MESSAGE_OVERHEAD)
+                if self.pending_response_bytes + size > self.max_pending_response_bytes:
+                    raise _ResponseLimit("Global SSE response budget exhausted")
+                self.pending_response_bytes += size
+                reservation = _Reservation(self, size)
+                started = [False]
+                task = asyncio.create_task(self._execute(body, started))
+                body = None
                 self.executions.add(task)
-                task.add_done_callback(self._execution_done)
+                task.add_done_callback(
+                    lambda finished, state=started: self._execution_done(finished, state)
+                )
                 transferred = True
-                response = await asyncio.shield(task)
+                frame = await asyncio.shield(task)
+                task = None  # A completed task also retains its result.
+                if frame is not None:
+                    reservation.resize(len(frame))
+                    await session.outgoing.put((frame, reservation))
+                    reservation = None  # The sender/queue now owns the reservation.
             finally:
+                body = frame = None
                 if not transferred:
                     self.pending_request_bytes -= MAX_REQUEST_BYTES
-            if response is not None:
-                await session.outgoing.put(json.dumps(response).encode())
+                    if acquired:
+                        self.execution_lock.release()
+                if reservation is not None:
+                    if task is not None and not task.done():
+                        # Disconnect returns immediately; the thread still owns memory.
+                        task.add_done_callback(lambda _, held=reservation: held.release())
+                    else:
+                        reservation.release()
+                task = reservation = None
 
     async def _stream(self, receive, send):
         session_id = secrets.token_urlsafe(32)
@@ -205,13 +309,25 @@ class SSEApplication:
             )
             while True:
                 try:
-                    data = await asyncio.wait_for(session.outgoing.get(), timeout=15)
-                    body = b"event: message\ndata: " + data + b"\n\n"
+                    frame, reservation = await asyncio.wait_for(session.outgoing.get(), timeout=15)
                 except TimeoutError:
-                    body = b": keepalive\n\n"
-                await send({"type": "http.response.body", "body": body, "more_body": True})
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": b": keepalive\n\n",
+                            "more_body": True,
+                        }
+                    )
+                    continue
+                try:
+                    await send({"type": "http.response.body", "body": frame, "more_body": True})
+                finally:
+                    frame = None
+                    reservation.release()
+                    reservation = None
 
         tasks = []
+        limited = False
         try:
             tasks = [
                 asyncio.create_task(coro)
@@ -220,6 +336,9 @@ class SSEApplication:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 task.result()
+        except _ResponseLimit:
+            # Deliberately close this session; never truncate a JSON-RPC envelope.
+            limited = True
         finally:
             self.sessions.pop(session_id, None)
             for task in tasks:
@@ -228,6 +347,10 @@ class SSEApplication:
             while not session.incoming.empty():
                 session.incoming.get_nowait()
                 self.pending_request_bytes -= MAX_REQUEST_BYTES
+            while not session.outgoing.empty():
+                session.outgoing.get_nowait()[1].release()
+            if limited:
+                await send({"type": "http.response.body", "body": b"", "more_body": False})
 
 
 def run_mcp_sse_server(profile="coding", host="127.0.0.1", port=8080, auth_token=None):
