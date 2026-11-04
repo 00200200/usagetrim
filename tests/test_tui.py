@@ -9,6 +9,7 @@ pytest.importorskip("textual")
 
 from textual.widgets import Button, Collapsible, DataTable, Input, Select, Sparkline, Static
 
+from tui_support import settle
 from usagetrim.core.telemetry import TelemetryStore
 from usagetrim.tui import app as dashboard
 from usagetrim.tui.history import HistoryFilters
@@ -33,7 +34,8 @@ def test_tui_hypothetical_usd_uses_openai_savings_and_static_pricing(
 
     async def scenario():
         app = dashboard.UsageTrimDashboard(store)
-        async with app.run_test():
+        async with app.run_test() as pilot:
+            await settle(pilot)
             summary = str(app.query_one("#summary", Static).render())
             assert f"GPT-4o ~${expected:.6f}" in summary
             assert "Hypothetical input-cost saving" in summary
@@ -49,11 +51,12 @@ def test_tui_empty_database_and_quit(tmp_path):
     async def scenario():
         app = dashboard.UsageTrimDashboard(store)
         async with app.run_test() as pilot:
+            await settle(pilot)
             assert app.query_one("#history", DataTable).row_count == 0
             assert "Operations: 0" in str(app.query_one("#summary", Static).render())
             assert "No operations yet" in str(app.query_one("#status", Static).render())
             await pilot.press("q")
-            await pilot.pause()
+            await settle(pilot)
             assert not app.is_running
 
     asyncio.run(scenario())
@@ -77,6 +80,7 @@ def test_tui_uses_gain_report_totals_and_latest_fifty(tmp_path):
     async def scenario():
         app = dashboard.UsageTrimDashboard(store)
         async with app.run_test() as pilot:
+            await settle(pilot)
             table = app.query_one("#history", DataTable)
             assert table.row_count == 50
             assert str(table.get_row_at(0)[1]) == "operation-54"
@@ -87,6 +91,7 @@ def test_tui_uses_gain_report_totals_and_latest_fifty(tmp_path):
             with store.connect() as conn:
                 assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 57
             await pilot.press("down")
+            await settle(pilot)
             assert table.cursor_row == 1
 
     asyncio.run(scenario())
@@ -107,14 +112,18 @@ def test_tui_refresh_timer_updates_rows_without_losing_cursor(tmp_path, monkeypa
 
     async def scenario():
         async with app.run_test() as pilot:
+            await settle(pilot)
             assert scheduled == [(5, app.refresh_dashboard)]
             for _ in range(3):
                 store.record(0, raw_openai=100, compact_openai=20)
             scheduled[0][1]()
+            await settle(pilot)
             table = app.query_one("#history", DataTable)
             assert table.row_count == 3
             await pilot.press("down")
+            await settle(pilot)
             app.refresh_dashboard()
+            await settle(pilot)
             assert table.cursor_row == 1
 
     asyncio.run(scenario())
@@ -128,6 +137,7 @@ def test_tui_ignores_stale_and_unmounted_table_highlights(tmp_path):
     async def scenario():
         app = dashboard.UsageTrimDashboard(store)
         async with app.run_test() as pilot:
+            await settle(pilot)
             table = app.query_one("#history", DataTable)
             delayed = DataTable.RowHighlighted(
                 data_table=table,
@@ -135,6 +145,7 @@ def test_tui_ignores_stale_and_unmounted_table_highlights(tmp_path):
                 row_key=table.coordinate_to_cell_key(table.cursor_coordinate).row_key,
             )
             await pilot.press("down")
+            await settle(pilot)
             selected_id = app._selected_event_id
             assert selected_id != delayed.row_key.value
             app.on_data_table_row_highlighted(delayed)
@@ -145,7 +156,7 @@ def test_tui_ignores_stale_and_unmounted_table_highlights(tmp_path):
             assert app._selected_event_id == selected_id
 
             await table.remove()
-            await pilot.pause()
+            await settle(pilot)
             assert not table.is_attached
             app.on_data_table_row_highlighted(delayed)
             assert app._selected_event_id == selected_id
@@ -164,6 +175,7 @@ def test_tui_ignores_highlights_when_details_are_unmounted(tmp_path):
     async def scenario():
         app = dashboard.UsageTrimDashboard(store)
         async with app.run_test() as pilot:
+            await settle(pilot)
             table = app.query_one("#history", DataTable)
             delayed = DataTable.RowHighlighted(
                 data_table=table,
@@ -171,7 +183,7 @@ def test_tui_ignores_highlights_when_details_are_unmounted(tmp_path):
                 row_key=table.coordinate_to_cell_key(table.cursor_coordinate).row_key,
             )
             await app.query_one("#details", Static).remove()
-            await pilot.pause()
+            await settle(pilot)
             app.on_data_table_row_highlighted(delayed)
             app._show_details()
             assert app._selected_event_id == "selected"
@@ -189,9 +201,11 @@ def test_tui_telemetry_error_keeps_dashboard_open(tmp_path, monkeypatch):
 
     async def scenario():
         async with app.run_test() as pilot:
+            await settle(pilot)
             assert "Unable to refresh telemetry" in str(app.query_one("#status", Static).render())
             assert app.query_one("#history", DataTable).row_count == 0
             await pilot.press("q")
+            await settle(pilot)
 
     asyncio.run(scenario())
 
@@ -208,13 +222,16 @@ def test_tui_filters_apply_from_keyboard_and_clear_empty_results(tmp_path):
     async def scenario():
         app = dashboard.UsageTrimDashboard(store)
         async with app.run_test(size=(120, 45)) as pilot:
+            await settle(pilot)
             await pilot.press("ctrl+f")
+            await settle(pilot)
             assert app.query_one("#operation-filter", Input).has_focus
             app.query_one("#operation-filter", Input).value = "read"
             app.query_one("#client-filter", Input).value = "codex"
             app.query_one("#project-filter", Input).value = "/repo"
             app.query_one("#time-filter", Select).value = "24h"
             await pilot.press("enter")
+            await settle(pilot)
             assert app.filters == HistoryFilters("read", "codex", "/repo", "24h")
             table = app.query_one("#history", DataTable)
             assert table.has_focus and table.row_count == 1
@@ -224,12 +241,12 @@ def test_tui_filters_apply_from_keyboard_and_clear_empty_results(tmp_path):
             assert "Operations: 2" in summary and "filters apply to history and chart" in summary
             app.query_one("#operation-filter", Input).value = "missing"
             app.query_one("#apply-filters", Button).press()
-            await pilot.pause()
+            await settle(pilot)
             assert table.row_count == 0
             assert "No operations match" in str(app.query_one("#status", Static).render())
             assert str(app.query_one("#details", Static).render()) == "No operation selected."
             app.query_one("#clear-filters", Button).press()
-            await pilot.pause()
+            await settle(pilot)
             assert app.filters == HistoryFilters()
             assert app.query_one("#operation-filter", Input).value == ""
             assert app.query_one("#time-filter", Select).value == "all"
@@ -253,12 +270,13 @@ def test_tui_refresh_preserves_active_filters_and_selected_event(tmp_path):
     async def scenario():
         app = dashboard.UsageTrimDashboard(store)
         async with app.run_test(size=(120, 45)) as pilot:
+            await settle(pilot)
             app.query_one("#operation-filter", Input).value = "read"
             app.query_one("#client-filter", Input).value = "codex"
             app.query_one("#project-filter", Input).value = "/repo"
             app.query_one("#time-filter", Select).value = "7d"
             app.action_apply_filters()
-            await pilot.pause()
+            await settle(pilot)
             active = app.filters
             store.record(
                 0,
@@ -279,7 +297,7 @@ def test_tui_refresh_preserves_active_filters_and_selected_event(tmp_path):
             # Unsubmitted edits must not silently alter the active timer query.
             app.query_one("#operation-filter", Input).value = "unfinished draft"
             app.refresh_dashboard()
-            await pilot.pause()
+            await settle(pilot)
             table = app.query_one("#history", DataTable)
             assert app.filters == active
             assert app.query_one("#operation-filter", Input).value == "unfinished draft"
@@ -319,6 +337,7 @@ def test_tui_details_follow_selection_and_show_only_recorded_metadata(tmp_path):
     async def scenario():
         app = dashboard.UsageTrimDashboard(store)
         async with app.run_test(size=(120, 45)) as pilot:
+            await settle(pilot)
             details = str(app.query_one("#details", Static).render())
             for value in (
                 'event_id: "newer"',
@@ -340,6 +359,7 @@ def test_tui_details_follow_selection_and_show_only_recorded_metadata(tmp_path):
                 "command:" not in details and "status:" not in details and "output:" not in details
             )
             await pilot.press("down")
+            await settle(pilot)
             details = str(app.query_one("#details", Static).render())
             assert 'event_id: "older"' in details
             assert "client: null" in details and "project: null" in details
@@ -347,7 +367,7 @@ def test_tui_details_follow_selection_and_show_only_recorded_metadata(tmp_path):
             # Applying a filter removes the selected record and its stale details.
             app.query_one("#client-filter", Input).value = "codex"
             app.action_apply_filters()
-            await pilot.pause()
+            await settle(pilot)
             assert app._selected_event_id == "newer"
             assert 'event_id: "older"' not in str(app.query_one("#details", Static).render())
 
@@ -381,12 +401,13 @@ def test_tui_chart_uses_active_filters_and_the_refresh_timer(tmp_path, monkeypat
 
     async def scenario():
         async with app.run_test(size=(120, 50)) as pilot:
+            await settle(pilot)
             app.query_one("#operation-filter", Input).value = "read"
             app.query_one("#client-filter", Input).value = "codex"
             app.query_one("#project-filter", Input).value = "/repo"
             app.query_one("#time-filter", Select).value = "24h"
             app.action_apply_filters()
-            await pilot.pause()
+            await settle(pilot)
             chart = app.query_one("#savings-chart", Sparkline)
             assert list(chart.data) == [0] * 23 + [60]
             assert scheduled == [(5, app.refresh_dashboard)]
@@ -403,7 +424,7 @@ def test_tui_chart_uses_active_filters_and_the_refresh_timer(tmp_path, monkeypat
             store.record(0, raw_openai=9999, operation="diff", client="codex", project="/repo")
             app.query_one("#operation-filter", Input).value = "unsubmitted"
             scheduled[0][1]()
-            await pilot.pause()
+            await settle(pilot)
             assert list(chart.data) == [0] * 23 + [120]
             assert app.filters == active
             assert app._selected_event_id == "selected"
@@ -427,9 +448,10 @@ def test_tui_chart_empty_ranges_are_labeled(tmp_path, period, count, label):
     async def scenario():
         app = dashboard.UsageTrimDashboard(store)
         async with app.run_test(size=(100, 45)) as pilot:
+            await settle(pilot)
             app.query_one("#time-filter", Select).value = period
             app.action_apply_filters()
-            await pilot.pause()
+            await settle(pilot)
             assert list(app.query_one("#savings-chart", Sparkline).data) == [0] * count
             caption = str(app.query_one("#savings-caption", Static).render())
             assert label in caption and "UTC" in caption
@@ -447,14 +469,16 @@ def test_tui_chart_can_collapse_in_small_terminal_without_losing_navigation(tmp_
     async def scenario():
         app = dashboard.UsageTrimDashboard(store)
         async with app.run_test(size=(48, 20)) as pilot:
+            await settle(pilot)
             panel = app.query_one("#savings-panel", Collapsible)
             panel.collapsed = True
             app.action_focus_history()
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("down")
+            await settle(pilot)
             assert app.query_one("#history", DataTable).cursor_row == 1
             app.refresh_dashboard()
-            await pilot.pause()
+            await settle(pilot)
             assert panel.collapsed is True
             assert len(app.query_one("#savings-chart", Sparkline).data) == 30
             assert app.query_one("#history", DataTable).cursor_row == 1
@@ -472,15 +496,60 @@ def test_tui_vim_navigation(tmp_path):
         app = dashboard.UsageTrimDashboard(store)
 
         async with app.run_test() as pilot:
+            await settle(pilot)
             table = app.query_one("#history", DataTable)
             table.focus()
 
             assert table.cursor_row == 0
 
             await pilot.press("j")
+            await settle(pilot)
             assert table.cursor_row == 1
 
             await pilot.press("k")
+            await settle(pilot)
             assert table.cursor_row == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("timestamp", [1e300, "invalid", None, float("nan")])
+def test_tui_history_uses_placeholder_for_invalid_timestamp(tmp_path, monkeypatch, timestamp):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    store.record(0, raw_openai=100, compact_openai=20, event_id="invalid-time")
+    original_read = dashboard.read_history
+
+    def history(*args, **kwargs):
+        # None/NaN cannot be stored in the NOT NULL timestamp column, but the
+        # display formatter must also tolerate these values from an adapter.
+        return [{**row, "timestamp": timestamp} for row in original_read(*args, **kwargs)]
+
+    monkeypatch.setattr(dashboard, "read_history", history)
+
+    async def scenario():
+        app = dashboard.UsageTrimDashboard(store)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            table = app.query_one("#history", DataTable)
+            assert table.row_count == 1
+            assert str(table.get_row_at(0)[0]) == "—"
+            app.refresh_dashboard()
+            await settle(pilot)
+            assert table.row_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_tui_history_handles_out_of_range_timestamp_from_sqlite(tmp_path):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    store.record(0, raw_openai=100, event_id="out-of-range")
+    with store.connect() as conn:
+        conn.execute("UPDATE events SET timestamp=?", (1e300,))
+
+    async def scenario():
+        app = dashboard.UsageTrimDashboard(store)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert str(app.query_one("#history", DataTable).get_row_at(0)[0]) == "—"
 
     asyncio.run(scenario())

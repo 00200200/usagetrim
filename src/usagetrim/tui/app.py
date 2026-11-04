@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
 
 from rich.text import Text
@@ -26,9 +25,11 @@ from usagetrim.core.gain import build_gain_report
 from usagetrim.core.telemetry import TelemetryStore
 from usagetrim.metrics.pricing import calculate_cost
 from usagetrim.tui.cache_screen import CacheScreen
+from usagetrim.tui.formatting import format_timestamp
 from usagetrim.tui.history import HistoryFilters, read_history
 from usagetrim.tui.savings import SavingsSeries, read_savings
 from usagetrim.tui.vim_table import VimDataTable
+from usagetrim.tui.workers import IOLane, IoResult
 
 
 class UsageTrimDashboard(App):
@@ -66,6 +67,8 @@ class UsageTrimDashboard(App):
         self._history: dict[str, dict] = {}
         self._selected_event_id: str | None = None
         self._details_widget: Static | None = None
+        self._refresh_lane = IOLane(self, "telemetry-refresh")
+        self._store_holder = [store]
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -120,6 +123,7 @@ class UsageTrimDashboard(App):
         if isinstance(self.screen, CacheScreen):
             self.screen.action_close()
         else:
+            self._refresh_lane.invalidate()
             self.push_screen(CacheScreen(self.cache), self._cache_closed)
 
     def _cache_closed(self, result: None) -> None:
@@ -214,19 +218,44 @@ class UsageTrimDashboard(App):
             return
         if self.screen.id == "cache-screen":
             return
-        status = self.query_one("#status", Static)
-        try:
-            store = self.store if self.store is not None else TelemetryStore()
+        filters = self.filters
+
+        def load():
+            # Only this serialized lane initializes/uses the holder. SQLite
+            # connections are opened by the existing APIs inside this thread.
+            if self._store_holder[0] is None:
+                self._store_holder[0] = TelemetryStore()
+            store = self._store_holder[0]
             report = build_gain_report(store, history_limit=50)
             now = time.time()
-            history = read_history(store, self.filters, now=now)
-            savings = read_savings(store, self.filters, now=now)
-        except (OSError, sqlite3.Error) as exc:
+            history = read_history(store, filters, now=now)
+            savings = read_savings(store, filters, now=now)
+            return store, report, history, savings
+
+        self._refresh_lane.submit(filters, load, self._apply_dashboard)
+
+    def on_io_result(self, message: IoResult) -> None:
+        message.stop()
+        message.lane.finish(message)
+
+    def on_unmount(self) -> None:
+        self._refresh_lane.close()
+
+    def _apply_dashboard(self, result, error) -> None:
+        if (
+            not self.is_running
+            or self._details_widget is None
+            or not self._details_widget.is_attached
+            or self.screen.id == "cache-screen"
+        ):
+            return
+        status = self.query_one("#status", Static)
+        if error is not None:
             status.update(
-                f"Unable to refresh telemetry ({type(exc).__name__}); retrying in 5 seconds."
+                f"Unable to refresh telemetry ({type(error).__name__}); retrying in 5 seconds."
             )
             return
-
+        self.store, report, history, savings = result
         self.query_one("#summary", Static).update(
             f"Operations: {report.total_events:,}\n"
             f"Estimated tokens — raw: {report.raw_openai:,} · compact: {report.compact_openai:,} · "
@@ -263,7 +292,7 @@ class UsageTrimDashboard(App):
             saved = max(0, raw - compact) if known else None
             reduction = (100 * saved / raw if raw > 0 else 0) if known else None
             table.add_row(
-                Text(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(event["timestamp"]))),
+                Text(format_timestamp(event["timestamp"])),
                 Text(event["operation"]),
                 f"{raw:,}" if raw is not None else "—",
                 f"{compact:,}" if compact is not None else "—",

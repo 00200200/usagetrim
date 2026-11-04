@@ -1,6 +1,5 @@
 """Explicit, bounded previews of legacy CCR payloads."""
 
-import io
 import zlib
 
 from usagetrim.core.redactor import redact_secrets
@@ -39,6 +38,8 @@ def read_preview(cache, ref_id):
             )
             if not decoder.eof:
                 return "Preview unavailable: compressed payload is oversized or incomplete."
+            if decoder.unused_data:
+                return "Preview unavailable: compressed payload has trailing data."
         elif payload.startswith((b"ZSTD", b"\x28\xb5\x2f\xfd")):
             try:
                 import zstandard
@@ -46,10 +47,14 @@ def read_preview(cache, ref_id):
                 return "Preview unavailable: zstandard support is not installed."
             encoded = payload[4:] if payload.startswith(b"ZSTD") else payload
             try:
-                with zstandard.ZstdDecompressor(max_window_size=1024).stream_reader(
-                    io.BytesIO(encoded)
-                ) as reader:
-                    data = reader.read(LIMIT + 1)
+                size = zstandard.frame_content_size(encoded)
+                # A known frame size overrides max_output_size in decompress().
+                # Validate it first; unknown-size frames use the bounded buffer.
+                if size != zstandard.CONTENTSIZE_UNKNOWN and size > LIMIT:
+                    return "Preview unavailable: decoded payload exceeds 16 KiB."
+                data = zstandard.ZstdDecompressor(max_window_size=1024).decompress(
+                    encoded, max_output_size=LIMIT + 1, allow_extra_data=False
+                )
             except zstandard.ZstdError:
                 return "Preview unavailable: damaged or oversized zstd payload."
         else:

@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
-import time
 from dataclasses import asdict
 
 from rich.text import Text
@@ -17,7 +15,9 @@ from usagetrim.core.cache import ContextCache
 from usagetrim.tui.cache_content import CacheContentError, export_content, search_content
 from usagetrim.tui.cache_data import CachePage, read_cache_metadata, read_cache_page
 from usagetrim.tui.cache_preview import read_preview
+from usagetrim.tui.formatting import format_timestamp
 from usagetrim.tui.vim_table import VimDataTable
+from usagetrim.tui.workers import IOLane, IoResult
 
 
 def _format_search_line(number: int, line: str) -> str:
@@ -59,9 +59,16 @@ class CacheScreen(Screen):
         self.page = 0
         self._result = CachePage((), 0, 0)
         self._selected_ref: str | None = None
+        self._content_ref: str | None = None
         self._table: DataTable | None = None
         self._details: Static | None = None
         self._status: Static | None = None
+        self._io_closing = False
+        self._exporting = False
+        self._page_lane = IOLane(self, "cache-pages")
+        self._detail_lane = IOLane(self, "cache-details")
+        self._export_lane = IOLane(self, "cache-export")
+        self._clipboard_lane = IOLane(self, "cache-clipboard")
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -105,7 +112,39 @@ class CacheScreen(Screen):
         self.set_interval(5, self.refresh_cache)
 
     def action_close(self) -> None:
+        self._close_io()
         self.dismiss(None)
+
+    def _close_io(self) -> None:
+        # MessagePump owns _closing: setting it here would prevent Textual from
+        # delivering Prune and completing screen removal.
+        self._io_closing = True
+        for lane in (self._page_lane, self._detail_lane, self._export_lane, self._clipboard_lane):
+            lane.close()
+
+    def on_unmount(self) -> None:
+        self._close_io()
+
+    def on_io_result(self, message: IoResult) -> None:
+        message.stop()
+        message.lane.finish(message)
+
+    def _ready(self) -> bool:
+        return (
+            not self._io_closing
+            and self.is_attached
+            and self.app.is_running
+            and self._details is not None
+            and self._details.is_attached
+            and self._status is not None
+            and self._status.is_attached
+        )
+
+    def _clear_selection(self) -> None:
+        self._selected_ref = self._content_ref = None
+        self._detail_lane.invalidate()
+        self._table.clear()
+        self._details.update("No cache entry selected.")
 
     def action_focus_search(self) -> None:
         self.query_one("#cache-search", Input).focus()
@@ -113,7 +152,7 @@ class CacheScreen(Screen):
     def action_search(self) -> None:
         self.ref_query = self.query_one("#cache-search", Input).value
         self.page = 0
-        self._selected_ref = None
+        self._clear_selection()
         self.refresh_cache()
         self.query_one("#cache-table", DataTable).focus()
 
@@ -123,13 +162,13 @@ class CacheScreen(Screen):
     def action_previous_page(self) -> None:
         if self._result.has_previous:
             self.page -= 1
-            self._selected_ref = None
+            self._clear_selection()
             self.refresh_cache()
 
     def action_next_page(self) -> None:
         if self._result.has_next:
             self.page += 1
-            self._selected_ref = None
+            self._clear_selection()
             self.refresh_cache()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -165,58 +204,109 @@ class CacheScreen(Screen):
             self.action_export_content()
 
     def action_search_content(self) -> None:
+        if not self._ready():
+            return
         if self._selected_ref is None:
             self._status.update("Select a cache entry first.")
             return
-        try:
-            matches = search_content(
-                self.cache,
-                self._selected_ref,
-                self.query_one("#cache-content-query", Input).value,
+        ref = self._selected_ref
+        query = self.query_one("#cache-content-query", Input).value
+        self._content_ref = ref  # Also protect the view while this read is pending.
+
+        def apply(matches, error):
+            if not self._ready() or self._selected_ref != ref:
+                return
+            if error is not None:
+                self._status.update(f"Search refused: {self._error_text(error)}")
+                return
+            self._details.update(
+                "Redacted matches (maximum 20; display lines limited to 300 characters):\n"
+                + ("\n".join(_format_search_line(n, line) for n, line in matches) or "No matches.")
             )
-        except (CacheContentError, OSError, sqlite3.Error) as exc:
-            self._status.update(f"Search refused: {exc}")
-            return
-        self._details.update(
-            "Redacted matches (maximum 20; display lines limited to 300 characters):\n"
-            + (
-                "\n".join(_format_search_line(number, line) for number, line in matches)
-                or "No matches."
-            )
+
+        self._detail_lane.submit(
+            ("search", ref, query),
+            lambda: search_content(self.cache, ref, query),
+            apply,
+            force=True,
+        )
+
+    @staticmethod
+    def _error_text(error) -> str:
+        return (
+            str(error) if isinstance(error, (CacheContentError, OSError)) else type(error).__name__
         )
 
     def action_export_content(self) -> None:
+        if not self._ready() or self._export_lane.busy:
+            return
         path = self.query_one("#cache-export-path", Input).value
         if self._selected_ref is None or not path:
             self._status.update("Select an entry and enter an export path.")
             return
-        try:
-            export_content(self.cache, self._selected_ref, path)
-        except (CacheContentError, OSError, sqlite3.Error) as exc:
-            self._status.update(f"Export refused: {exc}")
-            return
-        self._status.update("Complete redacted log exported. Existing files were not overwritten.")
+        ref = self._selected_ref
+        self._exporting = True
+        self.query_one("#cache-export", Button).disabled = True
+        self._status.update("Exporting complete redacted log…")
+
+        def apply(result, error):
+            if not self._ready():
+                return
+            self._exporting = False
+            self.query_one("#cache-export", Button).disabled = False
+            if self._selected_ref != ref:
+                self._status.update(
+                    "Export finished for the previous selection."
+                    if error is None
+                    else "Export for the previous selection failed."
+                )
+                return
+            self._status.update(
+                f"Export refused: {self._error_text(error)}"
+                if error is not None
+                else "Complete redacted log exported. Existing files were not overwritten."
+            )
+
+        self._export_lane.submit((ref, path), lambda: export_content(self.cache, ref, path), apply)
 
     def action_preview(self) -> None:
+        if not self._ready():
+            return
         if self._selected_ref is None:
             self._status.update("Select a cache entry first.")
             return
-        try:
-            text = read_preview(self.cache, self._selected_ref)
-        except (OSError, sqlite3.Error):
-            text = "Preview unavailable: cache could not be read."
-        self._details.update(text)
+        ref = self._selected_ref
+        self._content_ref = ref
+
+        def apply(text, error):
+            if self._ready() and self._selected_ref == ref:
+                self._details.update(
+                    text if error is None else "Preview unavailable: cache could not be read."
+                )
+
+        self._detail_lane.submit(
+            ("preview", ref), lambda: read_preview(self.cache, ref), apply, force=True
+        )
 
     def action_copy_ref(self) -> None:
         from usagetrim.core.clip import set_clipboard
 
+        if not self._ready():
+            return
         if self._selected_ref is None:
             self._status.update("Select a cache entry first.")
             return
-        copied = set_clipboard(self._selected_ref)
-        self._status.update(
-            "Ref ID copied." if copied else "Clipboard unavailable; copy the ref ID from the table."
-        )
+        ref = self._selected_ref
+
+        def apply(copied, error):
+            if self._ready() and self._selected_ref == ref:
+                self._status.update(
+                    "Ref ID copied."
+                    if copied and error is None
+                    else "Clipboard unavailable; copy the ref ID from the table."
+                )
+
+        self._clipboard_lane.submit(ref, lambda: set_clipboard(ref), apply)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         event.stop()
@@ -236,53 +326,66 @@ class CacheScreen(Screen):
             return
         if table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value != ref_id:
             return
+        changed = self._selected_ref != ref_id
+        if changed:
+            self._detail_lane.invalidate()
+            self._content_ref = None
         self._selected_ref = ref_id
-        self._show_metadata()
+        if changed or self._content_ref != ref_id:
+            self._show_metadata()
 
     def _show_metadata(self) -> None:
-        if self._details is None or not self._details.is_attached:
+        if not self._ready():
             return
+        self._content_ref = None
         if self._selected_ref is None:
             self._details.update("No cache entry selected.")
             return
-        try:
-            entry = read_cache_metadata(self.cache, self._selected_ref)
-        except (OSError, sqlite3.Error) as exc:
-            self._details.update(f"Cache metadata unavailable ({type(exc).__name__}).")
-            return
-        if entry is None:
-            self._details.update(
-                "This cache entry was removed or is no longer available. Refresh the list."
-            )
-            return
-        self._details.update(
-            "Recorded cache metadata (null = not recorded)\n"
-            + "\n".join(
-                f"{key}: {json.dumps(value, ensure_ascii=False)}"
-                for key, value in asdict(entry).items()
-            )
+        ref = self._selected_ref
+        self._details.update("Loading cache metadata…")
+
+        def apply(entry, error):
+            if not self._ready() or self._selected_ref != ref or self._content_ref == ref:
+                return
+            if error is not None:
+                self._details.update(f"Cache metadata unavailable ({type(error).__name__}).")
+            elif entry is None:
+                self._details.update(
+                    "This cache entry was removed or is no longer available. Refresh the list."
+                )
+            else:
+                self._details.update(
+                    "Recorded cache metadata (null = not recorded)\n"
+                    + "\n".join(
+                        f"{key}: {json.dumps(value, ensure_ascii=False)}"
+                        for key, value in asdict(entry).items()
+                    )
+                )
+
+        self._detail_lane.submit(
+            ("metadata", ref), lambda: read_cache_metadata(self.cache, ref), apply
         )
 
     def refresh_cache(self) -> None:
         table = self._table
-        if (
-            not self.is_attached
-            or table is None
-            or not table.is_attached
-            or not self.app.is_running
-            or self._details is None
-            or not self._details.is_attached
-            or self._status is None
-            or not self._status.is_attached
-        ):
+        if not self._ready() or table is None or not table.is_attached:
             return
-        try:
-            result = read_cache_page(self.cache, ref_query=self.ref_query, page=self.page)
-        except (OSError, sqlite3.Error) as exc:
-            self._status.update(
-                f"Unable to refresh cache metadata ({type(exc).__name__}); retrying in 5 seconds."
-            )
-            self._details.update("Cache metadata could not be refreshed; list may be stale.")
+        query, page = self.ref_query, self.page
+        self._page_lane.submit(
+            (query, page),
+            lambda: read_cache_page(self.cache, ref_query=query, page=page),
+            self._apply_page,
+        )
+
+    def _apply_page(self, result, error) -> None:
+        if not self._ready():
+            return
+        table = self._table
+        if error is not None:
+            if not self._exporting:
+                self._status.update(
+                    f"Unable to refresh cache metadata ({type(error).__name__}); retrying in 5 seconds."
+                )
             return
         self._result, self.page = result, result.page
         self.query_one("#cache-previous", Button).disabled = not result.has_previous
@@ -295,25 +398,24 @@ class CacheScreen(Screen):
             message = "CCR cache is not initialized. No database was created."
         elif not result.entries:
             message = "No matching cache entries." if self.ref_query else "CCR cache is empty."
-        self._status.update(message)
+        if not self._exporting:
+            self._status.update(message)
         selected = self._selected_ref
         table.clear()
         for entry in result.entries:
-            created = "—"
-            if entry.created_at is not None:
-                try:
-                    created = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry.created_at))
-                except (ValueError, OverflowError, OSError):
-                    created = str(entry.created_at)
             table.add_row(
                 Text(entry.ref_id),
                 Text(entry.source if entry.source is not None else "—"),
-                created,
+                format_timestamp(entry.created_at),
                 str(entry.hit_count) if entry.hit_count is not None else "—",
                 key=entry.ref_id,
             )
         refs = [entry.ref_id for entry in result.entries]
         self._selected_ref = selected if selected in refs else refs[0] if refs else None
+        if self._selected_ref != selected:
+            self._detail_lane.invalidate()
+            self._content_ref = None
         if self._selected_ref is not None:
             table.move_cursor(row=refs.index(self._selected_ref), scroll=False)
-        self._show_metadata()
+        if self._selected_ref is None or self._content_ref != self._selected_ref:
+            self._show_metadata()

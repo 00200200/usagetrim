@@ -50,3 +50,57 @@ def test_preview_optional_zstd(tmp_path):
     zstd = pytest.importorskip("zstandard")
     cache = payload_cache(tmp_path, b"ZSTD" + zstd.ZstdCompressor().compress(b"diagnostic"))
     assert "diagnostic" in read_preview(cache, "tc_test")
+
+
+@pytest.mark.parametrize("prefix", [b"ZLIB", b""])
+@pytest.mark.parametrize("case", ["trailing", "concatenated", "truncated", "oversized"])
+def test_preview_refuses_invalid_zlib_streams(tmp_path, prefix, case):
+    frame = zlib.compress(b"diagnostic")
+    payload = {
+        "trailing": frame + b"garbage",
+        "concatenated": frame + zlib.compress(b"second log"),
+        "truncated": frame[:-1],
+        "oversized": zlib.compress(b"x" * (LIMIT + 1)),
+    }[case]
+    cache = payload_cache(tmp_path, prefix + payload)
+    assert "Preview unavailable" in read_preview(cache, "tc_test")
+
+
+@pytest.mark.parametrize("prefix", [b"ZSTD", b""])
+@pytest.mark.parametrize("content_size", [True, False])
+def test_preview_zstd_valid_single_frame(tmp_path, prefix, content_size):
+    zstd = pytest.importorskip("zstandard")
+    frame = zstd.ZstdCompressor(write_checksum=True, write_content_size=content_size).compress(
+        "diagnostic żółć".encode()
+    )
+    cache = payload_cache(tmp_path, prefix + frame)
+    assert "diagnostic żółć" in read_preview(cache, "tc_test")
+
+
+@pytest.mark.parametrize("prefix", [b"ZSTD", b""])
+@pytest.mark.parametrize(
+    "case", ["truncated", "checksum", "trailing", "concatenated", "oversized", "unknown-oversized"]
+)
+def test_preview_zstd_refuses_incomplete_or_non_single_frames(tmp_path, prefix, case):
+    zstd = pytest.importorskip("zstandard")
+    compressor = zstd.ZstdCompressor(write_checksum=True)
+    frame = compressor.compress(b"diagnostic")
+    payload = {
+        "truncated": frame[:-2],
+        "checksum": frame[:-1] + bytes([frame[-1] ^ 1]),
+        "trailing": frame + b"garbage",
+        "concatenated": frame + compressor.compress(b"second log"),
+        "oversized": compressor.compress(b"x" * (LIMIT + 1)),
+        "unknown-oversized": zstd.ZstdCompressor(write_content_size=False).compress(
+            b"x" * (LIMIT + 1)
+        ),
+    }[case]
+    cache = payload_cache(tmp_path, prefix + payload)
+    assert "Preview unavailable" in read_preview(cache, "tc_test")
+
+
+def test_preview_zstd_exact_decoded_limit(tmp_path):
+    zstd = pytest.importorskip("zstandard")
+    frame = zstd.ZstdCompressor(write_checksum=True).compress(b"x" * LIMIT)
+    cache = payload_cache(tmp_path, b"ZSTD" + frame)
+    assert read_preview(cache, "tc_test").split("\n", 1)[1] == "x" * LIMIT
