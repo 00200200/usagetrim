@@ -10,6 +10,11 @@ from pathlib import Path
 
 from usagetrim.core.cache import DEFAULT_CACHE_DB
 from usagetrim.core.companion_state import client_name, project_for
+from usagetrim.core.event_replay import (
+    INSPECTION_COLUMNS,
+    EventInspection,
+    capture_event_snapshots,
+)
 from usagetrim.metrics.pricing import estimate_savings
 
 
@@ -52,8 +57,8 @@ class LifetimeStats:
         return savings.avg_saved_usd
 
 
-# This database never stores commands, output, recovery references or conversations.
-# Recovery content remains exclusively in cache.db.
+# This database never stores commands, output or conversations. Optional
+# inspection rows contain references only; recovery content stays in cache.db.
 EVENT_COLUMNS = (
     "event_id",
     "timestamp",
@@ -91,6 +96,18 @@ class TelemetryStore:
                 raw_bytes INTEGER, compact_bytes INTEGER, duration_s REAL
             )""")
             conn.execute("CREATE INDEX IF NOT EXISTS events_time ON events(timestamp)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS event_inspection (
+                event_id TEXT PRIMARY KEY NOT NULL REFERENCES events(event_id) ON DELETE CASCADE,
+                before_ref TEXT, after_ref TEXT, snapshot_state TEXT NOT NULL,
+                child_returncode INTEGER, termination_reason TEXT, tool_error TEXT,
+                recovery_ref TEXT, recovery_scope TEXT
+            )""")
+            # A trigger also handles history deletion by legacy connections that
+            # do not enable foreign_keys. Never delete shared CCR payloads here.
+            conn.execute("""CREATE TRIGGER IF NOT EXISTS event_inspection_cleanup
+                AFTER DELETE ON events BEGIN
+                    DELETE FROM event_inspection WHERE event_id=OLD.event_id;
+                END""")
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS imports (source TEXT PRIMARY KEY, last_id INTEGER NOT NULL)"
             )
@@ -154,6 +171,7 @@ class TelemetryStore:
         delivery: str = "returned",
         raw_bytes: int | None = None,
         compact_bytes: int | None = None,
+        inspection: EventInspection | None = None,
         **kwargs,
     ):
         # `command` is accepted for compatibility, deliberately never persisted.
@@ -183,10 +201,25 @@ class TelemetryStore:
             duration_s,
         )
         with self.connect() as conn:
-            conn.execute(
+            inserted = conn.execute(
                 f"INSERT OR IGNORE INTO events ({','.join(EVENT_COLUMNS)}) VALUES ({','.join('?' for _ in EVENT_COLUMNS)})",
                 event,
             )
+            if inserted.rowcount and inspection is not None:
+                conn.execute(
+                    f"INSERT INTO event_inspection (event_id,{','.join(INSPECTION_COLUMNS)}) "
+                    f"VALUES ({','.join('?' for _ in range(1 + len(INSPECTION_COLUMNS)))})",
+                    (event[0], *(getattr(inspection, name) for name in INSPECTION_COLUMNS)),
+                )
+
+    def get_inspection(self, event_id: str) -> EventInspection | None:
+        """Return recorded metadata; None means no inspection was recorded."""
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT {','.join(INSPECTION_COLUMNS)} FROM event_inspection WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+        return EventInspection(**dict(zip(INSPECTION_COLUMNS, row))) if row is not None else None
 
     def get_stats(self) -> LifetimeStats:
         with self.connect() as conn:
@@ -199,6 +232,7 @@ class TelemetryStore:
 
     def clear(self):
         with self.connect() as conn:
+            conn.execute("DELETE FROM event_inspection")
             conn.execute("DELETE FROM events")
 
 
@@ -214,8 +248,15 @@ def record_text(
     client=None,
     engine="usagetrim",
     offline=False,
+    cache_allowed=False,
+    inspection: EventInspection | None = None,
 ) -> None:
-    """Best effort telemetry must never make a working tool fail."""
+    """Best effort telemetry must never make a working tool fail.
+
+    Snapshot capture additionally requires USAGETRIM_EVENT_REPLAY=1 and explicit
+    cache_allowed=True. Existing callers stay metadata-only; adapters must apply
+    all local no-cache and storage-disabled settings before permitting capture.
+    """
     try:
         from usagetrim.metrics.tokenizer import count_tokens, count_tokens_offline, get_o200k
 
@@ -224,6 +265,12 @@ def record_text(
             after, method = count_tokens_offline(output)
         else:
             before, after = count_tokens(raw), count_tokens(output)
+        details = None
+        has_metadata = inspection is not None and inspection != EventInspection()
+        if has_metadata or os.environ.get("USAGETRIM_EVENT_REPLAY") == "1":
+            details = capture_event_snapshots(
+                raw, output, cache_allowed=cache_allowed, inspection=inspection
+            )
         if engine == "rtk":
             TelemetryStore().record(
                 0,
@@ -239,6 +286,7 @@ def record_text(
                 event_id=event_id,
                 raw_bytes=len(raw.encode()),
                 compact_bytes=len(output.encode()),
+                inspection=details,
             )
             return
         TelemetryStore().record(
@@ -258,6 +306,7 @@ def record_text(
             method=method if offline else get_o200k().name,
             raw_bytes=len(raw.encode("utf-8")),
             compact_bytes=len(output.encode("utf-8")),
+            inspection=details,
         )
     except Exception:
         pass

@@ -6,6 +6,8 @@ import asyncio
 def _io_state(app):
     """Describe pending UI delivery without waiting for any message pump."""
     lanes = [app._refresh_lane]
+    if hasattr(app, "_inspection_lane"):
+        lanes.append(app._inspection_lane)
     try:
         screen = app.screen
     except Exception:
@@ -15,6 +17,8 @@ def _io_state(app):
         lanes.extend(
             [screen._page_lane, screen._detail_lane, screen._export_lane, screen._clipboard_lane]
         )
+    if hasattr(screen, "_diff_lane"):
+        lanes.append(screen._diff_lane)
     return f"screen={getattr(screen, 'id', None)!r}; " + "; ".join(
         f"{lane.name}: busy={lane.busy}, closed={lane.closed}, "
         f"revision={lane.revision}, running={lane._running_revision}, "
@@ -41,6 +45,8 @@ async def settle(pilot):
         async with asyncio.timeout(5):
             while app.is_running:
                 lanes = [app._refresh_lane]
+                if hasattr(app, "_inspection_lane"):
+                    lanes.append(app._inspection_lane)
                 screen = app.screen
                 if hasattr(screen, "_page_lane"):
                     lanes.extend(
@@ -51,6 +57,8 @@ async def settle(pilot):
                             screen._clipboard_lane,
                         ]
                     )
+                if hasattr(screen, "_diff_lane"):
+                    lanes.append(screen._diff_lane)
                 lanes = [lane for lane in lanes if not lane.closed]
                 for lane in lanes:
                     phase = f"waiting for {lane.name}"

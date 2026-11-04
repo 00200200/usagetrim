@@ -199,6 +199,53 @@ USD savings are hypothetical GPT-4o and Claude 3.5 Sonnet input-cost estimates
 based on OpenAI token counts and static reference rates, not actual billing
 or subscription savings.
 
+The history table shows recorded execution outcomes such as `Pass (exit 0)`,
+`Fail (exit 7)`, `Signaled` and `Timed out`. Pass means a process exited with
+code 0, not that UsageTrim validated every test or diagnostic. Missing execution
+metadata is shown as `Not recorded`. Details separately report execution,
+recovery (`full`, line range or search results), delivery, and snapshot presence.
+`Prepared` is not confirmation that a client received the response. Opening the
+viewer is not counted as recovery and does not increment CCR hit counts.
+
+Press **Enter on a selected history row** to open its unified before/after diff;
+press **Esc** to return with filters and selection preserved. The viewer uses
+stored, sanitized and redacted snapshots, never a rerun of the original command
+or compressor. Identical snapshots are identified explicitly. Unavailable,
+evicted, damaged or oversized snapshots produce a message instead of a partial
+comparison. Each snapshot's complete decompressed content is checked against
+its full stored SHA-256 before renewed redaction and display; a short `ref_id`
+alone is not integrity verification. Missing or inconsistent hash metadata
+prevents comparison. This is a consistency check against local metadata, not
+a signature against someone modifying both the content and its hash.
+
+**Snapshot storage is disabled by default.** Opt in explicitly before running
+supported operations:
+
+```bash
+export USAGETRIM_EVENT_REPLAY=1
+```
+
+The environment variable alone does not force capture: the operation must also
+explicitly allow caching. `--no-cache`, pause and applicable storage bypasses
+take precedence. CLI/MCP paths without a real before/after pair do not create
+one. Native hooks keep replay disabled because stream boundaries and client
+cache permission are not sufficiently established; their telemetry remains
+`prepared`. Only trustworthy supplied execution metadata is used.
+
+Snapshots live exclusively in CCR `cache.db`; telemetry contains references and
+limited metadata, not command strings or log payloads. Capture is limited to
+4 MiB per snapshot, with no silent truncation. Diff generation has stricter
+limits: 128 KiB decoded and 192 KiB stored per input, 1,000 lines per input,
+4,096 bytes per sanitized line including its terminator, and 256 KiB of complete
+diff output. Snapshots are redacted before capture and again before presentation,
+but pattern-based redaction can miss sensitive information. Capture is not a
+permanent backup: CCR eviction, pruning or clearing may remove either snapshot.
+Historical events lacking snapshots cannot be reconstructed retroactively.
+
+History and charts retain `gain` eligibility: engine `usagetrim`, excluding
+`delivery="prepared"`. Consequently native prepared events, `rtk` and bypassed
+operations do not appear in this history. At most 50 matching events are shown.
+
 Press `F2` for Cache and Esc/F2 to return. Search by a literal ref ID fragment,
 use Previous/Next or Ctrl+Left/Ctrl+Right for pages of up to 50 entries, and
 select a row for metadata. Browsing does not retrieve log content or increment

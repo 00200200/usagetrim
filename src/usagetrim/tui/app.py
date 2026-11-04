@@ -21,12 +21,20 @@ from textual.widgets import (
 )
 
 from usagetrim.core.cache import ContextCache
+from usagetrim.core.event_replay import snapshot_availability
 from usagetrim.core.gain import build_gain_report
 from usagetrim.core.telemetry import TelemetryStore
 from usagetrim.metrics.pricing import calculate_cost
 from usagetrim.tui.cache_screen import CacheScreen
+from usagetrim.tui.diff_screen import DiffScreen
 from usagetrim.tui.formatting import format_timestamp
-from usagetrim.tui.history import HistoryFilters, read_history
+from usagetrim.tui.history import HistoryFilters, read_history, read_history_inspections
+from usagetrim.tui.replay_data import (
+    InspectionData,
+    ReplayState,
+    format_event_status,
+    read_event_inspection,
+)
 from usagetrim.tui.savings import SavingsSeries, read_savings
 from usagetrim.tui.vim_table import VimDataTable
 from usagetrim.tui.workers import IOLane, IoResult
@@ -68,6 +76,9 @@ class UsageTrimDashboard(App):
         self._selected_event_id: str | None = None
         self._details_widget: Static | None = None
         self._refresh_lane = IOLane(self, "telemetry-refresh")
+        self._inspection_lane = IOLane(self, "event-details")
+        self._history_inspections = {}
+        self._inspection_detail = None
         self._store_holder = [store]
 
     def compose(self) -> ComposeResult:
@@ -105,38 +116,77 @@ class UsageTrimDashboard(App):
     def on_mount(self) -> None:
         self._details_widget = self.query_one("#details", Static)
         table = self.query_one("#history", DataTable)
-        table.add_columns("When", "Operation", "Raw", "Compact", "Saved", "Reduction", "Delivery")
+        table.add_columns(
+            "When", "Operation", "Raw", "Compact", "Saved", "Reduction", "Delivery", "Execution"
+        )
         table.focus()
         self.refresh_dashboard()
         self.set_interval(5, self.refresh_dashboard)
 
     def action_focus_filters(self) -> None:
+        if self.screen.id in {"cache-screen", "diff-screen"}:
+            return
         self.query_one("#operation-filter", Input).focus()
 
     def action_focus_history(self) -> None:
+        if self.screen.id in {"cache-screen", "diff-screen"}:
+            return
         self.query_one("#history", DataTable).focus()
 
     def action_refresh_history(self) -> None:
         self.refresh_dashboard()
 
     def action_open_cache(self) -> None:
+        if isinstance(self.screen, DiffScreen):
+            return
         if isinstance(self.screen, CacheScreen):
             self.screen.action_close()
         else:
             self._refresh_lane.invalidate()
+            self._inspection_lane.invalidate()
             self.push_screen(CacheScreen(self.cache), self._cache_closed)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        table = event.data_table
+        if (
+            table.id == "history"
+            and table.is_attached
+            and table.has_focus
+            and table.row_count
+            and event.cursor_row == table.cursor_row
+            and event.row_key.value in self._history
+            and table.coordinate_to_cell_key(table.cursor_coordinate).row_key == event.row_key
+            and self.screen.id not in {"cache-screen", "diff-screen"}
+        ):
+            self._selected_event_id = event.row_key.value
+            self.action_open_diff()
+
+    def action_open_diff(self) -> None:
+        if (
+            self.store is None
+            or self._selected_event_id not in self._history
+            or self.screen.id in {"cache-screen", "diff-screen"}
+        ):
+            return
+        self._refresh_lane.invalidate()
+        self._inspection_lane.invalidate()
+        self.push_screen(
+            DiffScreen(self.store, self._selected_event_id, cache=self.cache), self._cache_closed
+        )
 
     def _cache_closed(self, result: None) -> None:
         if (
             self.is_running
             and self._details_widget is not None
             and self._details_widget.is_attached
-            and self.screen.id != "cache-screen"
+            and self.screen.id not in {"cache-screen", "diff-screen"}
         ):
             self.refresh_dashboard()
             self.action_focus_history()
 
     def action_apply_filters(self) -> None:
+        if self.screen.id in {"cache-screen", "diff-screen"}:
+            return
         self.filters = HistoryFilters(
             operation=self.query_one("#operation-filter", Input).value or None,
             client=self.query_one("#client-filter", Input).value or None,
@@ -164,6 +214,7 @@ class UsageTrimDashboard(App):
         # sender directly instead of looking up a table that may be unmounted.
         if (
             not self.is_running
+            or self.screen.id in {"cache-screen", "diff-screen"}
             or table.id != "history"
             or not table.is_attached
             or table.row_count == 0
@@ -177,6 +228,9 @@ class UsageTrimDashboard(App):
             return
         if table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value != event_id:
             return
+        if self._selected_event_id != event_id:
+            self._inspection_lane.invalidate()
+            self._inspection_detail = None
         self._selected_event_id = event_id
         self._show_details()
 
@@ -187,11 +241,77 @@ class UsageTrimDashboard(App):
         event = self._history.get(self._selected_event_id)
         text = "No operation selected."
         if event is not None:
+            event_id = event["event_id"]
+            metadata = self._history_inspections.get(event_id)
+            presence = None
+            if self._inspection_detail is not None and self._inspection_detail[0] == event_id:
+                _, metadata, presence = self._inspection_detail
+            status = format_event_status(
+                metadata.inspection if metadata else None,
+                delivery=metadata.delivery if metadata else event.get("delivery"),
+            )
+            availability = "Not recorded"
+            if metadata is not None:
+                if metadata.state is ReplayState.EVENT_MISSING:
+                    availability = "Event was removed"
+                elif metadata.inspection is not None:
+                    state = metadata.inspection.snapshot_state
+                    availability = {
+                        "disabled": "Not recorded (replay disabled)",
+                        "cache_disabled": "Not recorded (cache disabled)",
+                        "too_large": "Capture exceeded the snapshot limit",
+                        "unavailable": "Capture unavailable",
+                    }.get(state, "Not recorded")
+                    if state == "stored":
+                        availability = (
+                            "Checking…"
+                            if presence is None
+                            else (
+                                f"before: {'present' if presence[0] else 'unavailable'}; "
+                                f"after: {'present' if presence[1] else 'unavailable'} (content not checked)"
+                            )
+                        )
+                elif metadata.state not in {ReplayState.HISTORICAL, ReplayState.READY}:
+                    availability = "Inspection unavailable"
             # JSON quoting preserves metadata strings without interpreting markup
             # or allowing embedded newlines to impersonate additional fields.
-            text = "Recorded telemetry metadata (null = not recorded)\n" + "\n".join(
+            text = (
+                f"Execution: {status.execution}\nRecovery: {status.recovery}\n"
+                f"Delivery: {status.delivery}\nBefore/after: {availability}\n"
+                "Enter on the history row opens a comparison.\n"
+                "Recorded telemetry metadata (null = not recorded)\n"
+            ) + "\n".join(
                 f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in event.items()
             )
+            if self._inspection_detail is None or self._inspection_detail[0] != event_id:
+
+                def load():
+                    inspected = read_event_inspection(self.store, event_id)
+                    available = (
+                        snapshot_availability(inspected.inspection, cache=self.cache)
+                        if inspected.inspection is not None
+                        and inspected.inspection.snapshot_state == "stored"
+                        else None
+                    )
+                    return inspected, available
+
+                def apply(value, error):
+                    if (
+                        not self.is_running
+                        or not details.is_attached
+                        or self._selected_event_id != event_id
+                        or self.screen.id in {"cache-screen", "diff-screen"}
+                    ):
+                        return
+                    if error is None:
+                        inspected, available = value
+                    else:
+                        inspected = InspectionData(event_id, ReplayState.METADATA_UNAVAILABLE)
+                        available = None
+                    self._inspection_detail = (event_id, inspected, available)
+                    self._show_details()
+
+                self._inspection_lane.submit(event_id, load, apply)
         details.update(text)
 
     def _show_savings(self, series: SavingsSeries) -> None:
@@ -216,7 +336,7 @@ class UsageTrimDashboard(App):
         """Refresh from telemetry without recording dashboard activity as savings."""
         if self._details_widget is None or not self._details_widget.is_attached:
             return
-        if self.screen.id == "cache-screen":
+        if self.screen.id in {"cache-screen", "diff-screen"}:
             return
         filters = self.filters
 
@@ -230,7 +350,8 @@ class UsageTrimDashboard(App):
             now = time.time()
             history = read_history(store, filters, now=now)
             savings = read_savings(store, filters, now=now)
-            return store, report, history, savings
+            inspections = read_history_inspections(store, history)
+            return store, report, history, savings, inspections
 
         self._refresh_lane.submit(filters, load, self._apply_dashboard)
 
@@ -240,13 +361,14 @@ class UsageTrimDashboard(App):
 
     def on_unmount(self) -> None:
         self._refresh_lane.close()
+        self._inspection_lane.close()
 
     def _apply_dashboard(self, result, error) -> None:
         if (
             not self.is_running
             or self._details_widget is None
             or not self._details_widget.is_attached
-            or self.screen.id == "cache-screen"
+            or self.screen.id in {"cache-screen", "diff-screen"}
         ):
             return
         status = self.query_one("#status", Static)
@@ -255,7 +377,9 @@ class UsageTrimDashboard(App):
                 f"Unable to refresh telemetry ({type(error).__name__}); retrying in 5 seconds."
             )
             return
-        self.store, report, history, savings = result
+        self.store, report, history, savings, self._history_inspections = result
+        self._inspection_lane.invalidate()
+        self._inspection_detail = None
         self.query_one("#summary", Static).update(
             f"Operations: {report.total_events:,}\n"
             f"Estimated tokens — raw: {report.raw_openai:,} · compact: {report.compact_openai:,} · "
@@ -277,7 +401,7 @@ class UsageTrimDashboard(App):
         else:
             message = (
                 f"Showing {len(history)} operations (maximum 50) · refreshes every 5 seconds · "
-                "arrows/Page Up/Page Down."
+                "arrows/j/k/Page Up/Page Down · Enter: compare."
             )
         status.update(message)
         table = self.query_one("#history", DataTable)
@@ -299,6 +423,11 @@ class UsageTrimDashboard(App):
                 f"{saved:,}" if saved is not None else "—",
                 f"{reduction:.1f}%" if reduction is not None else "—",
                 Text(event["delivery"]),
+                Text(
+                    format_event_status(
+                        self._history_inspections[event["event_id"]].inspection
+                    ).execution
+                ),
                 key=event["event_id"],
             )
         if table.row_count:
