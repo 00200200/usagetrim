@@ -141,6 +141,15 @@ def test_limits_and_disconnect(monkeypatch):
         application = sse.SSEApplication()
         received = asyncio.Queue()
         sent = asyncio.Queue()
+        worker_waiting = asyncio.Event()
+        acquire = application.execution_lock.acquire
+
+        async def observed_acquire():
+            worker_waiting.set()
+            return await acquire()
+
+        await acquire()
+        monkeypatch.setattr(application.execution_lock, "acquire", observed_acquire)
 
         async def send(event):
             await sent.put(event)
@@ -192,13 +201,22 @@ def test_limits_and_disconnect(monkeypatch):
             assert await post(b"x" * 11) == 413
             assert await post(b"{") == 400
             session = next(iter(application.sessions.values()))
+            assert await post(b"{}") == 202
+            # The worker dequeues before acquiring the lock. Wait until it has
+            # reached the held lock so it cannot free another queue slot.
+            await asyncio.wait_for(worker_waiting.wait(), 2)
+            assert session.incoming.empty()
+            assert application.pending_request_bytes == sse.MAX_REQUEST_BYTES
             for _ in range(sse.QUEUE_SIZE):
                 session.incoming.put_nowait(b"{}")
                 application.pending_request_bytes += sse.MAX_REQUEST_BYTES
             assert await post(b"{}") == 429
+            assert session.incoming.full()
+            assert application.pending_request_bytes == (sse.QUEUE_SIZE + 1) * sse.MAX_REQUEST_BYTES
             await received.put({"type": "http.disconnect"})
             await asyncio.wait_for(task, 2)
             assert not application.sessions
+            assert application.pending_request_bytes == 0
             assert await post(b"{}") == 404
             events = []
 
@@ -210,8 +228,14 @@ def test_limits_and_disconnect(monkeypatch):
             )
             assert events[0]["status"] == 403
         finally:
-            await received.put({"type": "http.disconnect"})
-            await asyncio.wait_for(task, 2)
+            try:
+                await received.put({"type": "http.disconnect"})
+                await asyncio.wait_for(task, 2)
+            finally:
+                application.execution_lock.release()
+            assert not application.sessions
+            assert application.pending_request_bytes == 0
+            assert application.pending_response_bytes == 0
 
     asyncio.run(scenario())
 
