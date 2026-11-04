@@ -106,6 +106,55 @@ usagetrim prepare --file draft.txt
 
 [Details and tradeoffs →](https://github.com/00200200/usagetrim/blob/main/docs/guide.md)
 
+### Local Llama 3 text token counting
+
+You can explicitly supply an already-obtained April 2024 Llama 3
+`tokenizer.model` file. UsageTrim never downloads it or installs a backend:
+
+```sh
+export USAGETRIM_LLAMA3_TOKENIZER_PATH=/absolute/path/to/tokenizer.model
+usagetrim tokens "hello world" --model llama
+usagetrim prepare --file draft.txt --model llama --budget 1000
+```
+
+In PowerShell, set `$env:USAGETRIM_LLAMA3_TOKENIZER_PATH` to the local file path.
+The optional path is consulted only for the `llama` family. It does not change
+legacy calls with `model=None` or the Claude/OpenAI counting paths.
+
+With tiktoken available and a valid file, the method is
+`llama3-2024-04-local-sha256-<file digest>` and `is_estimate=False`: this is a
+real count of plain text under that specific local vocabulary and the April
+2024 Llama 3 segmentation rules. It does not certify that the file came from
+Meta. Use the tokenizer supplied for your exact model; the file digest identifies
+the artifact, not a general guarantee for every Llama version or derivative.
+SentencePiece files and other vocabulary formats are not supported by this adapter.
+
+The adapter accepts regular files named `tokenizer.model`, at most 16 MiB, in
+base64-token/integer-rank format with 128,000 unique contiguous ranks and complete
+byte fallback. URL and UNC paths are refused. No file is executed. Missing,
+unreadable, oversized or structurally incompatible files, or unavailable tiktoken,
+use the existing deterministic `utf8-bytes-div4-ceil` estimate instead. Configuration
+errors are reflected by the fallback method and estimate label. Structural
+validation cannot detect every vocabulary intended for a different model.
+One encoding snapshot is pinned throughout an optimization/preparation operation;
+changing the file or environment affects only subsequent operations.
+
+No BOS/EOS, chat templates, role markers or API message framing are added.
+Text resembling a special token is counted as ordinary text. These counts are
+therefore not counts for an entire API request. Budget enforcement uses the
+selected local method; the UTF-8 fallback is not an upper bound on provider tokens.
+
+The adapter uses tiktoken's Encoding API and the published segmentation rules;
+it does not bundle Meta vocabulary, model weights or the Meta tokenizer class.
+Obtain and use Meta artifacts under the
+[Meta Llama 3 Community License](https://github.com/meta-llama/llama3/blob/main/LICENSE).
+The synthetic CI vocabulary tests loading, byte fallback and merges, not agreement
+with an official model. An optional manual comparison can use an independently
+installed [Meta tokenizer](https://github.com/meta-llama/llama3/blob/main/llama/tokenizer.py)
+and the same local file: compare counts with `bos=False`, `eos=False`, and special
+tokens treated as ordinary text, across code, JSON, whitespace and Unicode.
+No official vocabulary is required by the regular test suite.
+
 ### Measured on real sessions
 
 Maintainer-reported results from 14 days of Claude Code transcripts, replayed offline through the same functions the hook runs. Token counts are local `o200k_base` estimates, not billing; the private transcripts are not included as a public benchmark dataset.

@@ -589,6 +589,8 @@ def prepare_command(
             "Review before pasting into Claude Desktop / Codex. "
             "Credentials are redacted; compaction may cache a redacted original."
         )
+        if result.get("ref_id"):
+            err_console.print(f"Original redacted draft: usagetrim retrieve {result['ref_id']}")
         if selected_mode == "summary":
             err_console.print(
                 "Summary is heuristic and lossy; verify goals, constraints and decisions."

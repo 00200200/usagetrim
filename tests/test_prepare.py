@@ -207,7 +207,7 @@ def model_prepare_backend(monkeypatch):
     monkeypatch.setattr(adaptive, "count_tokens", forbidden)
     monkeypatch.setattr(adaptive, "ContextCache", MemoryCache)
     monkeypatch.setattr(adaptive, "compact_terminal_output", lambda text, options: text)
-    monkeypatch.setattr(prepare, "safe_compact_output", lambda text: text)
+    monkeypatch.setattr(prepare, "safe_compact_output", lambda text, **kwargs: text)
     monkeypatch.setattr(
         prepare, "distill_conversation", lambda text, **kw: SimpleNamespace(text=text)
     )

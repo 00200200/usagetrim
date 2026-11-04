@@ -5,6 +5,49 @@ import pytest
 from usagetrim.core.prompt_optimizer import align_prompt, lint_prompt, minify_prompt
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "session_id: abc\n=======\nKeep all rules.\n",
+        "session_id: abc\n-------\nKeep all rules.\n",
+        "session_id: abc\nContinuation of the heading\n=======\nKeep rules.\n",
+        "session_id: abc\n    code child\nKeep rules.\n",
+        "- session_id: abc\n  Keep its child instruction.\n",
+        "session_id: abc\n- Keep the first rule.\n  - Keep the nested rule.\n",
+        "```text\nsession_id: abc\nKeep code exactly.\n```\n",
+        "~~~text\nsession_id: abc\nKeep code exactly.\n~~~\n",
+        ">session_id: abc\n> Keep the quoted instruction.\n",
+        "---\nsession_id: abc\n---\nKeep rules.\n",
+        "<!--\nsession_id: abc\n-->\nKeep rules.\n",
+        "session_id: abc\n# Parent section\nKeep rules.\n",
+        "session_id: abc\nIf current time is unknown, never deploy.\nKeep rules.\n",
+    ],
+)
+def test_model_alignment_preserves_ambiguous_markdown_blocks(text):
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary
+
+    assert align_to_cache_boundary(text, 1, model="generic") == text
+    assert align_prompt(text, model="generic").aligned_text == text
+
+
+def test_boundary_alignment_preserves_order_of_plain_instructions():
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary
+
+    text = "session_id: abc\nrequest_id: request-123\nFirst validate.\nThen deploy.\n"
+    output = align_to_cache_boundary(text, 1, model="generic")
+    assert output.index("First validate.") < output.index("Then deploy.")
+    assert output.index("Then deploy.") < output.index("session_id: abc")
+    assert output.index("session_id: abc") < output.index("request_id: request-123")
+    assert "First validate.\nThen deploy." in output
+
+
+def test_minification_redacts_secret_created_by_comment_removal():
+    text = "ghp_<!-- separator -->" + "A" * 36
+    output = minify_prompt(text, model="generic").minified_text
+    assert "A" * 36 not in output
+    assert "REDACTED" in output
+
+
 @pytest.mark.parametrize("length,reached", [(12, False), (13, True), (17, True)])
 def test_align_boundary_measures_static_prefix_only(length, reached):
     from usagetrim.core.prompt_optimizer import align_to_cache_boundary

@@ -24,7 +24,7 @@ from usagetrim.core.distill import (
 from usagetrim.core.prompt_optimizer import align_prompt, lint_prompt
 from usagetrim.core.redactor import redact_secrets
 from usagetrim.core.table import compact_table
-from usagetrim.metrics.tokenizer import count_model_tokens, count_tokens
+from usagetrim.metrics.tokenizer import count_model_tokens, count_tokens, model_counting
 
 _COLOR = re.compile(r"\x1b\[[0-9;]*m")
 _FENCE_PATTERN = re.compile(r"(```([a-zA-Z0-9_\-]+)?\n(.*?)```)", re.DOTALL)
@@ -91,9 +91,12 @@ class OptimizeResult:
     text: str
     primary_mode: str
     pipeline_stages: list[str]
+    model: str | None = None
+    method: str | None = None
+    is_estimate: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "original_tokens": self.original_tokens,
             "optimized_tokens": self.optimized_tokens,
             "saved_tokens": self.saved_tokens,
@@ -103,12 +106,17 @@ class OptimizeResult:
             "primary_mode": self.primary_mode,
             "pipeline_stages": self.pipeline_stages,
         }
+        if self.model is not None:
+            result.update(model=self.model, method=self.method, is_estimate=self.is_estimate)
+        return result
 
 
+@model_counting
 def _optimize_code_fence(
     lang: str, body: str, budget: int, *, model: str | None = None
 ) -> tuple[str, str | None]:
     """Optimize code blocks inside markdown fences."""
+    model_options = {} if model is None else {"model": model}
     lang_clean = (lang or "").lower().strip()
     body_clean = body.strip()
 
@@ -124,7 +132,7 @@ def _optimize_code_fence(
     if lang_clean == "json" or (
         body_clean.startswith(("[", "{")) and body_clean.endswith(("]", "}"))
     ):
-        res = compact_table(body, budget=budget, format_type="toon")
+        res = compact_table(body, budget=budget, format_type="toon", **model_options)
         candidate = f"```text\n{res.text.strip()}\n```"
         if improves(candidate, model is None and res.compacted_tokens < res.original_tokens):
             return candidate, "fence:toon"
@@ -141,7 +149,7 @@ def _optimize_code_fence(
 
     # 3. Log / Traceback inside fence
     if "Traceback (most recent call last):" in body or "FAILED " in body or " PASSED" in body:
-        clip_res = compact_text(body, budget=budget)
+        clip_res = compact_text(body, budget=budget, **model_options)
         candidate = f"```{lang_clean or 'text'}\n{clip_res.text.strip()}\n```"
         if improves(
             candidate, model is None and clip_res.compacted_tokens < clip_res.original_tokens
@@ -151,12 +159,14 @@ def _optimize_code_fence(
     return "", None
 
 
+@model_counting
 def optimize_context(
     raw_input: str,
     budget: int = 2000,
     preserve_prompt_prefix: bool = True,
     *,
     model: str | None = None,
+    original_text: str | None = None,
 ) -> OptimizeResult:
     """Optimize context with recoverable redacted input and local token counts.
 
@@ -172,12 +182,22 @@ def optimize_context(
             return count_model_tokens(text, model).count
         return count_tokens(text).openai
 
+    model_options = {} if model is None else {"model": model}
     cleaned = _COLOR.sub("", raw_input)
     redacted = redact_secrets(cleaned)
     original_tokens = size(redacted)
+    measurement_options = {}
+    if model is not None:
+        measurement = count_model_tokens(redacted, model)
+        measurement_options = {
+            "model": measurement.model,
+            "method": measurement.method,
+            "is_estimate": measurement.is_estimate,
+        }
 
     cache = ContextCache()
-    ref_id = cache.store(redacted, source="unified-optimizer")
+    recovery_original = redacted if original_text is None else redact_secrets(original_text)
+    ref_id = cache.store(recovery_original, source="unified-optimizer")
 
     if original_tokens <= 12 and (model is None or original_tokens <= budget):
         return OptimizeResult(
@@ -189,6 +209,7 @@ def optimize_context(
             text=redacted,
             primary_mode="passthrough",
             pipeline_stages=["secret_redaction"],
+            **measurement_options,
         )
 
     pipeline_stages: list[str] = ["secret_redaction"]
@@ -226,7 +247,7 @@ def optimize_context(
         (stripped.startswith("[") and stripped.endswith("]"))
         or (stripped.startswith("{") and '"' in stripped and "{" in stripped)
     ):
-        tbl_res = compact_table(working_text, budget=budget, format_type="toon")
+        tbl_res = compact_table(working_text, budget=budget, format_type="toon", **model_options)
         if (
             size(tbl_res.text) < size(working_text)
             if model is not None
@@ -242,7 +263,7 @@ def optimize_context(
         working_text,
         re.MULTILINE | re.IGNORECASE,
     ):
-        dist_res = distill_conversation(working_text, budget=budget)
+        dist_res = distill_conversation(working_text, budget=budget, **model_options)
         if (
             size(dist_res.text) < size(working_text)
             if model is not None
@@ -267,7 +288,7 @@ def optimize_context(
         from usagetrim.core.specialized import filter_dev_server_logs, filter_traceback
 
         tb_filtered = filter_traceback(working_text)
-        dev_filtered = filter_dev_server_logs(tb_filtered)
+        dev_filtered = redact_secrets(filter_dev_server_logs(tb_filtered))
         if size(dev_filtered) < size(working_text):
             working_text = dev_filtered
             primary_mode = "dev_log_traceback"
@@ -275,7 +296,7 @@ def optimize_context(
 
     # D. General text / terminal logs / diffs fallback
     if primary_mode == "hybrid" or working_text == redacted:
-        clip_res = compact_text(working_text, budget=budget)
+        clip_res = compact_text(working_text, budget=budget, **model_options)
         if (
             size(clip_res.text) < size(working_text)
             if model is not None
@@ -289,10 +310,15 @@ def optimize_context(
         primary_mode = "passthrough"
 
     # Step 3: Strict Budget Ceiling Enforcement
+    working_text = redact_secrets(working_text)
     current_tokens = size(working_text)
     if model is not None and current_tokens > budget:
         working_text = compress_to_budget(
-            working_text, budget, original_text=redacted, source="unified-optimizer", model=model
+            working_text,
+            budget,
+            original_text=recovery_original,
+            source="unified-optimizer",
+            model=model,
         )
         current_tokens = size(working_text)
         pipeline_stages.append("budget_ceiling_enforcement")
@@ -337,4 +363,5 @@ def optimize_context(
         text=working_text,
         primary_mode=primary_mode,
         pipeline_stages=pipeline_stages,
+        **measurement_options,
     )

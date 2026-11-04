@@ -3,8 +3,11 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
+from functools import wraps
+from inspect import signature
 from typing import Literal
 
 try:
@@ -170,18 +173,128 @@ def _model_encoding(name: str):
     raise ValueError("No instantiated local tiktoken encoding")
 
 
+def _local_llama_encoding():
+    from usagetrim.metrics.llama_tokenizer import local_llama3_encoding
+
+    return local_llama3_encoding(tiktoken)
+
+
+@dataclass(frozen=True)
+class _ModelCounter:
+    model: str
+    family: ModelFamily
+    encoding: object
+    method: str
+
+    def measure(self, text: str) -> ModelTokenCount:
+        try:
+            count = (
+                _utf8_estimate(text)
+                if self.encoding is None
+                else len(self.encoding.encode(text, disallowed_special=()))
+            )
+        except (OSError, ValueError, RuntimeError, ImportError):
+            raise ValueError(
+                "The selected token counting backend failed during this operation"
+            ) from None
+        method = self.method
+        if self.family is ModelFamily.CLAUDE:
+            count = math.ceil(count * 1.10)
+            method = f"legacy-{method}-x1.10"
+        elif self.family is ModelFamily.GEMINI:
+            count = math.ceil(count * 1.02)
+            method = f"legacy-{method}-x1.02"
+        return ModelTokenCount(
+            count,
+            self.model,
+            self.family,
+            method,
+            not (
+                self.family is ModelFamily.OPENAI
+                and method == "o200k_base"
+                or self.family is ModelFamily.LLAMA
+                and self.encoding is not None
+            ),
+        )
+
+
+_MODEL_COUNTER: ContextVar[_ModelCounter | None] = ContextVar("model_counter", default=None)
+
+
+def model_counting(function):
+    """Pin one offline counting method across a call and its model-aware helpers.
+
+    Legacy calls do not enter a counting context. A pinned encoder that fails
+    later propagates its error instead of silently switching measurement units.
+    """
+    call_signature = signature(function)
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        bound = call_signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        model = bound.arguments.get("model")
+        if model is None:
+            return function(*args, **kwargs)
+        # Validation is intentionally before transforms and cache access.
+        try:
+            family = ModelFamily(model)
+        except ValueError:
+            supported = ", ".join(item.value for item in ModelFamily)
+            raise ValueError(f"Unknown model: {model}. Supported values: {supported}") from None
+        current = _MODEL_COUNTER.get()
+        if current is not None and current.model == model:
+            return function(*args, **kwargs)
+        encoding = _local_llama_encoding() if family is ModelFamily.LLAMA else None
+        if family in {ModelFamily.OPENAI, ModelFamily.CLAUDE, ModelFamily.GEMINI}:
+            for name in ("o200k_base", "cl100k_base"):
+                try:
+                    candidate = _model_encoding(name)
+                    candidate.encode("", disallowed_special=())
+                    encoding = candidate
+                    break
+                except (OSError, ValueError, RuntimeError, ImportError):
+                    continue
+        counter = _ModelCounter(
+            model,
+            family,
+            encoding,
+            encoding.name if encoding is not None else "utf8-bytes-div4-ceil",
+        )
+        token = _MODEL_COUNTER.set(counter)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _MODEL_COUNTER.reset(token)
+
+    return wrapped
+
+
 def count_model_tokens(text: str, model: str) -> ModelTokenCount:
     """Count plain text using an explicit family; excludes chat framing/billing.
 
     Family selection is not selection of a particular provider model version.
-    Only o200k_base counts are unestimated encoding counts. Claude, Gemini,
-    Llama, DeepSeek and generic results never claim to implement those models' tokenizers.
+    Unestimated counts refer to o200k_base or the explicitly configured local
+    Llama 3 encoding, not arbitrary model versions or API message token counts.
+    Claude, Gemini, DeepSeek and generic results remain estimates.
     """
+    current = _MODEL_COUNTER.get()
+    if current is not None and current.model == model:
+        return current.measure(text)
     try:
         family = ModelFamily(model)
     except ValueError:
         supported = ", ".join(item.value for item in ModelFamily)
         raise ValueError(f"Unknown model: {model}. Supported values: {supported}") from None
+
+    if family is ModelFamily.LLAMA:
+        encoding = _local_llama_encoding()
+        return _ModelCounter(
+            model,
+            family,
+            encoding,
+            encoding.name if encoding is not None else "utf8-bytes-div4-ceil",
+        ).measure(text)
 
     if family in {ModelFamily.OPENAI, ModelFamily.CLAUDE, ModelFamily.GEMINI}:
         for name in ("o200k_base", "cl100k_base"):

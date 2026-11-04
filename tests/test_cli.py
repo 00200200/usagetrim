@@ -96,7 +96,7 @@ def test_cli_model_selection_and_offline_fallback(monkeypatch, environment, flag
     monkeypatch.setattr(
         tokenizer, "_model_encoding", forbidden if expected == "deepseek" else unavailable
     )
-    monkeypatch.setattr(prepare, "safe_compact_output", lambda text: text)
+    monkeypatch.setattr(prepare, "safe_compact_output", lambda text, **kwargs: text)
     monkeypatch.setattr(prepare, "count_tokens", lambda text: tokenizer.TokenCount(3, 2, 1))
     options = [] if flag is None else ["--model", flag]
     tokens = runner.invoke(app, ["tokens", "hello world", *options])

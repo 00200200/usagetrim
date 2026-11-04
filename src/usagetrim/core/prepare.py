@@ -3,7 +3,7 @@
 from usagetrim.core.distill import distill_conversation
 from usagetrim.core.redactor import redact_secrets
 from usagetrim.core.safe_filter import safe_compact_output
-from usagetrim.metrics.tokenizer import count_model_tokens, count_tokens
+from usagetrim.metrics.tokenizer import count_model_tokens, count_tokens, model_counting
 
 MAX_INPUT_BYTES = 128 * 1024
 # Desktop-friendly summary/optimize ceiling (Claude Desktop / Codex paste targets).
@@ -28,6 +28,7 @@ def format_prepare_counts(before: int, after: int) -> str:
     return f"{before:,} → {after:,} ({delta_text} · {percent_text})"
 
 
+@model_counting
 def prepare_text(
     text: str,
     *,
@@ -50,6 +51,7 @@ def prepare_text(
         return count_tokens(value).openai
 
     model_options = {} if model is None else {"model": model}
+    recovery_ref = None
     redacted = redact_secrets(text)
     if mode == "desktop" and redacted.strip():
         from usagetrim.core.optimizer import optimize_context
@@ -57,17 +59,21 @@ def prepare_text(
         from usagetrim.core.specialized import filter_dev_server_logs, filter_traceback
 
         tb_filtered = filter_traceback(redacted)
-        dev_filtered = filter_dev_server_logs(tb_filtered)
+        dev_filtered = redact_secrets(filter_dev_server_logs(tb_filtered))
         stabilized = stabilize_cache_prefix(dev_filtered, **model_options)
-        candidate = optimize_context(stabilized, budget=budget, **model_options).text
+        recovery_options = {"original_text": redacted} if stabilized != redacted else {}
+        optimized = optimize_context(stabilized, budget=budget, **model_options, **recovery_options)
+        candidate = optimized.text
+        if recovery_options:
+            recovery_ref = optimized.ref_id
     elif mode == "optimize" and redacted.strip():
         from usagetrim.core.optimizer import optimize_context
 
         candidate = optimize_context(redacted, budget=budget, **model_options).text
     elif mode == "summary" and redacted.strip():
-        candidate = distill_conversation(redacted, budget=budget).text
+        candidate = distill_conversation(redacted, budget=budget, **model_options).text
     else:
-        candidate = safe_compact_output(redacted)
+        candidate = safe_compact_output(redacted, **model_options)
     # Never make a draft larger just to advertise a transformation. Redactions
     # remain even when their replacement labels themselves cost more tokens.
     if model is not None:
@@ -110,4 +116,9 @@ def prepare_text(
             method=measurement.method,
             is_estimate=measurement.is_estimate,
         )
+    if recovery_ref is not None and candidate != redacted:
+        # Keep the text budget unchanged: recovery is returned as metadata,
+        # and the CLI presents it separately from the prepared draft. This also
+        # repairs recovery for legacy Desktop calls without changing their counts.
+        result["ref_id"] = recovery_ref
     return result

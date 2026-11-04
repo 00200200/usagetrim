@@ -8,6 +8,9 @@ idempotent and ordinary code, short words, and prior placeholders stay intact.
 from __future__ import annotations
 
 import re
+from bisect import bisect_left, bisect_right
+
+from usagetrim.core.terminal_text import ANSI_SEQUENCE
 
 # Combined detectors. Anthropic (`sk-ant-`) is listed before broader `sk-` forms
 # inside the OpenAI group so substitution order stays correct when both fire.
@@ -129,4 +132,36 @@ def redact_secrets(text: str) -> str:
             continue
         for pattern, replacement in group:
             text = pattern.sub(replacement, text)
-    return text
+    if "\x1b" not in text:
+        return text
+    # Detect against terminal-visible text, but preserve unrelated ANSI bytes in
+    # recoverable originals. Map spans using escape offsets, not a per-char map.
+    positions, removed = [], [0]
+    for match in ANSI_SEQUENCE.finditer(text):
+        positions.append(match.start() - removed[-1])
+        removed.append(removed[-1] + match.end() - match.start())
+    if not positions:
+        return text
+    visible = ANSI_SEQUENCE.sub("", text)
+    replacements = []
+    for needles, group in _RULES:
+        if not any(needle in visible for needle in needles):
+            continue
+        for pattern, replacement in group:
+            for match in pattern.finditer(visible):
+                start, end = match.span()
+                replacements.append(
+                    (
+                        start + removed[bisect_right(positions, start)],
+                        end + removed[bisect_left(positions, end)],
+                        replacement,
+                    )
+                )
+    pieces, cursor = [], 0
+    for start, end, replacement in sorted(replacements, key=lambda item: (item[0], -item[1])):
+        if start < cursor:
+            continue
+        pieces.extend((text[cursor:start], replacement))
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)

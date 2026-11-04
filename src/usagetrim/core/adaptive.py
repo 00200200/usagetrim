@@ -4,9 +4,10 @@ from usagetrim.core.cache import ContextCache
 from usagetrim.core.cleaner import CleanerOptions, compact_terminal_output, strip_ansi
 from usagetrim.core.redactor import redact_secrets
 from usagetrim.core.safe_filter import recovery_notice
-from usagetrim.metrics.tokenizer import count_model_tokens, count_tokens
+from usagetrim.metrics.tokenizer import count_model_tokens, count_tokens, model_counting
 
 
+@model_counting
 def compress_to_budget(
     text: str,
     max_tokens: int,
@@ -24,6 +25,30 @@ def compress_to_budget(
     Provider estimates are not billing counts for any particular model.
     An explicit model selects model-family counting, which may also be estimated.
     """
+    result, _ = _compress_to_budget_with_ref(
+        text,
+        max_tokens,
+        provider,
+        source,
+        original_text=original_text,
+        suffix=suffix,
+        model=model,
+    )
+    return result
+
+
+@model_counting
+def _compress_to_budget_with_ref(
+    text: str,
+    max_tokens: int,
+    provider: str = "claude",
+    source: str = "adaptive",
+    *,
+    original_text: str | None = None,
+    suffix: str = "",
+    model: str | None = None,
+) -> tuple[str, str | None]:
+    """Return the emitted text and its authoritative recovery reference."""
     if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
         raise ValueError("max_tokens must be a positive integer")
     if provider not in {"claude", "openai", "gemini"}:
@@ -33,6 +58,7 @@ def compress_to_budget(
         count_model_tokens("", model)
 
     def size(value: str) -> int:
+        value = redact_secrets(value)
         if model is not None:
             return count_model_tokens(value, model).count
         return getattr(count_tokens(value), provider)
@@ -41,7 +67,7 @@ def compress_to_budget(
     cleaned = redact_secrets(text)
     suffix = redact_secrets(suffix)
     if cleaned.rstrip("\n") == original.rstrip("\n") and size(cleaned + suffix) <= max_tokens:
-        return cleaned + suffix
+        return redact_secrets(cleaned + suffix), None
 
     # Sanitization is deliberately applied before persistence, not only display.
     ref_id = ContextCache().store(original, source=source)
@@ -52,9 +78,9 @@ def compress_to_budget(
     if size(marker + suffix) > max_tokens:
         raise ValueError("max_tokens is too small for the recovery reference")
 
-    cleaned = strip_ansi(cleaned).strip()
+    cleaned = redact_secrets(strip_ansi(cleaned).strip())
     if size(cleaned + marker + suffix) <= max_tokens:
-        return cleaned + marker + suffix
+        return redact_secrets(cleaned + marker + suffix), ref_id
 
     target_lines = max(4, max_tokens // 12)
     compacted = compact_terminal_output(
@@ -67,11 +93,11 @@ def compress_to_budget(
         ),
     )
     if size(compacted + marker + suffix) <= max_tokens:
-        return compacted + marker + suffix
+        return redact_secrets(compacted + marker + suffix), ref_id
 
     # Retain both the start and final diagnostics, even for a single huge line.
     # Only measured candidates are returned: BPE counts need not be monotonic.
-    best = marker + suffix
+    best = redact_secrets(marker + suffix)
     low, high = 0, len(compacted)
     while low <= high:
         keep = (low + high) // 2
@@ -80,10 +106,10 @@ def compress_to_budget(
         candidate = compacted[:head] + marker
         if tail:
             candidate += "\n" + compacted[-tail:]
-        candidate += suffix
+        candidate = redact_secrets(candidate + suffix)
         if size(candidate) <= max_tokens:
             best = candidate
             low = keep + 1
         else:
             high = keep - 1
-    return best
+    return best, ref_id

@@ -11,7 +11,7 @@ from typing import Any
 
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.redactor import redact_secrets
-from usagetrim.metrics.tokenizer import count_tokens
+from usagetrim.metrics.tokenizer import count_model_tokens, count_tokens, model_counting
 
 
 @dataclass
@@ -172,28 +172,48 @@ def _parse_sql_ascii_table(trimmed: str) -> tuple[list[str], list[list[str]]]:
     return [], []
 
 
+@model_counting
 def compact_table(
     raw_input: str,
     budget: int = 2000,
     format_type: str = "toon",
+    *,
+    model: str | None = None,
 ) -> TableResult:
     """Convert JSON object arrays or CSV data into token-efficient TOON or markdown table."""
+    if model is not None:
+        count_model_tokens("", model)
+
+    def size(value: str) -> int:
+        if model is not None:
+            return count_model_tokens(value, model).count
+        return count_tokens(value).openai
+
     redacted = redact_secrets(raw_input)
-    original_tokens = count_tokens(redacted).openai
+    original_tokens = size(redacted)
 
     headers, rows = _parse_tabular_input(redacted)
     if not headers or not rows:
         # Fallback to returning original text if tabular parsing fails
+        fallback, fallback_tokens, fallback_ref = redacted, original_tokens, None
+        if model is not None and original_tokens > budget:
+            from usagetrim.core.adaptive import _compress_to_budget_with_ref
+
+            fallback, fallback_ref = _compress_to_budget_with_ref(
+                redacted, budget, source="table-compaction", model=model
+            )
+            fallback_tokens = size(fallback)
+        saved = max(0, original_tokens - fallback_tokens)
         return TableResult(
             original_tokens=original_tokens,
-            compacted_tokens=original_tokens,
-            saved_tokens=0,
-            reduction_pct=0.0,
-            ref_id=None,
+            compacted_tokens=fallback_tokens,
+            saved_tokens=saved,
+            reduction_pct=round(saved / original_tokens * 100, 1) if original_tokens else 0.0,
+            ref_id=fallback_ref,
             row_count=0,
             column_count=0,
             columns=[],
-            text=redacted,
+            text=fallback,
             format_type="raw",
         )
 
@@ -218,10 +238,10 @@ def compact_table(
             lines.append(
                 f"\n[... {omitted} rows omitted to fit token budget. Ref: {ref_id} - usagetrim retrieve {ref_id} ...]"
             )
-        return "\n".join(lines)
+        return redact_secrets("\n".join(lines))
 
     full_rendered = _render(rows)
-    current_tokens = count_tokens(full_rendered).openai
+    current_tokens = size(full_rendered)
 
     # Budget enforcement loop
     kept_rows = list(rows)
@@ -235,7 +255,7 @@ def compact_table(
         omitted = len(rows) - len(head) - len(tail)
         kept_rows = head + tail
         full_rendered = _render(kept_rows, omitted=omitted)
-        current_tokens = count_tokens(full_rendered).openai
+        current_tokens = size(full_rendered)
 
         while current_tokens > budget and len(kept_rows) > 4:
             if len(head) >= len(tail) and head:
@@ -245,8 +265,15 @@ def compact_table(
             omitted = len(rows) - len(head) - len(tail)
             kept_rows = head + tail
             full_rendered = _render(kept_rows, omitted=omitted)
-            current_tokens = count_tokens(full_rendered).openai
+            current_tokens = size(full_rendered)
 
+    if model is not None and current_tokens > budget:
+        from usagetrim.core.adaptive import compress_to_budget
+
+        full_rendered = compress_to_budget(
+            full_rendered, budget, original_text=redacted, source="table-compaction", model=model
+        )
+        current_tokens = size(full_rendered)
     saved = max(0, original_tokens - current_tokens)
     pct = round((saved / original_tokens) * 100, 1) if original_tokens else 0.0
 
