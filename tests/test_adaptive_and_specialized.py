@@ -794,6 +794,7 @@ def test_filter_cargo_test_compacts_failures_hard_with_large_savings():
     assert "[UsageTrim: 200 passing tests, 200 progress records]" in compact
     assert "stack backtrace:" not in compact
     assert "acme_core::parser::parse_12" not in compact
+    assert "[UsageTrim: 99 stack backtrace lines omitted]" in compact
     assert reduction >= 85.0, (
         f"expected >=85% savings, got {reduction:.1f}% ({raw_tokens}->{out_tokens})"
     )
@@ -4084,3 +4085,12 @@ def test_otel_trace_duplicate_id_across_resources_falls_back():
     raw = json.dumps(document)
     assert filter_otel_trace(raw) == raw
     assert auto_specialize_command_output("curl localhost", raw) == raw
+
+
+def test_filter_cargo_test_notes_backtrace_at_end_of_output():
+    raw = "\n".join(
+        ["test a ... ok", "test b ... FAILED", "stack backtrace:", "   0: frame", "   1: frame"]
+    )
+    compact = filter_cargo_test(raw)
+    assert "   0: frame" not in compact
+    assert compact.endswith("[UsageTrim: 3 stack backtrace lines omitted]")
