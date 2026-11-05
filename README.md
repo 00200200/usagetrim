@@ -65,7 +65,7 @@ verbose tool text  →  keep the failure  →  recover the rest by reference
 | `docker build` BuildKit | 18,360 → **107** (99.4%) |
 | `go test` + goroutine dump | 3,281 → **64** (98.0%) |
 | `terraform plan` refresh/read | 6,409 → **276** (95.7%) |
-| `cargo test` + backtrace | 3,795 → **185** (95.1%) |
+| `cargo test` + backtrace | 3,795 → **197** (94.8%) |
 | pytest noisy (xdist + I/O) | 5,111 → **349** (93.2%) |
 | `kubectl describe` pod | 8,127 → **595** (92.7%) |
 | pytest recovery demo | 1,562 → **174** (88.9%) |
