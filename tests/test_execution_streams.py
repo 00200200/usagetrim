@@ -1,10 +1,12 @@
 """Execution identity, independent streams, observation order and quota accounting."""
 
 import hashlib
+import importlib.util
 import sqlite3
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from pathlib import Path
 from threading import Barrier
 
 import pytest
@@ -13,7 +15,7 @@ from usagetrim.core import artifact_quota
 from usagetrim.core import execution_artifacts as artifacts
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.execution_artifacts import ArtifactError, ArtifactState, ArtifactStream
-from usagetrim.core.stream_redactor import MASK
+from usagetrim.core.stream_redactor import MASK, StreamingRedactor
 
 
 @pytest.fixture
@@ -67,6 +69,67 @@ def test_decoders_do_not_mix_utf8_state_between_streams(cache):
     stderr.finish()
     assert cache.read_artifact(stdout.ref_id).text == "漢\n"
     assert cache.read_artifact(stderr.ref_id).text == "stderr �\n"
+
+
+@pytest.mark.parametrize("unfinished", [False, True])
+def test_scalar_and_ascii_paths_preserve_ccr_fragments_and_observation_spans(
+    tmp_path, monkeypatch, unfinished
+):
+    path = Path(__file__).parent / "fixtures/execution/redactor_reference.py"
+    spec = importlib.util.spec_from_file_location("stream_scalar_reference", path)
+    reference = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reference)
+    events = [
+        (0, b"safe\tline\n"),
+        (1, b"stderr\xff\n"),
+        (0, b"gh\x1b[31m"),
+        (1, b"CR\r"),
+        (0, b"p_" + b"A" * 36 + b"\n"),
+        (1, b"\nnext\n"),
+        (0, b"\xe6\xbc"),
+        (1, b"plain no newline"),
+        (0, b"\xa2\n"),
+    ]
+    if unfinished:
+        events.append((1, b"\x1b]unfinished"))
+
+    def capture(redactor_type, db):
+        monkeypatch.setattr(artifacts, "StreamingRedactor", redactor_type)
+        cache = ContextCache(db)
+        writers = pair(cache)
+        for source, data in events:
+            writers[source].append(data)
+        summaries = []
+        for writer in writers:
+            metadata = writer.finish()
+            fragments = [
+                (
+                    part.sequence,
+                    part.first_line,
+                    part.last_line,
+                    part.data,
+                    part.observation_first,
+                    part.observation_last,
+                )
+                for part in cache.iter_artifact(writer.ref_id)
+            ]
+            summaries.append(
+                (
+                    metadata.complete,
+                    metadata.available,
+                    metadata.stored_bytes,
+                    metadata.line_count,
+                    metadata.content_hash,
+                    fragments,
+                )
+            )
+        return summaries
+
+    before = capture(reference.ScalarRedactor, tmp_path / "scalar.db")
+    after = capture(StreamingRedactor, tmp_path / "ascii.db")
+    assert after == before
+    assert after[0][0] is True
+    assert after[1][0] is (not unfinished)
 
 
 def test_unregistered_stream_is_distinct_from_a_completed_empty_stream(cache):
