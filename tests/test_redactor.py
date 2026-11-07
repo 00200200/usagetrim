@@ -9,7 +9,9 @@ import pytest
 from usagetrim.core.redactor import redact_secrets
 
 
-@pytest.mark.parametrize("escape", ["\x1b[31m", "\x1b[?25l", "\x1b]0;title\x07"])
+@pytest.mark.parametrize(
+    "escape", ["\x1b[31m", "\x1b[?25l", "\x1b]0;title\x07", "\x9b31m", "\x9d0;title\x9c"]
+)
 def test_redacts_secrets_across_ansi_without_removing_unrelated_escapes(escape):
     raw = "\x1b[32mstatus\x1b[0m\n" + "ghp_" + escape + "A" * 36 + "\nend"
     result = redact_secrets(raw)

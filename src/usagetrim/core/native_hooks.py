@@ -13,12 +13,25 @@ from pathlib import Path
 from typing import Any
 
 from usagetrim.core.companion_state import already_wrapped, paused
+from usagetrim.core.event_replay import EventInspection
 from usagetrim.core.mcp_output import compact_mcp_response
 from usagetrim.core.safe_filter import safe_compact_output
 from usagetrim.core.telemetry import record_text
 
 # Bash output, and results of other MCP servers (compacted losslessly).
 HOOK_MATCHERS = ("^Bash$", "^mcp__")
+
+
+def _record_prepared(raw: str, output: str, **metadata) -> None:
+    """Record a prepared response without promising delivery or replay fidelity.
+
+    Hook stream concatenation has no lossless stream boundaries and the client
+    payload supplies no authoritative cache permission. Keep snapshots disabled.
+    """
+    try:
+        record_text(raw, output, delivery="prepared", cache_allowed=False, **metadata)
+    except Exception:
+        pass
 
 
 def claude_post_tool_use(payload: Any) -> dict[str, Any]:
@@ -62,14 +75,20 @@ def claude_post_tool_use(payload: Any) -> dict[str, Any]:
     if result == original:
         return {}
     event_id = _event_id(payload)
-    record_text(
+    exit_code = original.get("exitCode")
+    inspection = (
+        EventInspection(child_returncode=exit_code, termination_reason="exited")
+        if type(exit_code) is int and 0 <= exit_code < 2**63
+        else None
+    )
+    _record_prepared(
         "".join(original.get(k) or "" for k in ("stdout", "stderr")),
         "".join(result.get(k) or "" for k in ("stdout", "stderr")),
         client="claude-code",
         project=payload.get("cwd"),
-        delivery="prepared",
         event_id=event_id,
         duration_s=time.perf_counter() - start,
+        inspection=inspection,
     )
     return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": result}}
 
@@ -101,12 +120,11 @@ def _claude_mcp_output(payload: dict[str, Any], tool: str, start: float) -> dict
     if result == original:
         return {}
     server = tool.split("__")[1] if tool.count("__") >= 2 else "mcp"
-    record_text(
+    _record_prepared(
         _texts(original),
         _texts(result),
         client="claude-code",
         project=payload.get("cwd"),
-        delivery="prepared",
         event_id=_event_id(payload),
         duration_s=time.perf_counter() - start,
         operation=f"mcp:{server}",

@@ -40,6 +40,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+tui = [
+  "textual>=0.85",
+]
 companion = [
   "PySide6-Essentials>=6.6,!=6.12.0,<7",
 ]

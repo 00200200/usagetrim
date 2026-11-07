@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -16,6 +17,7 @@ from usagetrim.core.cache import ContextCache
 from usagetrim.core.cleaner import CleanerOptions, compact_terminal_output
 from usagetrim.core.companion_state import already_wrapped, client_name, paused
 from usagetrim.core.diff_slimmer import budgeted_diff_slice, classify_git_diff
+from usagetrim.core.event_replay import EventInspection
 from usagetrim.core.gain import build_gain_report
 from usagetrim.core.json_slimmer import slim_json
 from usagetrim.core.redactor import redact_secrets
@@ -700,6 +702,7 @@ def _budget(arguments: dict[str, Any]) -> int:
 
 
 _START: ContextVar[float | None] = ContextVar("usagetrim_started", default=None)
+_RETRIEVE_ERROR: ContextVar[bool | None] = ContextVar("usagetrim_retrieve_error", default=None)
 
 
 def _timed(handler):
@@ -715,7 +718,15 @@ def _timed(handler):
 
 
 def _record(
-    raw: str, output: str, *, operation="exec", project=None, duration_s=None, offline=False
+    raw: str,
+    output: str,
+    *,
+    operation="exec",
+    project=None,
+    duration_s=None,
+    offline=False,
+    cache_allowed=False,
+    inspection: EventInspection | None = None,
 ) -> str:
     global _SESSION_SAVED_CLAUDE, _SESSION_SAVED_OPENAI, _SESSION_SAVED_GEMINI
     if offline:
@@ -729,16 +740,22 @@ def _record(
     _SESSION_SAVED_GEMINI += before.gemini - after.gemini
     if duration_s is None and _START.get() is not None:
         duration_s = time.perf_counter() - _START.get()
-    record_text(
-        raw,
-        output,
-        operation=operation,
-        project=project,
-        duration_s=duration_s,
-        client=client_name("mcp"),
-        engine="none" if paused() else "usagetrim",
-        offline=offline,
-    )
+    try:
+        record_text(
+            raw,
+            output,
+            operation=operation,
+            project=project,
+            duration_s=duration_s,
+            client=client_name("mcp"),
+            engine="none" if paused() else "usagetrim",
+            offline=offline,
+            cache_allowed=cache_allowed is True and not paused(),
+            inspection=inspection,
+        )
+    except Exception:
+        # Telemetry is best effort, including failures before its own guard.
+        pass
     return output
 
 
@@ -806,7 +823,7 @@ def handle_usagetrim_code(arguments: dict[str, Any]) -> str:
     else:
         result = index.query(mode, *query_args)
         output = _compress(result, budget, source="code-query")
-    return _record(result, output, operation="code", project=arguments["root"])
+    return _record(result, output, operation="code", project=arguments["root"], cache_allowed=True)
 
 
 def _specialized_with_recovery(raw: str, specialized: str) -> str:
@@ -851,11 +868,20 @@ def handle_usagetrim_exec(arguments: dict[str, Any]) -> str:
         )
         combined_raw = proc.stdout
         footer = f"\n[exit code: {proc.returncode}]"
+        inspection = EventInspection(
+            child_returncode=proc.returncode,
+            termination_reason=(
+                "signaled" if os.name == "posix" and proc.returncode < 0 else "exited"
+            ),
+        )
+        capture_complete = True
     except subprocess.TimeoutExpired as exc:
         combined_raw = exc.stdout or ""
         if isinstance(combined_raw, bytes):
             combined_raw = combined_raw.decode("utf-8", errors="replace")
         footer = "\n[command timed out after 120s; output may be partial]"
+        inspection = EventInspection(termination_reason="timed_out")
+        capture_complete = False
 
     if already_wrapped(command):
         return combined_raw + footer
@@ -880,7 +906,12 @@ def handle_usagetrim_exec(arguments: dict[str, Any]) -> str:
         else:
             output = safe_compact_output(combined_raw, command=command) + footer
     return _record(
-        combined_raw, output, project=_cwd(arguments), duration_s=time.perf_counter() - start
+        combined_raw,
+        output,
+        project=_cwd(arguments),
+        duration_s=time.perf_counter() - start,
+        inspection=inspection,
+        cache_allowed=capture_complete,
     )
 
 
@@ -913,7 +944,7 @@ def handle_usagetrim_read(arguments: dict[str, Any]) -> str:
                 f"since hash {current_hash[:12]} ({len(source_bytes):,} bytes).]"
             )
             raw = p.read_text(encoding="utf-8", errors="replace")
-            return _record(raw, notice, operation="read", project=path)
+            return _record(raw, notice, operation="read", project=path, cache_allowed=True)
 
     from usagetrim.core.lockfile import is_lockfile, summarize_lockfile
 
@@ -924,7 +955,7 @@ def handle_usagetrim_read(arguments: dict[str, Any]) -> str:
             current_hash = hashlib.sha256(raw_full.encode("utf-8")).hexdigest()
             extracted = f"# [sha256: {current_hash[:16]}]\n" + extracted
         output = _compress(extracted, budget, source="read")
-        return _record(raw_full, output, operation="read", project=path)
+        return _record(raw_full, output, operation="read", project=path, cache_allowed=True)
 
     auto_skeleton = bool(arguments.get("auto_skeleton", False))
     types_only = bool(arguments.get("types_only", False))
@@ -958,11 +989,11 @@ def handle_usagetrim_read(arguments: dict[str, Any]) -> str:
     if not paused():
         viewed = ContextCache().session_view(extracted, source="read")
         if viewed != extracted:
-            return _record(extracted, viewed, operation="read", project=path)
+            return _record(extracted, viewed, operation="read", project=path, cache_allowed=True)
 
     output = _compress(extracted, budget, source="read")
     # Compare with the requested view, not an unrequested full-file read.
-    return _record(extracted, output, operation="read", project=path)
+    return _record(extracted, output, operation="read", project=path, cache_allowed=True)
 
 
 @_timed
@@ -980,29 +1011,52 @@ def handle_usagetrim_retrieve(arguments: dict[str, Any]) -> str:
     if semantic and (query is None or lines is not None):
         raise ValueError("semantic requires query and cannot be combined with lines")
     if semantic:
-        retrieved = cache.hybrid_search(ref_id, query, budget, token_provider="claude")
+        recovered = cache.hybrid_search_result(ref_id, query, budget, token_provider="claude")
     else:
-        retrieved = (
-            cache.search(ref_id, query)
+        recovered = (
+            cache.search_result(ref_id, query)
             if query is not None
-            else cache.retrieve(ref_id, lines_range=lines)
+            else cache.retrieve_result(ref_id, lines_range=lines)
         )
-    if retrieved.startswith("Error:"):
+    if _RETRIEVE_ERROR.get() is not None:
+        _RETRIEVE_ERROR.set(recovered.error)
+    retrieved = recovered.text
+    if recovered.error:
         return retrieved
+    # Compression may refresh the same content-addressed entry's source. Keep
+    # the measurement owner of the reference that the client actually requested.
+    engine = recovery_engine(ref_id)
     # Hybrid search already budgets the complete output without downloading a
     # tokenizer. Recompressing it would re-enter the legacy online-capable path.
-    output = retrieved if semantic else _compress(retrieved, budget, source="retrieve")
-    if recovery_engine(ref_id) == "rtk":
-        record_text(
-            "",
-            output,
-            operation="retrieve",
-            client=client_name("mcp"),
-            engine="rtk",
-            offline=semantic,
+    # Preserve the historical text path for payloads beginning with Error:.
+    # This affects formatting only; error/recovery decisions use structured data.
+    output = (
+        retrieved
+        if semantic or retrieved.startswith("Error:")
+        else _compress(retrieved, budget, source="retrieve")
+    )
+    inspection = None
+    if recovered.recovered and output == retrieved:
+        inspection = EventInspection(
+            recovery_ref=ref_id,
+            recovery_scope="query" if query is not None else "lines" if lines else "full",
         )
+    if engine == "rtk":
+        try:
+            record_text(
+                "",
+                output,
+                operation="retrieve",
+                client=client_name("mcp"),
+                engine="rtk",
+                offline=semantic,
+                inspection=inspection,
+                cache_allowed=False,
+            )
+        except Exception:
+            pass
         return output
-    return _record("", output, operation="retrieve", offline=semantic)
+    return _record("", output, operation="retrieve", offline=semantic, inspection=inspection)
 
 
 @_timed
@@ -1041,7 +1095,9 @@ def handle_usagetrim_diff(arguments: dict[str, Any]) -> str:
             original_text=raw_diff,
             source="diff",
         )
-    return _record(raw_diff, output, operation="diff", project=_cwd(arguments))
+    return _record(
+        raw_diff, output, operation="diff", project=_cwd(arguments), cache_allowed=bool(raw_diff)
+    )
 
 
 @_timed
@@ -1057,7 +1113,13 @@ def handle_usagetrim_tree(arguments: dict[str, Any]) -> str:
 
     root_node, _ = scan_directory(target, max_depth=max_depth)
     raw = format_tree_as_text(root_node, root_node.tokens)
-    return _record(raw, _compress(raw, budget, source="tree"), operation="tree", project=target)
+    return _record(
+        raw,
+        _compress(raw, budget, source="tree"),
+        operation="tree",
+        project=target,
+        cache_allowed=True,
+    )
 
 
 @_timed
@@ -1076,7 +1138,7 @@ def handle_usagetrim_json(arguments: dict[str, Any]) -> str:
 
     preview = slim_json(raw_str, max_array_items=max_items, cache_full=False)
     output = _compress(preview, budget, original_text=raw_str, source="json")
-    return _record(raw_str, output, operation="json", project=path_str)
+    return _record(raw_str, output, operation="json", project=path_str, cache_allowed=True)
 
 
 def handle_usagetrim_stats() -> str:
@@ -1130,7 +1192,7 @@ def handle_usagetrim_clip(arguments: dict[str, Any]) -> str:
     if type(budget) is not int or not 64 <= budget <= 32000:
         raise ValueError("budget must be an integer between 64 and 32000")
     res = compact_text(text, budget=budget)
-    return _record(text, res.text, operation="clip")
+    return _record(text, res.text, operation="clip", cache_allowed=True)
 
 
 @_timed
@@ -1193,7 +1255,7 @@ def handle_usagetrim_distill(arguments: dict[str, Any]) -> str:
     if type(budget) is not int or not 100 <= budget <= 32000:
         raise ValueError("budget must be an integer between 100 and 32000")
     res = distill_conversation(transcript, budget=budget)
-    return _record(transcript, res.text, operation="distill")
+    return _record(transcript, res.text, operation="distill", cache_allowed=True)
 
 
 @_timed
@@ -1208,7 +1270,7 @@ def handle_usagetrim_table(arguments: dict[str, Any]) -> str:
     if format_type not in {"toon", "markdown"}:
         raise ValueError("format must be 'toon' or 'markdown'")
     res = compact_table(data, budget=budget, format_type=format_type)
-    return _record(data, res.text, operation="table")
+    return _record(data, res.text, operation="table", cache_allowed=True)
 
 
 @_timed
@@ -1220,7 +1282,7 @@ def handle_usagetrim_optimize(arguments: dict[str, Any]) -> str:
     if type(budget) is not int or not 64 <= budget <= 64000:
         raise ValueError("budget must be an integer between 64 and 64000")
     res = optimize_context(content, budget=budget)
-    return _record(content, res.text, operation="optimize")
+    return _record(content, res.text, operation="optimize", cache_allowed=True)
 
 
 def handle_usagetrim_context(arguments: dict[str, Any]) -> str:
@@ -1310,12 +1372,16 @@ def _respond(req: Any, *, profile: str = "full") -> dict[str, Any] | None:
         tool["name"] for tool in tool_definitions(profile)
     }:
         return {**response, "error": {"code": -32602, "message": "Unknown tool"}}
+    error_token = _RETRIEVE_ERROR.set(False if name == "usagetrim_retrieve" else None)
     try:
         _validate_arguments(name, arguments)
         output = handlers[name](arguments)
-        is_error = output.startswith("Error:")
+        recovery_error = _RETRIEVE_ERROR.get()
+        is_error = recovery_error if recovery_error is not None else output.startswith("Error:")
     except Exception as exc:
         output, is_error = f"Error: {redact_secrets(str(exc))[:500]}", True
+    finally:
+        _RETRIEVE_ERROR.reset(error_token)
     result = {"content": [{"type": "text", "text": output}], "isError": is_error}
     # Match _DEFAULT_OUTPUT_SCHEMA while preserving the legacy text result.
     return {**response, "result": {**result, "structuredContent": {"isError": is_error}}}

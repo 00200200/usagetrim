@@ -17,6 +17,56 @@ def test_cli_help():
     assert "Context compression engine" in res.output
 
 
+def test_cli_tui_without_textual_has_install_hint(monkeypatch):
+    import builtins
+
+    original_import = builtins.__import__
+
+    def without_textual(name, *args, **kwargs):
+        if name == "usagetrim.tui.app":
+            raise ModuleNotFoundError("No module named 'textual'", name="textual")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_textual)
+    result = runner.invoke(app, ["tui"])
+    assert result.exit_code == 1
+    assert "Textual" in result.output and "usagetrim[tui]" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_tui_starts_dashboard_lazily(monkeypatch):
+    from types import SimpleNamespace
+
+    calls = []
+
+    class Dashboard:
+        def run(self):
+            calls.append("run")
+
+    monkeypatch.setitem(
+        sys.modules, "usagetrim.tui.app", SimpleNamespace(UsageTrimDashboard=Dashboard)
+    )
+    result = runner.invoke(app, ["tui"])
+    assert result.exit_code == 0
+    assert calls == ["run"]
+
+
+def test_cli_help_does_not_import_textual(monkeypatch):
+    import builtins
+
+    original_import = builtins.__import__
+
+    def guarded(name, *args, **kwargs):
+        if name.startswith("textual") or name == "usagetrim.tui.app":
+            raise AssertionError("CLI help must not import the optional dashboard")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "tui" in result.output
+
+
 @pytest.mark.parametrize("model", ["openai", "claude", "llama"])
 def test_cli_tokens(model, monkeypatch):
     from usagetrim.metrics import tokenizer

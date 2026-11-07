@@ -132,7 +132,7 @@ def redact_secrets(text: str) -> str:
             continue
         for pattern, replacement in group:
             text = pattern.sub(replacement, text)
-    if "\x1b" not in text:
+    if not any(control in text for control in ("\x1b", "\x9b", "\x9d")):
         return text
     # Detect against terminal-visible text, but preserve unrelated ANSI bytes in
     # recoverable originals. Map spans using escape offsets, not a per-char map.

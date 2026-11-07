@@ -56,6 +56,7 @@ from usagetrim.core.doctor import (
     write_claude_desktop_extension,
 )
 from usagetrim.core.engines import select_engine
+from usagetrim.core.event_replay import EventInspection
 from usagetrim.core.gain import build_gain_report
 from usagetrim.core.hooks import install_zsh_hook, setup_claude_code_mcp_config
 from usagetrim.core.json_slimmer import slim_json
@@ -120,6 +121,21 @@ def _emit(text: str) -> str:
     emitted = text + ("\n" if text and not text.endswith("\n") else "")
     sys.stdout.write(emitted)
     return emitted
+
+
+@app.command("tui")
+def tui_command():
+    """Open the local telemetry dashboard (requires the tui extra)."""
+    try:
+        from usagetrim.tui.app import UsageTrimDashboard
+    except ModuleNotFoundError as exc:
+        if exc.name != "textual" and not (exc.name or "").startswith("textual."):
+            raise
+        typer.echo(
+            "The dashboard requires Textual. Install with: pip install 'usagetrim[tui]'", err=True
+        )
+        raise typer.Exit(code=1) from None
+    UsageTrimDashboard().run()
 
 
 @app.command("tokens")
@@ -1171,6 +1187,13 @@ def run(
             duration_s=time.perf_counter() - start_time,
             engine=selected,
             operation=operation,
+            cache_allowed=selected == "usagetrim",
+            inspection=EventInspection(
+                child_returncode=proc.returncode,
+                termination_reason=(
+                    "signaled" if os.name == "posix" and proc.returncode < 0 else "exited"
+                ),
+            ),
         )
 
     if proc.returncode != 0:
@@ -1242,6 +1265,7 @@ def cat(
                 project=file_path,
                 duration_s=time.perf_counter() - start,
                 engine="none" if paused() else "usagetrim",
+                cache_allowed=not paused(),
             )
             return
 
@@ -1276,6 +1300,7 @@ def cat(
         project=file_path,
         duration_s=time.perf_counter() - start,
         engine="none" if paused() else "usagetrim",
+        cache_allowed=not paused(),
     )
 
 
@@ -1318,6 +1343,7 @@ def types_cmd(
         project=file_path,
         duration_s=time.perf_counter() - start,
         engine="none" if paused() else "usagetrim",
+        cache_allowed=not paused(),
     )
 
 
@@ -1364,6 +1390,7 @@ def json_cmd(
         project=p if target and p.is_file() else None,
         duration_s=time.perf_counter() - start,
         engine="none" if paused() else "usagetrim",
+        cache_allowed=not no_cache and not paused(),
     )
 
 
@@ -1396,25 +1423,38 @@ def retrieve(
         raise typer.BadParameter("--budget requires --semantic")
     try:
         if semantic:
-            raw = cache.hybrid_search(
+            recovered = cache.hybrid_search_result(
                 ref_id,
                 query,
                 budget=budget if budget is not None else 1000,
                 token_provider="openai",
             )
         else:
-            raw = (
-                cache.search(ref_id, query)
+            recovered = (
+                cache.search_result(ref_id, query)
                 if query is not None
-                else cache.retrieve(ref_id, lines_range=lines)
+                else cache.retrieve_result(ref_id, lines_range=lines)
             )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    emitted = _emit(raw)
+    emitted = _emit(recovered.text)
     # Recovery is additional context, not a second saving of the original log.
     try:
         record_text(
-            "", emitted, operation="retrieve", engine=recovery_engine(ref_id), offline=semantic
+            "",
+            emitted,
+            operation="retrieve",
+            engine=recovery_engine(ref_id),
+            offline=semantic,
+            cache_allowed=False,
+            inspection=(
+                EventInspection(
+                    recovery_ref=ref_id,
+                    recovery_scope="query" if query is not None else "lines" if lines else "full",
+                )
+                if recovered.recovered
+                else None
+            ),
         )
     except Exception:
         pass
@@ -2028,6 +2068,7 @@ def pipe(
         operation="pipe",
         duration_s=time.perf_counter() - start,
         engine="none" if paused() else "usagetrim",
+        cache_allowed=not paused(),
     )
 
 
@@ -2080,6 +2121,7 @@ def diff(
         operation="diff",
         duration_s=time.perf_counter() - start,
         engine="none" if paused() else "usagetrim",
+        cache_allowed=not paused(),
     )
 
 

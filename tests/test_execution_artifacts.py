@@ -39,6 +39,35 @@ def test_empty_artifact_is_available_and_complete(cache):
     assert metadata.content_hash == hashlib.sha256(b"").hexdigest()
     assert cache.read_artifact(writer.ref_id).text == ""
     assert list(cache.iter_artifact(writer.ref_id)) == []
+    assert cache.retrieve_result(writer.ref_id).recovered
+    assert not cache.retrieve_result(writer.ref_id, "1").recovered
+
+
+@pytest.mark.parametrize("finished", [False, True])
+def test_artifact_recovery_result_does_not_claim_incomplete_full_recovery(cache, finished):
+    writer = cache.begin_artifact()
+    writer.append(b"execution diagnostic\n")
+    if finished:
+        writer.finish()
+    result = cache.retrieve_result(writer.ref_id)
+    assert result.recovered is finished
+    assert result.text == cache.retrieve(writer.ref_id)
+    assert cache.retrieve_result(writer.ref_id, "invalid").error
+    assert not cache.retrieve_result(writer.ref_id, "99-100").recovered
+    assert not cache.search_result(writer.ref_id, "diagnostic").recovered
+    assert not cache.hybrid_search_result(writer.ref_id, "diagnostic").recovered
+    if not finished:
+        writer.abort()
+
+
+def test_bounded_artifact_response_does_not_claim_full_recovery(cache):
+    writer = cache.begin_artifact()
+    writer.append(b"line of execution output\n" * 4000)
+    writer.finish()
+    result = cache.retrieve_result(writer.ref_id)
+    assert "response_truncated=True" in result.text
+    assert not result.recovered
+    assert cache.retrieve_result(writer.ref_id, "1-2").recovered
 
 
 @pytest.mark.parametrize("finished", [False, True])

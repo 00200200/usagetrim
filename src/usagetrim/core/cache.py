@@ -5,6 +5,7 @@ import os
 import sqlite3
 import time
 import zlib
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,15 @@ DEFAULT_CACHE_DIR = Path.home() / ".usagetrim"
 DEFAULT_CACHE_DB = DEFAULT_CACHE_DIR / "cache.db"
 COMPRESSION_THRESHOLD = 512
 DEFAULT_CACHE_BUDGET_BYTES = 500 * 1024 * 1024  # 500 MB
+
+
+@dataclass(frozen=True)
+class RecoveryResult:
+    """Text plus evidence that this call actually returned recovered content."""
+
+    text: str = field(repr=False)
+    recovered: bool
+    error: bool = False
 
 
 class _ExecutionArtifactSearchUnavailable(ValueError):
@@ -241,6 +251,10 @@ class ContextCache:
 
     def retrieve(self, ref_id: str, lines_range: str | None = None) -> str:
         """Retrieve stored content by ref ID, optionally slicing a line range."""
+        return self.retrieve_result(ref_id, lines_range).text
+
+    def retrieve_result(self, ref_id: str, lines_range: str | None = None) -> RecoveryResult:
+        """Read once and report recovery without interpreting user payload text."""
         with sqlite3.connect(self.db_path) as conn:
             artifact = self._is_execution_artifact(conn, ref_id)
             row = conn.execute(
@@ -260,7 +274,9 @@ class ContextCache:
                 conn.commit()
 
         if not row:
-            return f"Error: ref ID '{ref_id}' not found in usagetrim cache."
+            return RecoveryResult(
+                f"Error: ref ID '{ref_id}' not found in usagetrim cache.", False, True
+            )
 
         if artifact:
             # New internal refs must not look like empty/full legacy payloads.
@@ -274,19 +290,26 @@ class ContextCache:
                     if first < 1 or last < first:
                         raise ValueError
                 except ValueError:
-                    return "Error: lines must be a positive line number or an ascending range (e.g. 10-40)."
+                    return RecoveryResult(
+                        "Error: lines must be a positive line number or an ascending range (e.g. 10-40).",
+                        False,
+                        True,
+                    )
             result = self.read_artifact(ref_id, first_line=first, last_line=last)
-            return (
+            return RecoveryResult(
                 f"# [Execution artifact {ref_id}; state={result.metadata.state.value}; "
                 "view=redacted-normalized; "
                 f"storage_complete={result.metadata.complete}; "
-                f"response_truncated={result.response_truncated}]\n" + result.text
+                f"response_truncated={result.response_truncated}]\n" + result.text,
+                result.metadata.available
+                and not result.response_truncated
+                and (bool(result.text) if lines_range else result.metadata.complete),
             )
 
         # Also protect entries written by older versions before cache redaction.
         content, source = redact_secrets(decompress_payload(row[0])), row[1]
         if not lines_range:
-            return content
+            return RecoveryResult(content, True)
 
         all_lines = content.splitlines()
         try:
@@ -300,12 +323,17 @@ class ContextCache:
                 raise ValueError
             end = min(len(all_lines), end)
             selected = all_lines[start - 1 : end]
-            return (
+            return RecoveryResult(
                 f"# [Retrieved {ref_id} ({source}) lines {start}-{end} of {len(all_lines)}]\n"
-                + "\n".join(selected)
+                + "\n".join(selected),
+                bool(selected),
             )
         except ValueError:
-            return "Error: lines must be a positive line number or an ascending range (e.g. 10-40)."
+            return RecoveryResult(
+                "Error: lines must be a positive line number or an ascending range (e.g. 10-40).",
+                False,
+                True,
+            )
 
     def _search_snapshot(self, ref_id, query, limit, *, check_complete=False):
         """Search only the requested recovery record; never search conversations.
@@ -394,13 +422,19 @@ class ContextCache:
 
     def search(self, ref_id: str, query: str, limit: int = 5) -> str:
         """Lexical search of one redacted recovery record, with legacy output."""
+        return self.search_result(ref_id, query, limit).text
+
+    def search_result(self, ref_id: str, query: str, limit: int = 5) -> RecoveryResult:
+        """Read lexical candidates once; notices alone are not recovered content."""
         try:
             original, rows, _ = self._search_snapshot(ref_id, query, limit)
         except _ExecutionArtifactSearchUnavailable as exc:
-            return str(exc)
+            return RecoveryResult(str(exc), False)
         if original is None:
-            return f"Error: ref ID '{ref_id}' not found in usagetrim cache."
-        return self._lexical_result(ref_id, rows, limit)
+            return RecoveryResult(
+                f"Error: ref ID '{ref_id}' not found in usagetrim cache.", False, True
+            )
+        return RecoveryResult(self._lexical_result(ref_id, rows, limit), bool(rows))
 
     def hybrid_search(
         self,
@@ -413,6 +447,21 @@ class ContextCache:
         embedder=None,
     ) -> str:
         """Opt-in, offline semantic fallback; vectors live only for this call."""
+        return self.hybrid_search_result(
+            ref_id, query, budget, limit=limit, token_provider=token_provider, embedder=embedder
+        ).text
+
+    def hybrid_search_result(
+        self,
+        ref_id: str,
+        query: str,
+        budget: int = 1000,
+        *,
+        limit: int = 3,
+        token_provider: str = "openai",
+        embedder=None,
+    ) -> RecoveryResult:
+        """Report emitted chunks separately from budget/availability notices."""
         from usagetrim.metrics.tokenizer import count_tokens_offline
 
         if type(budget) is not int or budget < 1:
@@ -434,12 +483,12 @@ class ContextCache:
             notice = str(exc)
             if not fits(notice):
                 raise ValueError("budget is too small for the recovery status") from None
-            return notice
+            return RecoveryResult(notice, False)
         if original is None:
             missing = f"Error: ref ID '{ref_id}' not found in usagetrim cache."
             if not fits(missing):
                 raise ValueError("budget is too small for the recovery status")
-            return missing
+            return RecoveryResult(missing, False, True)
         candidates = lexical
         semantic_ranges = set()
         skipped = []
@@ -458,7 +507,7 @@ class ContextCache:
                 ]
         legacy = self._lexical_result(ref_id, lexical, limit)
         if not semantic_ranges and not skipped and fits(legacy):
-            return legacy
+            return RecoveryResult(legacy, bool(lexical))
 
         selected = []
 
@@ -486,7 +535,7 @@ class ContextCache:
         result = render(selected)
         if not fits(result):
             raise ValueError("budget is too small for the recovery notice")
-        return result
+        return RecoveryResult(result, bool(selected))
 
     def check_duplicate(self, content: str) -> str | None:
         """Check if identical content was cached recently within last 15 minutes."""
