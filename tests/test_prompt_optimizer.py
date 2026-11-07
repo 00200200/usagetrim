@@ -1,6 +1,200 @@
 from __future__ import annotations
 
+import pytest
+
 from usagetrim.core.prompt_optimizer import align_prompt, lint_prompt, minify_prompt
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "session_id: abc\n=======\nKeep all rules.\n",
+        "session_id: abc\n-------\nKeep all rules.\n",
+        "session_id: abc\nContinuation of the heading\n=======\nKeep rules.\n",
+        "session_id: abc\n    code child\nKeep rules.\n",
+        "- session_id: abc\n  Keep its child instruction.\n",
+        "session_id: abc\n- Keep the first rule.\n  - Keep the nested rule.\n",
+        "```text\nsession_id: abc\nKeep code exactly.\n```\n",
+        "~~~text\nsession_id: abc\nKeep code exactly.\n~~~\n",
+        ">session_id: abc\n> Keep the quoted instruction.\n",
+        "---\nsession_id: abc\n---\nKeep rules.\n",
+        "<!--\nsession_id: abc\n-->\nKeep rules.\n",
+        "session_id: abc\n# Parent section\nKeep rules.\n",
+        "session_id: abc\nIf current time is unknown, never deploy.\nKeep rules.\n",
+    ],
+)
+def test_model_alignment_preserves_ambiguous_markdown_blocks(text):
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary
+
+    assert align_to_cache_boundary(text, 1, model="generic") == text
+    assert align_prompt(text, model="generic").aligned_text == text
+
+
+def test_boundary_alignment_preserves_order_of_plain_instructions():
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary
+
+    text = "session_id: abc\nrequest_id: request-123\nFirst validate.\nThen deploy.\n"
+    output = align_to_cache_boundary(text, 1, model="generic")
+    assert output.index("First validate.") < output.index("Then deploy.")
+    assert output.index("Then deploy.") < output.index("session_id: abc")
+    assert output.index("session_id: abc") < output.index("request_id: request-123")
+    assert "First validate.\nThen deploy." in output
+
+
+def test_minification_redacts_secret_created_by_comment_removal():
+    text = "ghp_<!-- separator -->" + "A" * 36
+    output = minify_prompt(text, model="generic").minified_text
+    assert "A" * 36 not in output
+    assert "REDACTED" in output
+
+
+@pytest.mark.parametrize("length,reached", [(12, False), (13, True), (17, True)])
+def test_align_boundary_measures_static_prefix_only(length, reached):
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary
+
+    static = "x" * length
+    text = "session_id: abcdef0123456789\n" + static + "\n"
+    result = align_to_cache_boundary(text, 4, model="generic")
+    if reached:
+        assert result == align_prompt(text, model="generic").aligned_text
+        assert result.startswith(static)
+        assert "session_id: abcdef0123456789" in result
+    else:
+        assert result == text
+
+
+@pytest.mark.parametrize("boundary", [0, -1, True, 1.5, "1024", None])
+def test_align_boundary_rejects_invalid_threshold(boundary):
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary
+
+    with pytest.raises(ValueError, match="positive integer"):
+        align_to_cache_boundary("", boundary)
+
+
+@pytest.mark.parametrize("key", ["request", "session", "turn", "conversation"])
+def test_align_boundary_preserves_ambiguous_instruction_fields(key):
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary
+
+    text = f"{key}: deploy\n" + "Keep all safety constraints.\n" * 30
+    assert align_to_cache_boundary(text, 4, model="generic") == text
+
+
+@pytest.mark.parametrize("key", ["session_id", "request_id", "turn_id", "conversation_id"])
+def test_align_boundary_can_relocate_unambiguous_identifiers(key):
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary
+
+    static = "Keep all safety constraints.\n" * 30
+    text = f"{key}: abc123\n" + static
+    result = align_to_cache_boundary(text, 4, model="generic")
+    assert result == align_prompt(text, model="generic").aligned_text
+    assert result.startswith(static.rstrip())
+    assert f"{key}: abc123" in result
+
+
+def test_align_boundary_rejects_unknown_model():
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary
+
+    with pytest.raises(ValueError, match="Unknown model"):
+        align_to_cache_boundary("", model="unknown")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "session_id: " + "a" * 200 + "\nx\n",
+        "If current time is unknown, do not deploy.\n" + "Keep rules.\n" * 20,
+        "# Staging\nsession_id: abc\n" + "Keep rules.\n" * 20,
+        "session_id: abc\nKeep this hard break.  \n",
+    ],
+)
+def test_align_boundary_preserves_insufficient_or_unsafe_input(text):
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary
+
+    assert align_to_cache_boundary(text, 4, model="generic") == text
+
+
+@pytest.mark.parametrize("model", ["openai", "claude", "gemini", "llama", "generic"])
+def test_align_boundary_unicode_offline_without_padding(monkeypatch, model):
+    import tiktoken.load
+    import tiktoken.registry
+
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary
+    from usagetrim.metrics import tokenizer
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("network or vocabulary loading attempted")
+
+    monkeypatch.setattr(tiktoken.load, "read_file", forbidden)
+    monkeypatch.setattr(tokenizer.tiktoken, "get_encoding", forbidden)
+    monkeypatch.setattr(tokenizer, "_O200K_ENC", None)
+    monkeypatch.setattr(tokenizer, "_CL100K_ENC", None)
+    monkeypatch.setattr(tiktoken.registry, "ENCODINGS", {})
+    text = "Current time: 2026-11-03T12:00:00Z\n" + "🦙漢字" * 20 + "\n"
+    result = align_to_cache_boundary(text, 20, model=model)
+    assert result == align_prompt(text, model=model).aligned_text
+    assert result.startswith("🦙漢字" * 20)
+    assert sorted(line for line in text.splitlines() if line) == sorted(
+        line for line in result.splitlines() if line and not line.startswith("<!--")
+    )
+
+
+@pytest.mark.parametrize("model", ["openai", "claude", "gemini", "llama", "generic"])
+@pytest.mark.parametrize(
+    "text",
+    ["", "   ", "Keep 漢字🙂.\n", "Current time: 12:00\nPlease ensure you run tests.\n"],
+)
+def test_prompt_model_statistics_transforms_and_offline(monkeypatch, model, text):
+    import tiktoken.load
+    import tiktoken.registry
+
+    from usagetrim.core import prompt_optimizer as prompts
+    from usagetrim.metrics import tokenizer
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("model prompt counting must not load vocabulary or use legacy counting")
+
+    monkeypatch.setattr(
+        prompts,
+        "count_tokens",
+        lambda value: tokenizer.TokenCount(len(value), len(value), len(value)),
+    )
+    legacy_aligned = prompts.align_prompt(text)
+    legacy_minified = prompts.minify_prompt(text)
+    legacy_stabilized = prompts.stabilize_cache_prefix(text)
+    assert prompts.align_prompt(text, model=None) == legacy_aligned
+    assert prompts.minify_prompt(text, model=None) == legacy_minified
+    assert prompts.stabilize_cache_prefix(text, model=None) == legacy_stabilized
+
+    monkeypatch.setattr(prompts, "count_tokens", forbidden)
+    monkeypatch.setattr(tiktoken.load, "read_file", forbidden)
+    monkeypatch.setattr(tokenizer.tiktoken, "get_encoding", forbidden)
+    monkeypatch.setattr(tokenizer, "_O200K_ENC", None)
+    monkeypatch.setattr(tokenizer, "_CL100K_ENC", None)
+    monkeypatch.setattr(tiktoken.registry, "ENCODINGS", {})
+    aligned = prompts.align_prompt(text, model=model)
+    minified = prompts.minify_prompt(text, model=model)
+    assert aligned.aligned_text == legacy_aligned.aligned_text
+    assert minified.minified_text == legacy_minified.minified_text
+    assert prompts.stabilize_cache_prefix(text, model=model) == legacy_stabilized
+    before = tokenizer.count_model_tokens(text, model).count
+    after = tokenizer.count_model_tokens(minified.minified_text, model).count
+    assert aligned.original_tokens == minified.original_tokens == before
+    assert aligned.aligned_tokens == tokenizer.count_model_tokens(aligned.aligned_text, model).count
+    assert minified.minified_tokens == after
+    assert minified.saved_tokens == max(0, before - after)
+    assert minified.reduction_pct == (
+        round(100 * minified.saved_tokens / before, 1) if before else 0.0
+    )
+
+
+@pytest.mark.parametrize("text", ["", "Keep instructions."])
+@pytest.mark.parametrize("function", ["align_prompt", "minify_prompt", "stabilize_cache_prefix"])
+def test_prompt_functions_reject_unknown_model(function, text):
+    from usagetrim.core import prompt_optimizer as prompts
+
+    with pytest.raises(ValueError, match="Unknown model"):
+        getattr(prompts, function)(text, model="unknown")
 
 
 def test_lint_clean_prompt():

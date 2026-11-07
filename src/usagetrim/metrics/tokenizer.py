@@ -1,16 +1,330 @@
 from __future__ import annotations
 
 import math
+import os
+from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
+from enum import Enum
+from functools import wraps
+from inspect import signature
 from typing import Literal
 
-import tiktoken
+try:
+    import tiktoken
+except ImportError:
+    # Model-aware estimates remain usable without the optional runtime backend.
+    # This does not change the project's installation dependencies.
+    tiktoken = None
 
 Provider = Literal["claude", "openai", "gemini"]
 
 # Cache tiktoken encodings
 _CL100K_ENC = None
 _O200K_ENC = None
+
+
+class ModelFamily(Enum):
+    OPENAI = "openai"
+    CLAUDE = "claude"
+    GEMINI = "gemini"
+    LLAMA = "llama"
+    GENERIC = "generic"
+    DEEPSEEK = "deepseek"
+
+
+def detect_model_family(
+    environment: Mapping[str, str] | None = None,
+) -> ModelFamily | None:
+    """Detect a known family; precedence is LLM_MODEL, ANTHROPIC_MODEL, OPENAI_MODEL.
+
+    An unknown value in the highest-priority configured variable returns None
+    rather than guessing or falling through to a lower-priority variable.
+    """
+    values = os.environ if environment is None else environment
+    model = next(
+        (
+            values.get(key, "").strip().lower()
+            for key in ("LLM_MODEL", "ANTHROPIC_MODEL", "OPENAI_MODEL")
+            if values.get(key, "").strip()
+        ),
+        "",
+    )
+    if not model:
+        return None
+    try:
+        return ModelFamily(model)
+    except ValueError:
+        pass
+    if model in {"deepseek-chat", "deepseek-reasoner", "deepseek-v3", "deepseek-r1"} or (
+        model.startswith("deepseek-ai/") and len(model) > len("deepseek-ai/")
+    ):
+        return ModelFamily.DEEPSEEK
+    if model == "claude" or model.startswith(("claude-", "claude/")):
+        return ModelFamily.CLAUDE
+    if model == "gemini" or model.startswith(("gemini-", "gemini/", "models/gemini-")):
+        return ModelFamily.GEMINI
+    if model == "llama" or model.startswith(("llama-", "llama/", "meta-llama/")):
+        return ModelFamily.LLAMA
+    if (
+        model.startswith(("gpt-", "chatgpt-"))
+        or model in {"o1", "o3", "o4"}
+        or model.startswith(("o1-", "o3-", "o4-"))
+    ):
+        return ModelFamily.OPENAI
+    return None
+
+
+@dataclass(frozen=True)
+class ModelTokenCount:
+    count: int
+    model: str
+    family: ModelFamily
+    method: str
+    is_estimate: bool
+
+    def __post_init__(self) -> None:
+        if type(self.count) is not int or self.count < 0:
+            raise ValueError("count must be a nonnegative integer")
+
+
+@dataclass(frozen=True)
+class CacheBreakpointInfo:
+    """Local text threshold comparison, not a guarantee of prompt cache eligibility."""
+
+    model: str
+    family: ModelFamily
+    token_count: int
+    min_tokens: int
+    threshold_reached: bool
+    tokens_missing: int
+    method: str
+    is_estimate: bool
+
+
+def check_cache_breakpoint(
+    text: str, model: str = "claude", min_tokens: int = 1024
+) -> CacheBreakpointInfo:
+    """Compare a local token count with a caller-supplied positive threshold.
+
+    The default threshold is a convenience, not a provider policy. Reaching it
+    does not guarantee prompt cache eligibility or a cache hit: actual model
+    tokenization, request structure and provider requirements also matter.
+    """
+    if type(min_tokens) is not int or min_tokens <= 0:
+        raise ValueError("min_tokens must be a positive integer (not bool)")
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    if not isinstance(model, str):
+        raise TypeError("model must be a string")
+
+    result = count_model_tokens(text, model)
+    return CacheBreakpointInfo(
+        model=result.model,
+        family=result.family,
+        token_count=result.count,
+        min_tokens=min_tokens,
+        threshold_reached=result.count >= min_tokens,
+        tokens_missing=max(0, min_tokens - result.count),
+        method=result.method,
+        is_estimate=result.is_estimate,
+    )
+
+
+def align_to_cache_boundary(
+    text: str, target_boundary: int = 1024, *, model: str = "claude"
+) -> str:
+    """Delegate safe prefix alignment; estimated counts do not guarantee cache hits."""
+    from usagetrim.core.prompt_optimizer import align_to_cache_boundary as align
+
+    return align(text, target_boundary, model=model)
+
+
+def _utf8_estimate(text: str) -> int:
+    """Uncalibrated size heuristic: ceil(UTF-8 bytes / 4), not a tokenizer."""
+    try:
+        encoded = text.encode("utf-8")
+    except UnicodeEncodeError:
+        repaired = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+        encoded = repaired.encode("utf-8")
+    return (len(encoded) + 3) // 4
+
+
+def _model_encoding(name: str):
+    """Reuse only instantiated encodings; never invoke a vocabulary loader.
+
+    Disk-only assets deliberately fall back to an estimate. Reading tiktoken's
+    cache safely would require coupling to its private loader and constructors.
+    """
+    for encoding in (_O200K_ENC, _CL100K_ENC):
+        if encoding is not None and getattr(encoding, "name", None) == name:
+            return encoding
+    if tiktoken is None:
+        raise ValueError("tiktoken is unavailable")
+    from tiktoken import registry
+
+    # Isolated optional integration with tiktoken's in-memory registry. If its
+    # representation changes, fail closed rather than calling get_encoding().
+    encodings = getattr(registry, "ENCODINGS", None)
+    if isinstance(encodings, dict):
+        encoding = encodings.get(name)
+        if encoding is not None and getattr(encoding, "name", None) == name:
+            return encoding
+    raise ValueError("No instantiated local tiktoken encoding")
+
+
+def _local_llama_encoding():
+    from usagetrim.metrics.llama_tokenizer import local_llama3_encoding
+
+    return local_llama3_encoding(tiktoken)
+
+
+@dataclass(frozen=True)
+class _ModelCounter:
+    model: str
+    family: ModelFamily
+    encoding: object
+    method: str
+
+    def measure(self, text: str) -> ModelTokenCount:
+        try:
+            count = (
+                _utf8_estimate(text)
+                if self.encoding is None
+                else len(self.encoding.encode(text, disallowed_special=()))
+            )
+        except (OSError, ValueError, RuntimeError, ImportError):
+            raise ValueError(
+                "The selected token counting backend failed during this operation"
+            ) from None
+        method = self.method
+        if self.family is ModelFamily.CLAUDE:
+            count = math.ceil(count * 1.10)
+            method = f"legacy-{method}-x1.10"
+        elif self.family is ModelFamily.GEMINI:
+            count = math.ceil(count * 1.02)
+            method = f"legacy-{method}-x1.02"
+        return ModelTokenCount(
+            count,
+            self.model,
+            self.family,
+            method,
+            not (
+                self.family is ModelFamily.OPENAI
+                and method == "o200k_base"
+                or self.family is ModelFamily.LLAMA
+                and self.encoding is not None
+            ),
+        )
+
+
+_MODEL_COUNTER: ContextVar[_ModelCounter | None] = ContextVar("model_counter", default=None)
+
+
+def model_counting(function):
+    """Pin one offline counting method across a call and its model-aware helpers.
+
+    Legacy calls do not enter a counting context. A pinned encoder that fails
+    later propagates its error instead of silently switching measurement units.
+    """
+    call_signature = signature(function)
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        bound = call_signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        model = bound.arguments.get("model")
+        if model is None:
+            return function(*args, **kwargs)
+        # Validation is intentionally before transforms and cache access.
+        try:
+            family = ModelFamily(model)
+        except ValueError:
+            supported = ", ".join(item.value for item in ModelFamily)
+            raise ValueError(f"Unknown model: {model}. Supported values: {supported}") from None
+        current = _MODEL_COUNTER.get()
+        if current is not None and current.model == model:
+            return function(*args, **kwargs)
+        encoding = _local_llama_encoding() if family is ModelFamily.LLAMA else None
+        if family in {ModelFamily.OPENAI, ModelFamily.CLAUDE, ModelFamily.GEMINI}:
+            for name in ("o200k_base", "cl100k_base"):
+                try:
+                    candidate = _model_encoding(name)
+                    candidate.encode("", disallowed_special=())
+                    encoding = candidate
+                    break
+                except (OSError, ValueError, RuntimeError, ImportError):
+                    continue
+        counter = _ModelCounter(
+            model,
+            family,
+            encoding,
+            encoding.name if encoding is not None else "utf8-bytes-div4-ceil",
+        )
+        token = _MODEL_COUNTER.set(counter)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _MODEL_COUNTER.reset(token)
+
+    return wrapped
+
+
+def count_model_tokens(text: str, model: str) -> ModelTokenCount:
+    """Count plain text using an explicit family; excludes chat framing/billing.
+
+    Family selection is not selection of a particular provider model version.
+    Unestimated counts refer to o200k_base or the explicitly configured local
+    Llama 3 encoding, not arbitrary model versions or API message token counts.
+    Claude, Gemini, DeepSeek and generic results remain estimates.
+    """
+    current = _MODEL_COUNTER.get()
+    if current is not None and current.model == model:
+        return current.measure(text)
+    try:
+        family = ModelFamily(model)
+    except ValueError:
+        supported = ", ".join(item.value for item in ModelFamily)
+        raise ValueError(f"Unknown model: {model}. Supported values: {supported}") from None
+
+    if family is ModelFamily.LLAMA:
+        encoding = _local_llama_encoding()
+        return _ModelCounter(
+            model,
+            family,
+            encoding,
+            encoding.name if encoding is not None else "utf8-bytes-div4-ceil",
+        ).measure(text)
+
+    if family in {ModelFamily.OPENAI, ModelFamily.CLAUDE, ModelFamily.GEMINI}:
+        for name in ("o200k_base", "cl100k_base"):
+            try:
+                encoding = _model_encoding(name)
+                count = len(encoding.encode(text, disallowed_special=()))
+                method = encoding.name
+                break
+            except (OSError, ValueError, RuntimeError, ImportError):
+                continue
+        else:
+            count = _utf8_estimate(text)
+            method = "utf8-bytes-div4-ceil"
+
+        if family is ModelFamily.CLAUDE:
+            count = math.ceil(count * 1.10)
+            method = f"legacy-{method}-x1.10"
+        elif family is ModelFamily.GEMINI:
+            count = math.ceil(count * 1.02)
+            method = f"legacy-{method}-x1.02"
+    else:
+        count = _utf8_estimate(text)
+        method = "utf8-bytes-div4-ceil"
+    return ModelTokenCount(
+        count=count,
+        model=model,
+        family=family,
+        method=method,
+        is_estimate=family is not ModelFamily.OPENAI or method != "o200k_base",
+    )
 
 
 def get_cl100k():

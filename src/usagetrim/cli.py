@@ -122,6 +122,31 @@ def _emit(text: str) -> str:
     return emitted
 
 
+@app.command("tokens")
+def tokens_command(
+    text: Annotated[str, typer.Argument(help="Plain text to count.")],
+    model: Annotated[
+        str | None,
+        typer.Option(
+            help="Family: openai, claude, gemini, llama, generic, deepseek. "
+            "Default: LLM_MODEL > ANTHROPIC_MODEL > OPENAI_MODEL, then openai."
+        ),
+    ] = None,
+):
+    """Count text with an explicit tokenizer or a labeled size estimate."""
+    from usagetrim.metrics.tokenizer import count_model_tokens, detect_model_family
+
+    if model is None:
+        detected = detect_model_family()
+        model = detected.value if detected is not None else "openai"
+    try:
+        result = count_model_tokens(text, model)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--model") from exc
+    kind = "estimate" if result.is_estimate else "encoding count"
+    typer.echo(f"{result.count} tokens · {result.family.value} · {kind} · {result.method}")
+
+
 @app.command("pricing")
 def pricing_command(
     model: Annotated[
@@ -502,10 +527,22 @@ def prepare_command(
     json_output: Annotated[
         bool, typer.Option("--json", help="Include local preview measurements")
     ] = False,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            help="Family: openai, claude, gemini, llama, generic, deepseek. "
+            "Default: LLM_MODEL > ANTHROPIC_MODEL > OPENAI_MODEL, then legacy counting.",
+        ),
+    ] = None,
 ):
     """Preview shorter input before pasting it into any chat; never sends or counts usage."""
     from usagetrim.core.prepare import MAX_INPUT_BYTES, prepare_text
+    from usagetrim.metrics.tokenizer import detect_model_family
 
+    if model is None:
+        detected = detect_model_family()
+        model = detected.value if detected is not None else None
     selected_mode = "desktop" if desktop else mode
     try:
         if file is not None:
@@ -526,7 +563,10 @@ def prepare_command(
             )
         if len(raw) > MAX_INPUT_BYTES:
             raise ValueError("Draft exceeds 128 KiB; select a smaller relevant excerpt")
-        result = prepare_text(raw.decode("utf-8"), mode=selected_mode, budget=budget)
+        model_options = {} if model is None else {"model": model}
+        result = prepare_text(
+            raw.decode("utf-8"), mode=selected_mode, budget=budget, **model_options
+        )
     except (OSError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     if json_output:
@@ -540,11 +580,17 @@ def prepare_command(
             err_console.print(
                 "[bold green]✓ Copied prepared text to system clipboard (ready to paste)![/bold green]"
             )
+        counting_label = "local o200k estimate"
+        if model is not None:
+            accuracy = "estimate" if result["is_estimate"] else "encoding count"
+            counting_label = f"{result['family']} · {result['method']} · {accuracy}"
         err_console.print(
-            f"Tokens: {result['counts']}  ·  local o200k estimate · not usage savings. "
+            f"Tokens: {result['counts']}  ·  {counting_label} · not usage savings. "
             "Review before pasting into Claude Desktop / Codex. "
             "Credentials are redacted; compaction may cache a redacted original."
         )
+        if result.get("ref_id"):
+            err_console.print(f"Original redacted draft: usagetrim retrieve {result['ref_id']}")
         if selected_mode == "summary":
             err_console.print(
                 "Summary is heuristic and lossy; verify goals, constraints and decisions."

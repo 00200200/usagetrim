@@ -8,7 +8,7 @@ from pathlib import PurePath
 
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.redactor import redact_secrets
-from usagetrim.metrics.tokenizer import count_tokens
+from usagetrim.metrics.tokenizer import count_model_tokens, count_tokens, model_counting
 
 # Avoid cache notices and extra work for already small command results.
 _MIN_TOKENS = 256
@@ -176,7 +176,14 @@ def recovery_notice(ref_id: str) -> str:
     return f"[UsageTrim: full output after redaction: usagetrim retrieve {ref_id}]\n"
 
 
-def safe_compact_output(text: str, *, command: str = "", exit_code: int | None = None) -> str:
+@model_counting
+def safe_compact_output(
+    text: str,
+    *,
+    command: str = "",
+    exit_code: int | None = None,
+    model: str | None = None,
+) -> str:
     """Filter routine records without discarding actionable failure signal.
 
     Recognized pytest pass records, xdist worker announcements, and exact
@@ -189,11 +196,19 @@ def safe_compact_output(text: str, *, command: str = "", exit_code: int | None =
     cache/tokenizer failure returns the original after best-effort redaction.
     Counts are local estimates, not model billing or subscription usage.
     """
+    if model is not None:
+        count_model_tokens("", model)
+
+    def size(value: str) -> int:
+        if model is not None:
+            return count_model_tokens(value, model).count
+        return count_tokens(value).openai
+
     original = redact_secrets(text)
     if not original:
         return original
     try:
-        original_tokens = count_tokens(original).openai
+        original_tokens = size(original)
     except Exception:
         return original
     if original_tokens < _MIN_TOKENS:
@@ -259,16 +274,16 @@ def safe_compact_output(text: str, *, command: str = "", exit_code: int | None =
 
     if not changed:
         return original
-    compact = "".join(result)
+    compact = redact_secrets("".join(result))
     try:
         # Avoid writing cache entries for candidates that cannot possibly save.
-        if count_tokens(compact).openai >= original_tokens:
+        if size(compact) >= original_tokens:
             return original
         cache = ContextCache()
         ref = cache.store(original, source="safe-command-output")
         separator = "" if compact.endswith(("\n", "\r")) else "\n"
         compact += separator + recovery_notice(ref)
-        if count_tokens(compact).openai >= original_tokens:
+        if size(compact) >= original_tokens:
             return original
         return compact
     except Exception:
