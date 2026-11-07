@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from click.utils import strip_ansi
 from typer.testing import CliRunner
 
 from usagetrim import cli
@@ -164,7 +165,7 @@ def test_invalid_bounded_options_fail_before_execution(monkeypatch, options, mes
     monkeypatch.setattr(cli, "ContextCache", forbidden)
     response = runner.invoke(cli.app, ["run", *options, "--", "fixture"])
     assert response.exit_code == 2 and "Traceback" not in response.output
-    assert message in re.sub(r"\s+", " ", response.output)
+    assert message in re.sub(r"\s+", " ", strip_ansi(response.output))
 
 
 @pytest.mark.parametrize("condition", ["paused", "wrapped"])
