@@ -1364,23 +1364,46 @@ def retrieve(
     lines: Annotated[
         str | None, typer.Option("--lines", "-l", help="Line range to inspect (e.g. 20-60)")
     ] = None,
+    semantic: Annotated[
+        bool, typer.Option("--semantic", help="Allow offline semantic fallback for --query.")
+    ] = False,
+    budget: Annotated[
+        int | None,
+        typer.Option(
+            "--budget", min=64, max=32000, help="Token budget for --semantic (default 1000)."
+        ),
+    ] = None,
 ):
     """Retrieve full uncompressed raw output from the local Compress-Cache-Retrieve store."""
     cache = ContextCache()
     if query is not None and lines is not None:
         raise typer.BadParameter("Choose --query or --lines, not both")
+    if semantic and (query is None or lines is not None):
+        raise typer.BadParameter("--semantic requires --query and cannot be combined with --lines")
+    if budget is not None and not semantic:
+        raise typer.BadParameter("--budget requires --semantic")
     try:
-        raw = (
-            cache.search(ref_id, query)
-            if query is not None
-            else cache.retrieve(ref_id, lines_range=lines)
-        )
+        if semantic:
+            raw = cache.hybrid_search(
+                ref_id,
+                query,
+                budget=budget if budget is not None else 1000,
+                token_provider="openai",
+            )
+        else:
+            raw = (
+                cache.search(ref_id, query)
+                if query is not None
+                else cache.retrieve(ref_id, lines_range=lines)
+            )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     emitted = _emit(raw)
     # Recovery is additional context, not a second saving of the original log.
     try:
-        record_text("", emitted, operation="retrieve", engine=recovery_engine(ref_id))
+        record_text(
+            "", emitted, operation="retrieve", engine=recovery_engine(ref_id), offline=semantic
+        )
     except Exception:
         pass
 
@@ -2281,6 +2304,12 @@ def mcp(
             help="minimal: 4 tools, smallest schema footprint; coding: 9 core tools with compact schemas (default); desktop: 11 tools; full: all tools",
         ),
     ] = "coding",
+    transport: Annotated[str, typer.Option("--transport", help="stdio or sse")] = "stdio",
+    host: Annotated[str, typer.Option("--host")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", min=1, max=65535)] = 8080,
+    auth_token: Annotated[
+        str | None, typer.Option("--auth-token", envvar="USAGETRIM_MCP_AUTH_TOKEN")
+    ] = None,
 ):
     """Start the Model Context Protocol (MCP) server for Claude Code, Cursor, and Codex."""
     from usagetrim.mcp.server import tool_definitions
@@ -2289,7 +2318,19 @@ def mcp(
         tool_definitions(profile)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    run_mcp_stdio_server(profile)
+    if transport not in {"stdio", "sse"}:
+        raise typer.BadParameter("transport must be stdio or sse")
+    if transport == "stdio":
+        run_mcp_stdio_server(profile)
+    else:
+        from usagetrim.mcp.sse import run_mcp_sse_server
+
+        try:
+            run_mcp_sse_server(profile, host, port, auth_token)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        except ImportError as exc:
+            raise typer.BadParameter("SSE requires: pip install 'usagetrim[mcp]'") from exc
 
 
 @app.command()
