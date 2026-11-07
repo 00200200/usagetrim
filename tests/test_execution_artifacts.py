@@ -41,6 +41,35 @@ def test_empty_artifact_is_available_and_complete(cache):
     assert list(cache.iter_artifact(writer.ref_id)) == []
 
 
+@pytest.mark.parametrize("finished", [False, True])
+def test_artifact_search_stays_bounded_and_does_not_invoke_semantic_backend(
+    cache, monkeypatch, finished
+):
+    from usagetrim.core import semantic_search
+
+    def no_semantic_search(*args, **kwargs):
+        pytest.fail("Execution artifact anchors must not enter semantic search")
+
+    monkeypatch.setattr(semantic_search, "rank_chunks", no_semantic_search)
+    legacy = cache.store("legacy diagnostic", source="review")
+    assert "legacy diagnostic" in cache.hybrid_search(legacy, "diagnostic")
+    writer = cache.begin_artifact()
+    writer.append(b"execution diagnostic\n")
+    if finished:
+        writer.finish()
+    notice = cache.search(writer.ref_id, "diagnostic")
+    assert "not indexed" in notice and "line-range recovery" in notice
+    assert cache.hybrid_search(writer.ref_id, "diagnostic") == notice
+    with pytest.raises(ValueError, match="budget is too small"):
+        cache.hybrid_search(writer.ref_id, "diagnostic", budget=1)
+    with sqlite3.connect(cache.db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM recovery_search WHERE ref=?", (writer.ref_id,)
+        ).fetchone() == (0,)
+    if not finished:
+        writer.abort()
+
+
 def test_many_small_appends_and_incremental_utf8(cache):
     data = ("Zażółć 漢字🙂\n" * 8 + "no newline").encode()
     writer = cache.begin_artifact()

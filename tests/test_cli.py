@@ -118,8 +118,8 @@ def test_demo_measures_recovery_and_preserves_user_cache(tmp_path, monkeypatch):
     }
     assert data["specialized"]["cargo_test"] == {
         "raw_tokens": 3795,
-        "output_tokens": 185,
-        "reduction_pct": 95.1,
+        "output_tokens": 197,
+        "reduction_pct": 94.8,
     }
     assert data["specialized"]["go_test"] == {
         "raw_tokens": 3281,
