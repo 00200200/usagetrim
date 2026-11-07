@@ -112,6 +112,34 @@ def test_qt_initialization_real_monitor_and_settings(qt_app, tmp_path, monkeypat
     assert not window.poll_timer.isActive()
 
 
+@pytest.mark.parametrize("mode", ["panel", "pet"])
+def test_statistics_fit_after_first_snapshot(qt_app, tmp_path, mode):
+    from usagetrim.companion.controller import CompanionController
+    from usagetrim.companion.qt import CompanionWindow
+    from usagetrim.core.monitor import Monitor
+
+    service = Monitor([], tmp_path)
+    service.store.record(100, 120, 100, 120, event_id="visible-statistics")
+    window = CompanionWindow(
+        CompanionController(service),
+        executor=ImmediateExecutor(),
+        preference_executor=ImmediateExecutor(),
+    )
+    try:
+        window.set_mode(mode)
+        window.show()
+        qt_app.processEvents()
+        # The first completed read replaces the one-line loading placeholder
+        # after the native window has already been sized and shown.
+        window.poll()
+        qt_app.processEvents()
+        assert "Net token reduction: -20" in window.summary.text()
+        assert window.summary.height() >= window.summary.heightForWidth(window.summary.width())
+        assert window.quit_button.isVisible()
+    finally:
+        window.close()
+
+
 def test_qt_empty_state_and_refresh_failure_are_safe(qt_app, tmp_path):
     from usagetrim.companion.controller import CompanionController
     from usagetrim.companion.qt import CompanionWindow

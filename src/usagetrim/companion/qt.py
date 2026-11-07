@@ -409,6 +409,10 @@ class CompanionWindow(QWidget):
         self.pause_button.setEnabled(self._snapshot is not None)
         self.top.setEnabled(True)
         self.refresh_button.setEnabled(True)
+        # Measurements can add lines after the loading window has been shown.
+        self.controls.layout().activate()
+        self.layout().activate()
+        self.adjustSize()
         self._sync_tray()
 
     def showEvent(self, event):
