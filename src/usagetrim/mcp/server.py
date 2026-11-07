@@ -809,6 +809,25 @@ def handle_usagetrim_code(arguments: dict[str, Any]) -> str:
     return _record(result, output, operation="code", project=arguments["root"])
 
 
+def _specialized_with_recovery(raw: str, specialized: str) -> str:
+    """Redact a specialized command summary and keep the full output recoverable.
+
+    Specialized filters drop lines (passing records, stack frames, ...), so the
+    redacted original is cached and referenced like ``safe_compact_output`` does.
+    If caching fails, the redacted original is returned instead of a lossy view.
+    """
+    original = redact_secrets(raw)
+    compact = redact_secrets(specialized)
+    if compact == original:
+        return original
+    try:
+        ref = ContextCache().store(original, source="exec")
+    except Exception:
+        return original
+    separator = "" if compact.endswith(("\n", "\r")) else "\n"
+    return compact + separator + recovery_notice(ref)
+
+
 @_timed
 def handle_usagetrim_exec(arguments: dict[str, Any]) -> str:
     start = time.perf_counter()
@@ -857,7 +876,7 @@ def handle_usagetrim_exec(arguments: dict[str, Any]) -> str:
     else:
         specialized = auto_specialize_command_output(command, combined_raw)
         if specialized is not None:
-            output = specialized + footer
+            output = _specialized_with_recovery(combined_raw, specialized) + footer
         else:
             output = safe_compact_output(combined_raw, command=command) + footer
     return _record(

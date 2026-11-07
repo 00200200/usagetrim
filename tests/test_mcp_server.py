@@ -1012,3 +1012,40 @@ def test_stdio_tool_result_matches_declared_output_schema(tmp_path, monkeypatch,
     schema = tool.get("outputSchema", server._DEFAULT_OUTPUT_SCHEMA)
     assert schema == server._DEFAULT_OUTPUT_SCHEMA
     assert set(schema["required"]) <= result["structuredContent"].keys()
+
+
+CARGO_FAILURE_WITH_SECRET = (
+    "running 2 tests\n"
+    "test a::ok_one ... ok\n"
+    "test b::boom ... FAILED\n\n"
+    "failures:\n\n"
+    "---- b::boom stdout ----\n"
+    "thread 'b::boom' panicked at src/lib.rs:10:5:\n"
+    "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789\n"
+    "stack backtrace:\n"
+    "   0: rust_begin_unwind\n"
+    "   1: mycrate::b::boom\n"
+    "             at ./src/lib.rs:10:5\n\n"
+    "failures:\n"
+    "    b::boom\n\n"
+    "test result: FAILED. 1 passed; 1 failed; 0 ignored\n"
+)
+
+
+def test_exec_default_specialized_output_is_redacted_and_recoverable(tmp_path, monkeypatch):
+    from subprocess import CompletedProcess
+
+    monkeypatch.setenv("USAGETRIM_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        server.subprocess,
+        "run",
+        lambda *a, **kw: CompletedProcess(a, 101, CARGO_FAILURE_WITH_SECRET),
+    )
+    output = handle_usagetrim_exec({"command": "cargo test"})
+    assert "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in output
+    assert "[REDACTED_GITHUB_TOKEN]" in output
+    assert output.endswith("[exit code: 101]")
+    ref = re.search(r"tc_[0-9a-f]+", output).group(0)
+    recovered = ContextCache().retrieve(ref)
+    assert "mycrate::b::boom" in recovered
+    assert "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in recovered
