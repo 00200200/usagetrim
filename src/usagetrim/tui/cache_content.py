@@ -8,8 +8,8 @@ import tempfile
 import zlib
 from pathlib import Path
 
-from usagetrim.core.redactor import redact_secrets
 from usagetrim.tui.cache_data import _metadata_connection
+from usagetrim.tui.formatting import redact_terminal_text
 
 CONTENT_LIMIT = 4 * 1024 * 1024
 STORED_LIMIT = CONTENT_LIMIT + 64 * 1024
@@ -122,7 +122,7 @@ def read_redacted_content(
         decoded = data.decode("utf-8")
         if verify_hash and hashlib.sha256(data).hexdigest() != row[2]:
             raise CacheContentError("Snapshot integrity verification failed.", reason="integrity")
-        text = redact_secrets(decoded)
+        text = redact_terminal_text(decoded)
         if len(text.encode("utf-8")) > max_bytes:
             raise CacheContentError(
                 f"Redacted content exceeds {limit_label}; operation refused.", reason="limit"

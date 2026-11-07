@@ -15,7 +15,7 @@ from usagetrim.core.cache import ContextCache
 from usagetrim.tui.cache_content import CacheContentError, export_content, search_content
 from usagetrim.tui.cache_data import CachePage, read_cache_metadata, read_cache_page
 from usagetrim.tui.cache_preview import read_preview
-from usagetrim.tui.formatting import format_timestamp
+from usagetrim.tui.formatting import display_text, format_timestamp
 from usagetrim.tui.vim_table import VimDataTable
 from usagetrim.tui.workers import IOLane, IoResult
 
@@ -24,6 +24,7 @@ def _format_search_line(number: int, line: str) -> str:
     """Bound only display text, including its line-number prefix and ellipsis."""
     prefix = f"{number}: "
     available = 300 - len(prefix)
+    line = display_text(line)
     body = line if len(line) <= available else line[: available - 1] + "…"
     return prefix + body
 
@@ -234,7 +235,9 @@ class CacheScreen(Screen):
     @staticmethod
     def _error_text(error) -> str:
         return (
-            str(error) if isinstance(error, (CacheContentError, OSError)) else type(error).__name__
+            display_text(str(error))
+            if isinstance(error, (CacheContentError, OSError))
+            else type(error).__name__
         )
 
     def action_export_content(self) -> None:
@@ -357,7 +360,7 @@ class CacheScreen(Screen):
                 self._details.update(
                     "Recorded cache metadata (null = not recorded)\n"
                     + "\n".join(
-                        f"{key}: {json.dumps(value, ensure_ascii=False)}"
+                        f"{key}: {json.dumps(display_text(value) if isinstance(value, str) else value, ensure_ascii=False)}"
                         for key, value in asdict(entry).items()
                     )
                 )
@@ -404,8 +407,8 @@ class CacheScreen(Screen):
         table.clear()
         for entry in result.entries:
             table.add_row(
-                Text(entry.ref_id),
-                Text(entry.source if entry.source is not None else "—"),
+                Text(display_text(entry.ref_id)),
+                Text(display_text(entry.source) if entry.source is not None else "—"),
                 format_timestamp(entry.created_at),
                 str(entry.hit_count) if entry.hit_count is not None else "—",
                 key=entry.ref_id,

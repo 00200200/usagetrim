@@ -11,6 +11,7 @@ from usagetrim.core.redactor import redact_secrets
 ANSI_CSI_PATTERN = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 ANSI_OSC_PATTERN = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 ANSI_GENERIC_PATTERN = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+ANSI_C1_TRANSLATION = str.maketrans({"\x9b": "\x1b[", "\x9d": "\x1b]", "\x9c": "\x1b\\"})
 
 # Progress indicator patterns (spinners, dots, hashes)
 SPINNER_CHARS = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "◐", "◓", "◑", "◒", "-\\|/"}
@@ -47,6 +48,9 @@ def strip_ansi(text: str) -> str:
     """Remove ANSI escape sequences, OSC strings, and control characters."""
     if not text:
         return ""
+    # C1 CSI/OSC/ST have the same meaning as their two-byte ESC forms. Normalize
+    # before stripping so they cannot split credentials before redaction.
+    text = text.translate(ANSI_C1_TRANSLATION)
     text = ANSI_OSC_PATTERN.sub("", text)
     text = ANSI_CSI_PATTERN.sub("", text)
     text = ANSI_GENERIC_PATTERN.sub("", text)

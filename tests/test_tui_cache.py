@@ -28,6 +28,36 @@ def cache_with_entries(tmp_path, count):
     return cache, refs
 
 
+@pytest.mark.parametrize("view", ["preview", "search", "metadata"])
+def test_cache_render_never_emits_payload_terminal_controls(tmp_path, view):
+    payload = "needle\x1b[2J\x1b]52;c;U0FNUExF\x1b\\\x9b2J\x9d52;c;U0FNUExF\x9cend"
+    cache = ContextCache(tmp_path / "cache.db")
+    cache.store(
+        payload if view != "metadata" else "content",
+        source=payload if view == "metadata" else "exec",
+    )
+
+    async def scenario():
+        app = UsageTrimDashboard(TelemetryStore(tmp_path / "telemetry.db"), cache=cache)
+        async with app.run_test(size=(120, 50)) as pilot:
+            await settle(pilot)
+            await pilot.press("f2")
+            await settle(pilot)
+            if view == "preview":
+                app.screen.action_preview()
+            elif view == "search":
+                app.screen.query_one("#cache-content-query", Input).value = "needle"
+                app.screen.action_search_content()
+            await settle(pilot)
+            rendered = app.screen._compositor.render_update(full=True).render_segments(app.console)
+            assert "\x1b[2J" not in rendered
+            assert "\x1b]52;" not in rendered
+            assert not any(chr(value) in rendered for value in range(127, 160))
+            assert "needle" in rendered
+
+    asyncio.run(scenario())
+
+
 def test_cache_screen_search_paging_and_metadata_without_content(tmp_path, monkeypatch):
     cache, refs = cache_with_entries(tmp_path, 60)
 

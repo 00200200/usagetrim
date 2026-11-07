@@ -2,8 +2,8 @@
 
 import zlib
 
-from usagetrim.core.redactor import redact_secrets
 from usagetrim.tui.cache_data import _metadata_connection
+from usagetrim.tui.formatting import display_text
 
 LIMIT = 16 * 1024
 STORED_LIMIT = 256 * 1024
@@ -61,7 +61,7 @@ def read_preview(cache, ref_id):
             data = payload
         if len(data) > LIMIT:
             return "Preview unavailable: decoded payload exceeds 16 KiB."
-        text = redact_secrets(data.decode("utf-8", errors="replace"))
+        text = display_text(data.decode("utf-8", errors="replace"))
         if len(text.encode("utf-8")) > LIMIT:
             return "Preview unavailable: redacted text exceeds 16 KiB."
         return "Preview limited to 100 lines and 16 KiB.\n" + "\n".join(text.splitlines()[:100])

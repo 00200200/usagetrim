@@ -60,9 +60,10 @@ def test_snapshot_pair_uses_one_event_identity_and_recovers_both_texts(replay):
     assert cache.retrieve(metadata.after_ref) == "compact\n"
 
 
-def test_snapshot_redaction_precedes_persistence_including_ansi_split_tokens(replay):
+@pytest.mark.parametrize("color", ["\x1b[31m", "\x9b31m"])
+def test_snapshot_redaction_precedes_persistence_including_ansi_split_tokens(replay, color):
     secret = "ghp_" + "A" * 36
-    before = "ghp_\x1b[31m" + "A" * 36
+    before = "ghp_" + color + "A" * 36
     cache = ContextCache()
     metadata = capture_event_snapshots(before, secret, cache_allowed=True, cache=cache)
     assert metadata.before_ref == metadata.after_ref

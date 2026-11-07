@@ -27,7 +27,7 @@ from usagetrim.core.telemetry import TelemetryStore
 from usagetrim.metrics.pricing import calculate_cost
 from usagetrim.tui.cache_screen import CacheScreen
 from usagetrim.tui.diff_screen import DiffScreen
-from usagetrim.tui.formatting import format_timestamp
+from usagetrim.tui.formatting import display_text, format_timestamp
 from usagetrim.tui.history import HistoryFilters, read_history, read_history_inspections
 from usagetrim.tui.replay_data import (
     InspectionData,
@@ -281,7 +281,8 @@ class UsageTrimDashboard(App):
                 "Enter on the history row opens a comparison.\n"
                 "Recorded telemetry metadata (null = not recorded)\n"
             ) + "\n".join(
-                f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in event.items()
+                f"{key}: {json.dumps(display_text(value) if isinstance(value, str) else value, ensure_ascii=False)}"
+                for key, value in event.items()
             )
             if self._inspection_detail is None or self._inspection_detail[0] != event_id:
 
@@ -417,12 +418,12 @@ class UsageTrimDashboard(App):
             reduction = (100 * saved / raw if raw > 0 else 0) if known else None
             table.add_row(
                 Text(format_timestamp(event["timestamp"])),
-                Text(event["operation"]),
+                Text(display_text(event["operation"])),
                 f"{raw:,}" if raw is not None else "—",
                 f"{compact:,}" if compact is not None else "—",
                 f"{saved:,}" if saved is not None else "—",
                 f"{reduction:.1f}%" if reduction is not None else "—",
-                Text(event["delivery"]),
+                Text(display_text(event["delivery"])),
                 Text(
                     format_event_status(
                         self._history_inspections[event["event_id"]].inspection

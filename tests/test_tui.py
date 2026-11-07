@@ -15,6 +15,26 @@ from usagetrim.tui import app as dashboard
 from usagetrim.tui.history import HistoryFilters
 
 
+def test_history_render_never_emits_metadata_terminal_controls(tmp_path):
+    from usagetrim.core.cache import ContextCache
+
+    payload = "operation\x1b[2J\x1b]52;c;U0FNUExF\x1b\\\x9b2J\x9d52;c;U0FNUExF\x9cend"
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    store.record(0, operation=payload, project=payload, client=payload)
+
+    async def scenario():
+        app = dashboard.UsageTrimDashboard(store, cache=ContextCache(tmp_path / "cache.db"))
+        async with app.run_test(size=(160, 60)) as pilot:
+            await settle(pilot)
+            rendered = app.screen._compositor.render_update(full=True).render_segments(app.console)
+            assert "\x1b[2J" not in rendered
+            assert "\x1b]52;" not in rendered
+            assert not any(chr(value) in rendered for value in range(127, 160))
+            assert "operation" in rendered
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("raw,compact", [(0, 0), (1_000_000, 200_000), (100, 200)])
 def test_tui_hypothetical_usd_uses_openai_savings_and_static_pricing(
     tmp_path, monkeypatch, raw, compact

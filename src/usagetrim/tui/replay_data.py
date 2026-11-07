@@ -14,21 +14,17 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from usagetrim.core.cache import ContextCache
-from usagetrim.core.cleaner import strip_ansi
 from usagetrim.core.event_replay import INSPECTION_COLUMNS, EventInspection
-from usagetrim.core.redactor import redact_secrets
 from usagetrim.core.telemetry import TelemetryStore
 from usagetrim.tui.cache_content import CacheContentError, read_redacted_content
 from usagetrim.tui.cache_data import _metadata_connection
+from usagetrim.tui.formatting import display_text
 
 DIFF_INPUT_BYTES = 128 * 1024
 DIFF_STORED_BYTES = DIFF_INPUT_BYTES + 64 * 1024
 DIFF_INPUT_LINES = 1000
 DIFF_LINE_BYTES = 4096  # Includes a line's terminator after display sanitization.
 DIFF_OUTPUT_BYTES = 256 * 1024
-_CONTROL_ESCAPES = {
-    value: f"\\x{value:02x}" for value in (*range(32), *range(127, 160)) if value not in (9, 10)
-}
 
 
 class ReplayState(StrEnum):
@@ -194,14 +190,6 @@ def _presence(cache, inspection):
     return inspection.before_ref in refs, inspection.after_ref in refs
 
 
-def _display_text(text):
-    # Strip before re-redaction so ANSI cannot hide fragments of a credential.
-    text = redact_secrets(strip_ansi(text))
-    # Make remaining terminal control bytes visible. Rich/Textual markup is
-    # ordinary text here; consumers must render these strings without markup.
-    return text.translate(_CONTROL_ESCAPES)
-
-
 def _diff_lines(text):
     if len(text.encode("utf-8")) > DIFF_INPUT_BYTES:
         return None
@@ -255,7 +243,7 @@ def load_event_replay(
                 max_stored_bytes=DIFF_STORED_BYTES,
                 verify_hash=True,
             )
-        before, after = _display_text(before), _display_text(after)
+        before, after = display_text(before), display_text(after)
         old_lines, new_lines = _diff_lines(before), _diff_lines(after)
         if old_lines is None or new_lines is None:
             return ReplayData(metadata, ReplayState.INPUT_LIMIT, *present)

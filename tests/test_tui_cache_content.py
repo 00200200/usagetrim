@@ -51,6 +51,17 @@ def test_redaction_precedes_search_and_complete_export(tmp_path):
     assert data.count("match\n") == 30
 
 
+@pytest.mark.parametrize("color", ["\x1b[31m", "\x9b31m"])
+def test_ansi_cannot_hide_credentials_from_search_or_export(tmp_path, color):
+    cache = cache_payload(tmp_path, "credential=ghp_" + color + "A" * 36 + "\r\n")
+    assert content.search_content(cache, "tc_test", "A" * 36) == []
+    target = tmp_path / "redacted.log"
+    content.export_content(cache, "tc_test", target)
+    exported = target.read_bytes()
+    assert b"REDACTED" in exported and b"A" * 36 not in exported
+    assert exported.endswith(b"\r\n")
+
+
 @pytest.mark.parametrize(
     "payload", [b"ZLIBbroken", b"ZLIB" + zlib.compress(b"valid")[:-1], b"\xff"]
 )
