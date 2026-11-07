@@ -164,6 +164,22 @@ which consumes the runner's children. A detected loss of waitability refuses
 group signaling and reports a cleanup failure rather than accepting a guessed
 exit code or risking a reused process-group ID.
 
+On Darwin, `killpg` may return `EPERM` when only unreaped zombies remain. That
+error is dismissed only while the exited leader is still verified as waitable
+and a read-only local `libproc` probe confirms that every listed group member is
+a zombie. Membership is enumerated again after status checks to detect a child
+forked before its parent exited. This uses public `proc_listpids` and
+`proc_pidinfo(PROC_PIDT_SHORTBSDINFO, arg=1)` data, including zombies, not `ps`,
+a shell, or a reaping wait. The short form retains the process-group identifier
+even when session information is no longer present. See Apple's
+[process inspection implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/proc_info.c)
+and [public structures](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/proc_info.h).
+The adapter checks the 64-bit ABI and caps enumeration at 4096 members. Missing
+symbols, denied/truncated reads, a missing leader or changing membership leave
+the original permission error visible as a cleanup failure. A live descendant
+never qualifies for this exception. Linux signaling and Windows jobs are
+unchanged; actual Darwin behavior still requires native macOS CI/manual tests.
+
 Windows creates an unnamed Job Object with `KILL_ON_JOB_CLOSE`. `Popen` creates
 the child suspended in a new console process group. The job is assigned before
 resuming its sole initial thread using documented Toolhelp/OpenThread/ResumeThread

@@ -472,6 +472,40 @@ def test_darwin_native_adapter_runs_without_python_waitid_api(tmp_path, scenario
     assert result["complete"] and not result["issues"]
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin", reason="Requires native Darwin process-group semantics"
+)
+@pytest.mark.parametrize("scenario", ["normal", "darwin_no_waitid"])
+def test_darwin_waitable_zombie_leader_does_not_break_successful_capture(tmp_path, scenario):
+    result = shutdown_capture(tmp_path, scenario)
+    assert result["reason"] == "exited" and result["returncode"] == 0
+    assert result["complete"] and result["issues"] == []
+    assert all(
+        stream["complete"] and stream["available"] and stream["recovery_complete"]
+        for stream in result["streams"]
+    )
+    assert "ready stdout" in result["streams"][0]["text"]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Requires native Darwin descendant cleanup")
+@pytest.mark.parametrize("scenario", ["orphan", "stubborn_tree"])
+def test_darwin_zombie_exception_does_not_skip_live_descendant_cleanup(tmp_path, scenario):
+    # The existing harness waits on readiness files and verifies every recorded
+    # child PID and reader is gone before returning, behind an outer deadline.
+    result = shutdown_capture(tmp_path, scenario)
+    assert result["reason"] == ("timed_out" if scenario == "orphan" else "cancelled")
+    assert result["returncode"] == (0 if scenario == "orphan" else -signal.SIGTERM)
+    assert not result["complete"]
+    assert all(not stream["recovery_complete"] for stream in result["streams"])
+    assert not {
+        "scope_close_failed",
+        "forced_termination_failed",
+        "tree_exit_unverified",
+        "tree_state_unavailable",
+        "child_not_reaped",
+    }.intersection(result["issues"])
+
+
 @pytest.mark.parametrize("scenario", ["exec_failure", "cwd_failure"])
 def test_real_constructor_failed_start_has_no_child_returncode_or_stale_group(tmp_path, scenario):
     result = shutdown_capture(tmp_path, scenario)

@@ -6,6 +6,7 @@ to a kill-on-close Job Object. Imports do not load Windows DLLs on POSIX.
 
 from __future__ import annotations
 
+import errno
 import os
 import signal
 import subprocess
@@ -20,6 +21,7 @@ class ProcessTree:
         self.status_unavailable = False
         self.observed_returncode = None
         self._darwin_wait = None
+        self._darwin_group = None
         if os.name == "nt":
             self.job = _WindowsJob()
 
@@ -97,6 +99,35 @@ class ProcessTree:
             os.killpg(pid, number)
         except ProcessLookupError:
             pass
+        except PermissionError as error:
+            if error.errno != errno.EPERM or not self._darwin_group_exited():
+                raise
+
+    def _darwin_group_exited(self):
+        """Only dismiss EPERM with a waitable leader and a verified dead group."""
+        if (
+            sys.platform != "darwin"
+            or self.released
+            or self.status_unavailable
+            or self.process is None
+        ):
+            return False
+        try:
+            # An exited leader alone is insufficient: descendants may still run.
+            if self.poll() is None:
+                return False
+            probe = getattr(self, "_darwin_group", None)
+            if probe is None:
+                from usagetrim.core.darwin_wait import DarwinProcessGroup
+
+                self._darwin_group = probe = DarwinProcessGroup()
+            if probe.has_live_members(self.process.pid):
+                return False
+            # Do not accept a snapshot after an external reaper released our ID.
+            return self.poll() is not None
+        except OSError:
+            # An unavailable native probe is not evidence that EPERM is harmless.
+            return False
 
     def poll(self):
         try:
@@ -132,6 +163,10 @@ class ProcessTree:
             return True
         except ProcessLookupError:
             return False
+        except PermissionError as error:
+            if error.errno == errno.EPERM and self._darwin_group_exited():
+                return False
+            raise
 
     def close(self):
         self.released = True

@@ -311,3 +311,208 @@ def test_lost_waitability_preserves_known_status_but_never_reauthorizes_signals(
         tree.force()
     assert tree.status_unavailable and tree.observed_returncode == 7
     assert calls == [1234567, 1234567] and signals == []
+
+
+@pytest.fixture
+def darwin_eperm_tree(monkeypatch):
+    """Synthetic ownership only: never call a native API with this group's ID."""
+    tree = execution_process.ProcessTree.__new__(execution_process.ProcessTree)
+    tree.process = SimpleNamespace(pid=1234567, returncode=None)
+    tree.job = None
+    tree.released = tree.status_unavailable = False
+    tree.observed_returncode = None
+    tree._darwin_wait = None
+    tree._darwin_group = SimpleNamespace(has_live_members=lambda pid: False)
+    monkeypatch.setattr(execution_process, "sys", SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(execution_process, "signal", SimpleNamespace(SIGTERM=15, SIGKILL=9))
+    monkeypatch.setattr(os, "getpgrp", lambda: 42, raising=False)
+
+    def poll():
+        tree.observed_returncode = 7
+        return 7
+
+    def denied(pid, number):
+        assert pid == 1234567
+        raise PermissionError(errno.EPERM, "Group signal denied")
+
+    monkeypatch.setattr(tree, "poll", poll)
+    monkeypatch.setattr(os, "killpg", denied, raising=False)
+    return tree
+
+
+@pytest.mark.parametrize("action", ["gentle", "force", "alive"])
+def test_darwin_eperm_for_verified_zombie_group_is_not_a_cleanup_failure(darwin_eperm_tree, action):
+    tree = darwin_eperm_tree
+    result = getattr(tree, action)()
+    assert result is (False if action == "alive" else None)
+    assert tree.process.returncode is None  # No Popen.poll/wait has reaped it.
+    assert tree.observed_returncode == 7 and not tree.released
+
+
+@pytest.mark.parametrize("action", ["force", "alive"])
+@pytest.mark.parametrize("state", ["live_child", "unknown", "running_leader", "released", "lost"])
+def test_darwin_eperm_is_preserved_without_dead_group_proof(
+    darwin_eperm_tree, monkeypatch, action, state
+):
+    tree = darwin_eperm_tree
+    calls = []
+
+    def probe(pid):
+        calls.append(pid)
+        if state == "unknown":
+            raise OSError("Group inspection denied")
+        return state == "live_child"
+
+    tree._darwin_group = SimpleNamespace(has_live_members=probe)
+    if state == "running_leader":
+        monkeypatch.setattr(tree, "poll", lambda: None)
+    elif state == "released":
+        tree.released = True
+    elif state == "lost":
+        tree.status_unavailable = True
+    # Ownership guards refuse signals before killpg; alive's read-only EPERM
+    # must also remain an error after ownership has been released/lost.
+    with pytest.raises(OSError) as failure:
+        getattr(tree, action)()
+    if state not in {"released", "lost"} or action == "alive":
+        assert isinstance(failure.value, PermissionError)
+        assert failure.value.errno == errno.EPERM
+    assert tree.process.returncode is None
+    if state in {"released", "lost", "running_leader"}:
+        assert calls == []
+    else:
+        assert calls == [1234567]
+
+
+@pytest.mark.parametrize("platform,error", [("linux", errno.EPERM), ("darwin", errno.EACCES)])
+def test_permission_failures_outside_darwin_eperm_never_use_group_exception(
+    darwin_eperm_tree, monkeypatch, platform, error
+):
+    tree = darwin_eperm_tree
+    monkeypatch.setattr(execution_process, "sys", SimpleNamespace(platform=platform))
+
+    def forbidden(pid):
+        raise AssertionError("No zombie exception is allowed here")
+
+    def denied(*args):
+        raise PermissionError(error, "Signal denied")
+
+    tree._darwin_group = SimpleNamespace(has_live_members=forbidden)
+    monkeypatch.setattr(os, "killpg", denied)
+    with pytest.raises(PermissionError) as failure:
+        tree.force()
+    assert failure.value.errno == error
+
+
+def test_darwin_lost_waitability_after_group_snapshot_cannot_hide_eperm(
+    darwin_eperm_tree, monkeypatch
+):
+    tree = darwin_eperm_tree
+    calls = []
+
+    def poll():
+        calls.append(True)
+        if len(calls) == 3:  # _signal, before inspection, after inspection.
+            raise OSError("Waitable ownership was lost")
+        return 7
+
+    monkeypatch.setattr(tree, "poll", poll)
+    with pytest.raises(PermissionError) as failure:
+        tree.force()
+    assert failure.value.errno == errno.EPERM and len(calls) == 3
+
+
+def test_darwin_group_probe_initialization_failure_preserves_eperm(darwin_eperm_tree, monkeypatch):
+    tree = darwin_eperm_tree
+    tree._darwin_group = None
+
+    def unavailable():
+        raise OSError("Darwin group inspection is unavailable")
+
+    monkeypatch.setattr(darwin_wait, "DarwinProcessGroup", unavailable)
+    with pytest.raises(PermissionError) as failure:
+        tree.force()
+    assert failure.value.errno == errno.EPERM
+    assert tree.process.returncode is None
+
+
+@pytest.fixture
+def darwin_group_probe(monkeypatch):
+    if ctypes.sizeof(ctypes.c_void_p) != 8:
+        pytest.skip("Darwin process-info adapter requires a 64-bit ABI")
+
+    def create(snapshots, statuses, *, returned_size=None):
+        remaining = iter(snapshots)
+        calls = []
+
+        def listpids(kind, pgid, buffer, capacity):
+            assert (kind, pgid) == (2, 123)
+            calls.append("list")
+            members = next(remaining)
+            if members == "full":
+                return capacity
+            for index, pid in enumerate(members):
+                buffer[index] = pid
+            return len(members) * ctypes.sizeof(ctypes.c_int)
+
+        def pidinfo(pid, flavor, argument, pointer, size):
+            assert (flavor, argument, size) == (13, 1, 64)
+            calls.append(pid)
+            status = statuses[pid]
+            if status == "denied":
+                ctypes.set_errno(errno.EPERM)
+                return 0
+            info = ctypes.cast(pointer, ctypes.POINTER(darwin_wait._BsdShortInfo)).contents
+            info.pid, info.pgid = pid, 123
+            if status == "wrong_group":
+                info.pgid, info.status = 999, 5
+            else:
+                info.status = status
+            return size if returned_size is None else returned_size
+
+        monkeypatch.setattr(darwin_wait, "sys", SimpleNamespace(platform="darwin"))
+        monkeypatch.setattr(
+            ctypes,
+            "CDLL",
+            lambda *args, **kwargs: SimpleNamespace(proc_listpids=listpids, proc_pidinfo=pidinfo),
+        )
+        return darwin_wait.DarwinProcessGroup(), calls
+
+    return create
+
+
+def test_darwin_group_probe_confirms_all_zombies_and_rechecks_membership(darwin_group_probe):
+    probe, calls = darwin_group_probe([[123, 456], [123, 456]], {123: 5, 456: 5})
+    assert probe.has_live_members(123) is False
+    assert calls[0] == calls[-1] == "list" and set(calls[1:-1]) == {123, 456}
+
+
+@pytest.mark.parametrize("status", [1, 2, 3, 4])
+def test_darwin_group_probe_does_not_confuse_live_descendant_with_zombie_leader(
+    darwin_group_probe, status
+):
+    probe, _ = darwin_group_probe([[123, 456]], {123: 5, 456: status})
+    assert probe.has_live_members(123) is True
+
+
+@pytest.mark.parametrize(
+    "snapshots,statuses,size",
+    [
+        ([[123], [123, 456]], {123: 5}, None),
+        ([[123, 456], [123]], {123: 5, 456: 5}, None),
+        ([[123]], {123: "denied"}, None),
+        ([[123, 456]], {123: 5, 456: "denied"}, None),
+        ([[123]], {123: "wrong_group"}, None),
+        ([[123]], {123: 0}, None),
+        ([[123]], {123: 5}, 63),
+        ([[456]], {}, None),
+        ([[]], {}, None),
+        (["full"], {}, None),
+    ],
+)
+def test_darwin_group_probe_refuses_incomplete_denied_or_changing_snapshots(
+    darwin_group_probe, snapshots, statuses, size
+):
+    probe, _ = darwin_group_probe(snapshots, statuses, returned_size=size)
+    with pytest.raises(OSError):
+        probe.has_live_members(123)
