@@ -413,13 +413,19 @@ def _is_cargo_pass_progress(line: str) -> bool:
     return bool(_CARGO_PASS_LINE.fullmatch(line.strip()))
 
 
+def _append_backtrace_notice(result: list[str], count: int) -> None:
+    if count:
+        result.append(f"[UsageTrim: {count} stack backtrace lines omitted]")
+
+
 def filter_cargo_test(raw_output: str) -> str:
     """Collapse cargo/nextest pass progress; keep failures dense.
 
     Passing ``test ... ok`` / nextest ``PASS [..]`` runs collapse to one marker.
     Failed tests keep their status line, name, panic location, and assertion
-    (including ``left:`` / ``right:``). Stack backtraces are dropped — they are
-    the bulk of the tokens and do not add identity beyond the assertion line.
+    (including ``left:`` / ``right:``). Stack backtraces are folded into a
+    one-line notice — they are the bulk of the tokens and do not add identity
+    beyond the assertion line, but the reader should know they were there.
     Passes that appear after a failure stay as named lines. The trailing
     ``test result:`` / nextest ``Summary`` line is preserved.
     """
@@ -429,6 +435,7 @@ def filter_cargo_test(raw_output: str) -> str:
     changed = False
     in_backtrace = False
     seen_failure = False
+    backtrace_lines = 0
 
     while index < len(lines):
         line = lines[index]
@@ -447,13 +454,16 @@ def filter_cargo_test(raw_output: str) -> str:
                 or stripped.startswith("───")
             ):
                 in_backtrace = False
+                _append_backtrace_notice(result, backtrace_lines)
             else:
                 changed = True
+                backtrace_lines += 1
                 index += 1
                 continue
 
         if _CARGO_BACKTRACE_START.match(stripped):
             in_backtrace = True
+            backtrace_lines = 1
             changed = True
             index += 1
             continue
@@ -486,6 +496,8 @@ def filter_cargo_test(raw_output: str) -> str:
         result.append(line)
         index += 1
 
+    if in_backtrace:
+        _append_backtrace_notice(result, backtrace_lines)
     if not changed:
         return raw_output
     return "\n".join(result)

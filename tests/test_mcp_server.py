@@ -838,7 +838,8 @@ def test_mcp_registry_metadata_and_output_schemas():
         assert "outputSchema" in tool, f"Missing outputSchema on tool: {tool['name']}"
         out_schema = tool["outputSchema"]
         assert out_schema.get("type") == "object"
-        assert "content" in out_schema.get("properties", {})
+        assert out_schema["properties"] == {"isError": {"type": "boolean"}}
+        assert out_schema["required"] == ["isError"]
 
 
 @pytest.fixture
@@ -976,3 +977,75 @@ def test_mcp_structural_diff_empty_keeps_message(structural_mcp_repo, monkeypatc
         server, "classify_git_diff", lambda *a, **kw: pytest.fail("Empty diff must skip classifier")
     )
     assert handle_usagetrim_diff({"cwd": str(root)}) == "No git changes detected."
+
+
+@pytest.mark.parametrize("profile", ["minimal", "coding", "desktop", "full"])
+@pytest.mark.parametrize("missing", [False, True])
+def test_stdio_tool_result_matches_declared_output_schema(tmp_path, monkeypatch, profile, missing):
+    source = tmp_path / "structured.txt"
+    if not missing:
+        source.write_text("STDIO_STRUCTURED_RESULT", encoding="utf-8")
+    request = {
+        "jsonrpc": "2.0",
+        "id": 51,
+        "method": "tools/call",
+        "params": {"name": "usagetrim_read", "arguments": {"path": str(source)}},
+    }
+    output = io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(request) + "\n"))
+    monkeypatch.setattr(sys, "stdout", output)
+    run_mcp_stdio_server(profile)
+    response = json.loads(output.getvalue())
+    assert response["jsonrpc"] == "2.0"
+    assert response["id"] == 51
+    result = response["result"]
+    assert result["isError"] is missing
+    assert result["structuredContent"] == {"isError": missing}
+    # Check the serialized wire response, including error text, for duplication.
+    assert output.getvalue().count(json.dumps(result["content"][0]["text"])) == 1
+    assert "structuredContent" not in result["structuredContent"]
+    assert result["content"][0]["type"] == "text"
+    assert isinstance(result["content"][0]["text"], str)
+    if not missing:
+        assert "STDIO_STRUCTURED_RESULT" in result["content"][0]["text"]
+    tool = next(t for t in server.tool_definitions(profile) if t["name"] == "usagetrim_read")
+    schema = tool.get("outputSchema", server._DEFAULT_OUTPUT_SCHEMA)
+    assert schema == server._DEFAULT_OUTPUT_SCHEMA
+    assert set(schema["required"]) <= result["structuredContent"].keys()
+
+
+CARGO_FAILURE_WITH_SECRET = (
+    "running 2 tests\n"
+    "test a::ok_one ... ok\n"
+    "test b::boom ... FAILED\n\n"
+    "failures:\n\n"
+    "---- b::boom stdout ----\n"
+    "thread 'b::boom' panicked at src/lib.rs:10:5:\n"
+    "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789\n"
+    "stack backtrace:\n"
+    "   0: rust_begin_unwind\n"
+    "   1: mycrate::b::boom\n"
+    "             at ./src/lib.rs:10:5\n\n"
+    "failures:\n"
+    "    b::boom\n\n"
+    "test result: FAILED. 1 passed; 1 failed; 0 ignored\n"
+)
+
+
+def test_exec_default_specialized_output_is_redacted_and_recoverable(tmp_path, monkeypatch):
+    from subprocess import CompletedProcess
+
+    monkeypatch.setenv("USAGETRIM_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        server.subprocess,
+        "run",
+        lambda *a, **kw: CompletedProcess(a, 101, CARGO_FAILURE_WITH_SECRET),
+    )
+    output = handle_usagetrim_exec({"command": "cargo test"})
+    assert "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in output
+    assert "[REDACTED_GITHUB_TOKEN]" in output
+    assert output.endswith("[exit code: 101]")
+    ref = re.search(r"tc_[0-9a-f]+", output).group(0)
+    recovered = ContextCache().retrieve(ref)
+    assert "mycrate::b::boom" in recovered
+    assert "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in recovered

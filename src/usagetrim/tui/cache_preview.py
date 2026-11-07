@@ -2,7 +2,7 @@
 
 import zlib
 
-from usagetrim.tui.cache_data import _metadata_connection
+from usagetrim.tui.cache_data import _is_execution_artifact, _metadata_connection
 from usagetrim.tui.formatting import display_text
 
 LIMIT = 16 * 1024
@@ -14,6 +14,8 @@ def read_preview(cache, ref_id):
     with _metadata_connection(cache) as conn:
         if conn is None:
             return "Cache entry is unavailable."
+        if _is_execution_artifact(conn, ref_id):
+            return "Preview unavailable: execution artifacts require bounded line-range recovery."
         row = conn.execute(
             "SELECT typeof(content),rowid FROM output_cache WHERE ref_id=?",
             (ref_id,),

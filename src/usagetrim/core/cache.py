@@ -31,6 +31,10 @@ class RecoveryResult:
     error: bool = False
 
 
+class _ExecutionArtifactSearchUnavailable(ValueError):
+    """An execution artifact cannot be indexed as a legacy text snapshot."""
+
+
 def get_cache_budget_bytes() -> int:
     """Return maximum cache budget in bytes from env or default (500 MB)."""
     env_bytes = os.environ.get("USAGETRIM_CACHE_MAX_BYTES")
@@ -171,6 +175,80 @@ class ContextCache:
 
         return ref_id
 
+    def begin_artifact(
+        self,
+        *,
+        quota_bytes: int | None = None,
+        max_active: int = 4,
+        execution_id: str | None = None,
+        stream="merged",
+    ):
+        """Begin an internal bounded execution artifact in this CCR database."""
+        from usagetrim.core.execution_artifacts import begin_artifact
+
+        return begin_artifact(
+            self,
+            quota_bytes=quota_bytes,
+            max_active=max_active,
+            execution_id=execution_id,
+            stream=stream,
+        )
+
+    def execution_recovery(self, execution_id: str):
+        from usagetrim.core.execution_artifacts import execution_recovery
+
+        return execution_recovery(self, execution_id)
+
+    def iter_execution_observations(self, execution_id: str):
+        from usagetrim.core.execution_artifacts import iter_execution_observations
+
+        return iter_execution_observations(self, execution_id)
+
+    def artifact_metadata(self, ref_id: str):
+        from usagetrim.core.execution_artifacts import artifact_metadata
+
+        return artifact_metadata(self, ref_id)
+
+    def read_artifact(self, ref_id: str, *, first_line=1, last_line=None, max_bytes=65536):
+        from usagetrim.core.execution_artifacts import read_artifact
+
+        return read_artifact(
+            self, ref_id, first_line=first_line, last_line=last_line, max_bytes=max_bytes
+        )
+
+    def iter_artifact(self, ref_id: str):
+        from usagetrim.core.execution_artifacts import iter_artifact
+
+        return iter_artifact(self, ref_id)
+
+    def expire_artifact_writes(self, *, stale_before=None):
+        from usagetrim.core.execution_artifacts import expire_writes
+
+        return expire_writes(self, stale_before=stale_before)
+
+    @staticmethod
+    def _is_execution_artifact(conn, ref_id):
+        # Do not require/migrate artifact tables for legacy-only cache users.
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_artifacts'"
+        ).fetchone()
+        if (
+            exists
+            and conn.execute(
+                "SELECT 1 FROM execution_artifacts WHERE ref_id=?", (ref_id,)
+            ).fetchone()
+        ):
+            return True
+        # A damaged/missing artifact metadata table must not expose its empty
+        # anchor as a successful legacy recovery. Ordinary legacy hashes are set.
+        return bool(
+            conn.execute(
+                """SELECT 1 FROM output_cache WHERE ref_id=? AND source='execution-artifact'
+            AND content_hash IS NULL""",
+                (ref_id,),
+            ).fetchone()
+        )
+
     def retrieve(self, ref_id: str, lines_range: str | None = None) -> str:
         """Retrieve stored content by ref ID, optionally slicing a line range."""
         return self.retrieve_result(ref_id, lines_range).text
@@ -178,6 +256,7 @@ class ContextCache:
     def retrieve_result(self, ref_id: str, lines_range: str | None = None) -> RecoveryResult:
         """Read once and report recovery without interpreting user payload text."""
         with sqlite3.connect(self.db_path) as conn:
+            artifact = self._is_execution_artifact(conn, ref_id)
             row = conn.execute(
                 "SELECT content, source FROM output_cache WHERE ref_id = ?",
                 (ref_id,),
@@ -197,6 +276,34 @@ class ContextCache:
         if not row:
             return RecoveryResult(
                 f"Error: ref ID '{ref_id}' not found in usagetrim cache.", False, True
+            )
+
+        if artifact:
+            # New internal refs must not look like empty/full legacy payloads.
+            # Bounded output and explicit storage/response state are mandatory.
+            first, last = 1, None
+            if lines_range:
+                try:
+                    parts = lines_range.split("-", 1)
+                    first = int(parts[0])
+                    last = int(parts[-1])
+                    if first < 1 or last < first:
+                        raise ValueError
+                except ValueError:
+                    return RecoveryResult(
+                        "Error: lines must be a positive line number or an ascending range (e.g. 10-40).",
+                        False,
+                        True,
+                    )
+            result = self.read_artifact(ref_id, first_line=first, last_line=last)
+            return RecoveryResult(
+                f"# [Execution artifact {ref_id}; state={result.metadata.state.value}; "
+                "view=redacted-normalized; "
+                f"storage_complete={result.metadata.complete}; "
+                f"response_truncated={result.response_truncated}]\n" + result.text,
+                result.metadata.available
+                and not result.response_truncated
+                and (bool(result.text) if lines_range else result.metadata.complete),
             )
 
         # Also protect entries written by older versions before cache redaction.
@@ -240,6 +347,7 @@ class ContextCache:
         if type(limit) is not int or not 1 <= limit <= 20:
             raise ValueError("limit must be 1–20")
         with sqlite3.connect(self.db_path) as conn:
+            artifact = self._is_execution_artifact(conn, ref_id)
             row = conn.execute(
                 "SELECT content FROM output_cache WHERE ref_id=?", (ref_id,)
             ).fetchone()
@@ -256,6 +364,10 @@ class ContextCache:
                 conn.commit()
         if row is None:
             return None, [], False
+        if artifact:
+            raise _ExecutionArtifactSearchUnavailable(
+                "Execution artifact search is not indexed; use bounded line-range recovery."
+            )
         original = redact_secrets(decompress_payload(row[0]))
         checksum = hashlib.sha256(original.encode()).hexdigest()
         with sqlite3.connect(self.db_path) as conn:
@@ -314,7 +426,10 @@ class ContextCache:
 
     def search_result(self, ref_id: str, query: str, limit: int = 5) -> RecoveryResult:
         """Read lexical candidates once; notices alone are not recovered content."""
-        original, rows, _ = self._search_snapshot(ref_id, query, limit)
+        try:
+            original, rows, _ = self._search_snapshot(ref_id, query, limit)
+        except _ExecutionArtifactSearchUnavailable as exc:
+            return RecoveryResult(str(exc), False)
         if original is None:
             return RecoveryResult(
                 f"Error: ref ID '{ref_id}' not found in usagetrim cache.", False, True
@@ -360,9 +475,15 @@ class ContextCache:
             counts, _ = count_tokens_offline(emitted)
             return getattr(counts, token_provider) <= budget
 
-        original, lexical, complete = self._search_snapshot(
-            ref_id, query, limit, check_complete=True
-        )
+        try:
+            original, lexical, complete = self._search_snapshot(
+                ref_id, query, limit, check_complete=True
+            )
+        except _ExecutionArtifactSearchUnavailable as exc:
+            notice = str(exc)
+            if not fits(notice):
+                raise ValueError("budget is too small for the recovery status") from None
+            return RecoveryResult(notice, False)
         if original is None:
             missing = f"Error: ref ID '{ref_id}' not found in usagetrim cache."
             if not fits(missing):
@@ -489,10 +610,26 @@ class ContextCache:
         target = target_bytes if target_bytes is not None else int(budget * 0.85)
 
         with sqlite3.connect(self.db_path) as conn:
+            has_artifacts = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_artifacts'"
+            ).fetchone()
+            active_filter = (
+                "WHERE ref_id NOT IN (SELECT ref_id FROM execution_artifacts WHERE state='writing')"
+                if has_artifacts
+                else ""
+            )
+            payload_size = "LENGTH(content)"
+            if has_artifacts:
+                payload_size = (
+                    "COALESCE(LENGTH(content),0) + COALESCE((SELECT stored_bytes + "
+                    "chunk_count * 256 + 1024 FROM execution_artifacts AS artifact "
+                    "WHERE artifact.ref_id=output_cache.ref_id),0)"
+                )
             cursor = conn.execute(
-                """
-                SELECT ref_id, LENGTH(content)
+                f"""
+                SELECT ref_id, {payload_size}
                 FROM output_cache
+                {active_filter}
                 ORDER BY
                     CASE WHEN hit_count > 0 THEN 1 ELSE 0 END ASC,
                     hit_count ASC,

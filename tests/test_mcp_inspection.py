@@ -74,7 +74,11 @@ def test_mcp_exec_records_actual_exit_and_snapshot_pair(monkeypatch, replay, cod
     command = python_command(f"print({text!r}); raise SystemExit({code})")
     response = call("usagetrim_exec", {"command": command})
     output = text + f"\n\n[exit code: {code}]"
-    assert response == {"content": [{"type": "text", "text": output}], "isError": False}
+    assert response == {
+        "content": [{"type": "text", "text": output}],
+        "isError": False,
+        "structuredContent": {"isError": False},
+    }
     [(event, details)] = recorded()
     assert details.child_returncode == code and details.termination_reason == "exited"
     assert details.snapshot_state == ("stored" if replay else "disabled")
@@ -188,7 +192,11 @@ def test_mcp_retrieve_records_scope_without_new_snapshots(monkeypatch, options, 
 def test_mcp_retrieve_empty_or_error_prefixed_payload_is_not_a_tool_error(text):
     ref = ContextCache().store(text)
     response = call("usagetrim_retrieve", {"ref_id": ref, "max_tokens": 80})
-    assert response == {"content": [{"type": "text", "text": text}], "isError": False}
+    assert response == {
+        "content": [{"type": "text", "text": text}],
+        "isError": False,
+        "structuredContent": {"isError": False},
+    }
     [(_, details)] = recorded()
     assert details.recovery_ref == ref and details.recovery_scope == "full"
     # The per-request flag must not leak into unrelated tools or later requests.
@@ -271,6 +279,7 @@ def test_mcp_telemetry_and_ccr_failures_do_not_change_success(monkeypatch, failu
     assert response == {
         "content": [{"type": "text", "text": "ok\n\n[exit code: 0]"}],
         "isError": False,
+        "structuredContent": {"isError": False},
     }
     if failure == "ccr":
         [(_, details)] = recorded()

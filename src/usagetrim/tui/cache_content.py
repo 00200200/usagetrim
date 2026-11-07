@@ -8,7 +8,7 @@ import tempfile
 import zlib
 from pathlib import Path
 
-from usagetrim.tui.cache_data import _metadata_connection
+from usagetrim.tui.cache_data import _is_execution_artifact, _metadata_connection
 from usagetrim.tui.formatting import redact_terminal_text
 
 CONTENT_LIMIT = 4 * 1024 * 1024
@@ -40,6 +40,10 @@ def read_redacted_content(
         raise ValueError("Invalid stored-payload limit")
     limit_label = "4 MiB" if max_bytes == CONTENT_LIMIT else f"{max_bytes:,} bytes"
     with _metadata_connection(cache) as conn:
+        if conn is not None and _is_execution_artifact(conn, ref_id):
+            raise CacheContentError(
+                "Execution artifacts require bounded line-range recovery.", reason="unavailable"
+            )
         if verify_hash and conn is not None:
             columns = {column[1] for column in conn.execute("PRAGMA table_info(output_cache)")}
             if "content_hash" not in columns:

@@ -17,6 +17,26 @@ def cache_payload(tmp_path, payload):
     return cache
 
 
+@pytest.mark.parametrize("finished", [False, True])
+def test_execution_artifact_anchor_is_not_previewed_or_exported_as_empty_log(tmp_path, finished):
+    from usagetrim.tui.cache_preview import read_preview
+
+    cache = ContextCache(tmp_path / "cache.db")
+    writer = cache.begin_artifact()
+    writer.append(b"actual execution output\n")
+    if finished:
+        writer.finish()
+    assert "execution artifacts" in read_preview(cache, writer.ref_id)
+    with pytest.raises(content.CacheContentError, match="line-range recovery"):
+        content.search_content(cache, writer.ref_id, "output")
+    destination = tmp_path / "execution.log"
+    with pytest.raises(content.CacheContentError, match="line-range recovery"):
+        content.export_content(cache, writer.ref_id, destination)
+    assert not destination.exists()
+    if not finished:
+        writer.abort()
+
+
 @pytest.mark.parametrize("kind", ["text", "raw", "zlib", "legacy-zlib", "zstd"])
 def test_complete_content_formats_search_and_export(tmp_path, kind):
     text = "first\r\nżółć diagnostic\nlast without newline"

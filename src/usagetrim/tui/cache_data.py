@@ -75,6 +75,14 @@ def _metadata_connection(cache: ContextCache | None):
         conn.close()
 
 
+def _is_execution_artifact(conn, ref_id):
+    # Older text-only cache schemas may lack the anchor metadata columns.
+    columns = {column[1] for column in conn.execute("PRAGMA table_info(output_cache)")}
+    return {"source", "content_hash"} <= columns and ContextCache._is_execution_artifact(
+        conn, ref_id
+    )
+
+
 def read_cache_page(
     cache: ContextCache | None = None,
     *,
