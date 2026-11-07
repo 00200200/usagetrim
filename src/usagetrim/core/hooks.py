@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import configparser
 import os
+import shlex
 import stat
 import sys
 import tempfile
+import tomllib
 from collections.abc import Sequence
 from fnmatch import fnmatchcase, translate
 from pathlib import Path
@@ -64,11 +67,137 @@ def _shell_options(argv: Sequence[str]) -> Sequence[str]:
     return argv[: argv.index("--")] if "--" in argv else argv
 
 
+_PYTEST_CONFIG_NAMES = (
+    "pytest.toml",
+    ".pytest.toml",
+    "pytest.ini",
+    ".pytest.ini",
+    "pyproject.toml",
+    "tox.ini",
+    "setup.cfg",
+)
+_PYTEST_SETTINGS_LIMIT = 64 * 1024
+
+
+def _pytest_addopts(value: object) -> list[str]:
+    """Parse pytest option data only; never reparse the command's OS argv."""
+    if isinstance(value, str):
+        if len(value) > _PYTEST_SETTINGS_LIMIT:
+            raise ValueError("pytest options exceed inspection limit")
+        return shlex.split(value)
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        if sum(map(len, value)) <= _PYTEST_SETTINGS_LIMIT:
+            return value
+    raise ValueError("ambiguous pytest options")
+
+
+def _pytest_config_options(path: Path) -> list[str]:
+    """Read bounded configuration data without importing pytest or plugins."""
+    if not stat.S_ISREG(path.stat().st_mode):
+        raise ValueError("pytest configuration is not a regular file")
+    with path.open("rb") as source:
+        data = source.read(_PYTEST_SETTINGS_LIMIT + 1)
+    if len(data) > _PYTEST_SETTINGS_LIMIT:
+        raise ValueError("pytest configuration exceeds inspection limit")
+    text = data.decode("utf-8")
+    if path.suffix == ".toml":
+        config = tomllib.loads(text)
+        if path.name in {"pytest.toml", ".pytest.toml"}:
+            section = config.get("pytest", {})
+        else:
+            section = config.get("tool", {}).get("pytest", {})
+            if "ini_options" in section:
+                if len(section) != 1:
+                    raise ValueError("mixed pytest configuration formats")
+                section = section["ini_options"]
+        if not isinstance(section, dict):
+            raise ValueError("invalid pytest configuration table")
+        return _pytest_addopts(section.get("addopts", ""))
+    if path.suffix not in {".ini", ".cfg"}:
+        raise ValueError("unknown pytest configuration format")
+    config = configparser.ConfigParser(interpolation=None)
+    config.read_string(text)
+    section = "tool:pytest" if path.suffix == ".cfg" else "pytest"
+    if path.suffix == ".cfg" and config.has_section("pytest"):
+        raise ValueError("unsupported setup.cfg pytest section")
+    return _pytest_addopts(config.get(section, "addopts", fallback=""))
+
+
+def _pytest_unsafe_options(options: Sequence[str], *, config: bool = False) -> bool:
+    for option in _shell_options(options):
+        if any(fnmatchcase(option, pattern) for pattern in _SHELL_PASSTHROUGH_ARGS["pytest"]):
+            return True
+        # Abbreviated debugger flags and argument files cannot be proved safe.
+        if option.startswith(("--pd", "--tr", "@")) or option == "--pyargs":
+            return True
+        if config and option.startswith(("-c", "--conf", "--rootdir")):
+            return True
+    return False
+
+
+def _pytest_settings_safe(args: Sequence[str]) -> bool:
+    """Conservatively inspect implicit options; uncertainty means passthrough.
+
+    Discovery deliberately checks a superset of pytest's possible configuration
+    roots (cwd and existing argument paths and their ancestors). It may bypass
+    a harmless invocation rather than miss an interactive configuration.
+    Explicit -c/--config-file selects only that file, as pytest does.
+    """
+    try:
+        combined = [*_pytest_addopts(os.environ.get("PYTEST_ADDOPTS", "")), *args]
+        if _pytest_unsafe_options(combined):
+            return False
+        options = _shell_options(combined)
+        selected = None
+        index = 0
+        while index < len(options):
+            option = options[index]
+            if option in {"-c", "--config-file"}:
+                index += 1
+                if index >= len(options) or not options[index] or options[index].startswith("-"):
+                    return False
+                selected = options[index]
+            elif option.startswith("-c"):
+                selected = option[2:].removeprefix("=")
+            elif option.startswith("--config-file="):
+                selected = option.partition("=")[2]
+            elif option.startswith("--conf"):
+                return False
+            index += 1
+        if selected is not None:
+            return bool(selected) and not _pytest_unsafe_options(
+                _pytest_config_options(Path(selected)), config=True
+            )
+        directories = {Path.cwd()}
+        for argument in combined:
+            if argument.startswith("-"):
+                continue
+            path = Path(argument.split("::", 1)[0])
+            if path.exists():
+                for candidate in (path.absolute(), path.resolve()):
+                    directories.add(candidate if candidate.is_dir() else candidate.parent)
+        roots = {parent for directory in directories for parent in (directory, *directory.parents)}
+        for root in roots:
+            for name in _PYTEST_CONFIG_NAMES:
+                path = root / name
+                try:
+                    extra = _pytest_config_options(path)
+                except FileNotFoundError:
+                    continue
+                if _pytest_unsafe_options(extra, config=True):
+                    return False
+        return True
+    except (OSError, ValueError, configparser.Error, AttributeError, TypeError, RuntimeError):
+        return False
+
+
 def should_intercept_command(argv: Sequence[str]) -> bool:
     """Match known finite argv forms; uncertain/global options fail open."""
     if isinstance(argv, (str, bytes)) or not argv:
         return False
     command, args = argv[0], argv[1:]
+    if command == "pytest" and not _pytest_settings_safe(args):
+        return False
     if command in _SHELL_FINITE_SUBCOMMANDS:
         while args and args[0].startswith("-"):
             if args[0] in _SHELL_GLOBAL_VALUE_FLAGS[command]:
@@ -96,6 +225,22 @@ def should_intercept_command(argv: Sequence[str]) -> bool:
     )
 
 
+def _pytest_shell_check(shell: str) -> str:
+    """Use one policy for every shell; helper failures preserve native execution."""
+    code = (
+        "import sys; from usagetrim.core.hooks import should_intercept_command; "
+        "sys.exit(0 if should_intercept_command(sys.argv[1:]) else 1)"
+    )
+
+    def quote(value: str) -> str:
+        if shell == "fish":
+            return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+        return shlex.quote(value)
+
+    argv = "$argv" if shell == "fish" else '"$@"'
+    return f"command {quote(sys.executable)} -c {quote(code)} {argv} </dev/null >/dev/null 2>&1"
+
+
 def generate_shell_wrapper(shell: str) -> str:
     """Return opt-in shell functions forwarding argv, without installation."""
     if shell == "fish":
@@ -112,6 +257,10 @@ def generate_shell_wrapper(shell: str) -> str:
         "# usagetrim: conservative high-volume command wrappers (bash/zsh)",
         "function _usagetrim_shell_intercept {",
         '    local _usagetrim_command="${1-}" _usagetrim_arg _usagetrim_input=0',
+        '    if [ "$_usagetrim_command" = pytest ]; then',
+        "        " + _pytest_shell_check(shell),
+        "        return $?",
+        "    fi",
     ]
     for command, subcommands in _SHELL_FINITE_SUBCOMMANDS.items():
         lines.extend(
@@ -245,6 +394,10 @@ def _generate_fish_wrapper() -> str:
         "    test (count $argv) -gt 0; or return 1",
         '    set -l _usagetrim_command "$argv[1]"',
         "    set -l _usagetrim_input 0",
+        '    if test "$_usagetrim_command" = pytest',
+        "        " + _pytest_shell_check("fish"),
+        "        return $status",
+        "    end",
     ]
     for command, subcommands in _SHELL_FINITE_SUBCOMMANDS.items():
         lines.extend(

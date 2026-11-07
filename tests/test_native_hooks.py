@@ -3,6 +3,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -106,13 +107,251 @@ _SHELL_ROUTING_CASES = [
 
 
 @pytest.mark.parametrize("argv,expected", _SHELL_ROUTING_CASES)
-def test_shell_interception_policy(argv, expected):
+def test_shell_interception_policy(argv, expected, monkeypatch):
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
     assert hooks.should_intercept_command(argv) is expected
 
 
 def test_shell_interception_does_not_parse_command_strings():
     assert not hooks.should_intercept_command("pytest -q")
     assert not hooks.should_intercept_command(["pytest; touch PWNED"])
+
+
+@pytest.mark.parametrize(
+    "addopts,expected",
+    [
+        ("", True),
+        ("-q --maxfail=1", True),
+        ("--pdb", False),
+        ("--pdb --pdbcls=IPython.terminal.debugger:TerminalPdb", False),
+        ("--trace", False),
+        ("--trace --pdbcls custom:Debugger", False),
+        ("--pdb=true", False),
+        ("--trace=true", False),
+        ("--pd", False),
+        ("--tra", False),
+        ("-o addopts=--pdb", False),
+        ("--override-ini=addopts=--trace", False),
+        ("@options.txt", False),
+        ('--pdbcls "unfinished', False),
+        ("x" * (hooks._PYTEST_SETTINGS_LIMIT + 1), False),
+    ],
+)
+def test_pytest_implicit_environment_options(tmp_path, monkeypatch, addopts, expected):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PYTEST_ADDOPTS", addopts)
+    assert hooks.should_intercept_command(["pytest", "-q"]) is expected
+    # Pytest-specific implicit settings must not affect other commands.
+    assert hooks.should_intercept_command(["docker", "build", "."])
+
+
+_PYTEST_CONFIG_CASES = [
+    ("pytest.ini", "[pytest]\naddopts = {options}\n"),
+    (".pytest.ini", "[pytest]\naddopts = {options}\n"),
+    ("tox.ini", "[pytest]\naddopts = {options}\n"),
+    ("setup.cfg", "[tool:pytest]\naddopts = {options}\n"),
+    ("pyproject.toml", '[tool.pytest.ini_options]\naddopts = "{options}"\n'),
+    ("pyproject.toml", '[tool.pytest.ini_options]\naddopts = ["{options}"]\n'),
+    ("pyproject.toml", '[tool.pytest]\naddopts = ["{options}"]\n'),
+    ("pytest.toml", '[pytest]\naddopts = ["{options}"]\n'),
+    (".pytest.toml", '[pytest]\naddopts = ["{options}"]\n'),
+]
+
+
+@pytest.mark.parametrize("name,template", _PYTEST_CONFIG_CASES)
+@pytest.mark.parametrize("options,expected", [("--pdb", False), ("--trace", False), ("-q", True)])
+def test_pytest_configuration_addopts(tmp_path, monkeypatch, name, template, options, expected):
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    (tmp_path / name).write_text(template.format(options=options), encoding="utf-8")
+    nested = tmp_path / "tests" / "nested"
+    nested.mkdir(parents=True)
+    monkeypatch.chdir(nested)
+    assert hooks.should_intercept_command(["pytest", "-q"]) is expected
+
+
+@pytest.mark.parametrize("flag", ["-c", "--config-file", "-c=", "--config-file="])
+def test_pytest_explicit_configuration_overrides_discovery(tmp_path, monkeypatch, flag):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    (tmp_path / "pytest.ini").write_text("[pytest]\naddopts=--pdb\n")
+    selected = tmp_path / "safe config.ini"
+    selected.write_text("[pytest]\naddopts=-q\n")
+    args = [flag + str(selected)] if flag.endswith("=") else [flag, str(selected)]
+    assert hooks.should_intercept_command(["pytest", *args, "-q"])
+    selected.write_text("[pytest]\naddopts=--trace\n")
+    assert not hooks.should_intercept_command(["pytest", *args, "-q"])
+
+
+def test_pytest_attached_and_environment_config_selection(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config = tmp_path / "chosen.ini"
+    config.write_text("[pytest]\naddopts=--pdb\n")
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    assert not hooks.should_intercept_command(["pytest", "-cchosen.ini", "-q"])
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-c chosen.ini")
+    assert not hooks.should_intercept_command(["pytest", "-q"])
+    safe = tmp_path / "safe.ini"
+    safe.write_text("[pytest]\naddopts=-q\n")
+    assert hooks.should_intercept_command(["pytest", "-c", str(safe)])
+
+
+@pytest.mark.parametrize(
+    "name,content",
+    [
+        ("pytest.ini", "not an ini file"),
+        ("pytest.ini", '[pytest]\naddopts=--pdbcls "unterminated\n'),
+        ("pytest.ini", "[pytest]\naddopts=@arguments.txt\n"),
+        ("pytest.ini", "[pytest]\naddopts=-c other.ini\n"),
+        ("pyproject.toml", "[tool.pytest.ini_options]\naddopts = 7\n"),
+        ("pyproject.toml", '[tool.pytest.ini_options]\naddopts = ["-q", 7]\n'),
+        ("pyproject.toml", "[tool.pytest.ini_options\n"),
+        ("pytest.ini", "[pytest]\n#" + "x" * hooks._PYTEST_SETTINGS_LIMIT),
+    ],
+)
+def test_pytest_uncertain_configuration_fails_open(tmp_path, monkeypatch, name, content):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    (tmp_path / name).write_text(content)
+    assert not hooks.should_intercept_command(["pytest", "-q"])
+
+
+def test_pytest_config_paths_and_unreadable_configuration_fail_open(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    target = tmp_path / "outside" / "tests"
+    target.mkdir(parents=True)
+    (target.parent / "pytest.ini").write_text("[pytest]\naddopts=--trace\n")
+    assert not hooks.should_intercept_command(["pytest", str(target)])
+    assert not hooks.should_intercept_command(["pytest", "-c", "missing.ini"])
+    assert not hooks.should_intercept_command(["pytest", "-c"])
+
+    def unavailable(path):
+        raise PermissionError("configuration cannot be inspected")
+
+    monkeypatch.setattr(hooks, "_pytest_config_options", unavailable)
+    assert not hooks.should_intercept_command(["pytest", "-q"])
+
+
+@pytest.mark.parametrize("shell", ["bash", "zsh", "fish", "native-shim"])
+@pytest.mark.parametrize("setting", ["environment", "configuration", "ordinary", "malformed"])
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX executable fixtures; shared shim policy is portable"
+)
+def test_generated_wrappers_share_implicit_pytest_policy(tmp_path, shell, setting):
+    executable = shutil.which(shell) if shell != "native-shim" else None
+    if shell != "native-shim" and executable is None:
+        pytest.skip(f"{shell} is not installed")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("pytest", "usagetrim"):
+        launcher = bin_dir / name
+        launcher.write_text(
+            f"#!{sys.executable}\nimport json, os, sys\n"
+            "print(json.dumps([os.path.basename(sys.argv[0]), *sys.argv[1:]]))\n"
+            "sys.exit(17)\n"
+        )
+        launcher.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+        "PYTEST_ADDOPTS": {"environment": "--pdb", "malformed": '"unterminated'}.get(setting, ""),
+    }
+    if setting == "configuration":
+        (tmp_path / "pytest.ini").write_text("[pytest]\naddopts=--trace\n")
+    args = ["-q", "space name", "", "$(touch PWNED)"]
+    if shell == "native-shim":
+        directory = tmp_path / "shims"
+        shell_shim.prepare_powershell_shims(directory)
+        command = [str(directory / "pytest"), *args]
+    else:
+        script = tmp_path / ("wrapper.fish" if shell == "fish" else "wrapper.sh")
+        script.write_text(
+            hooks.generate_shell_wrapper(shell)
+            + ("\npytest $argv\n" if shell == "fish" else '\npytest "$@"\n')
+        )
+        command = [executable, *(["--no-config"] if shell == "fish" else []), str(script), *args]
+    result = subprocess.run(
+        command, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=10
+    )
+    assert result.returncode == 17, result.stderr
+    expected = ["usagetrim", "run", "--", "pytest"] if setting == "ordinary" else ["pytest"]
+    assert json.loads(result.stdout) == [*expected, *args]
+    assert not (tmp_path / "PWNED").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX bash process-group cleanup")
+@pytest.mark.parametrize("setting", ["environment", "configuration", "trace", "ordinary"])
+def test_bash_wrapper_real_pytest_debugger_is_not_intercepted(tmp_path, setting):
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash is not installed")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    pytest_launcher = bin_dir / "pytest"
+    pytest_launcher.write_text(
+        f"#!{sys.executable}\nimport pytest\nraise SystemExit(pytest.console_main())\n"
+    )
+    pytest_launcher.chmod(0o755)
+    intercepted = tmp_path / "intercepted"
+    usagetrim = bin_dir / "usagetrim"
+    usagetrim.write_text(
+        f"#!{sys.executable}\nimport os, pathlib, sys\n"
+        f"pathlib.Path({str(intercepted)!r}).write_text('intercepted')\n"
+        "assert sys.argv[1:3] == ['run', '--']\n"
+        f"os.execv({str(pytest_launcher)!r}, [{str(pytest_launcher)!r}, *sys.argv[4:]])\n"
+    )
+    usagetrim.chmod(0o755)
+    (tmp_path / "test_failure.py").write_text("def test_failure():\n    assert False\n")
+    (tmp_path / "pytest.ini").write_text(
+        "[pytest]\naddopts=" + ("--pdb" if setting == "configuration" else "") + "\n"
+    )
+    script = tmp_path / "wrapper.bash"
+    script.write_text(hooks.generate_shell_wrapper("bash") + '\npytest "$@"\n')
+    env = {
+        **os.environ,
+        "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        "PYTEST_PLUGINS": "",
+        "PYTEST_DEBUG": "",
+        "PYTEST_ADDOPTS": {"environment": "--pdb", "trace": "--trace"}.get(setting, ""),
+    }
+    process = subprocess.Popen(
+        [bash, "--noprofile", "--norc", str(script), "-q", "test_failure.py"],
+        cwd=tmp_path,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        try:
+            stdout, stderr = process.communicate("q\n", timeout=15)
+        except subprocess.TimeoutExpired:
+            # Kill the owned session before waiting, including the actual pytest.
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=5)
+            pytest.fail("pytest debugger did not terminate within its deadline")
+    finally:
+        # No unbounded Popen context-manager wait, even after an unexpected error.
+        try:
+            if process.returncode is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+        finally:
+            for pipe in (process.stdin, process.stdout, process.stderr):
+                pipe.close()
+    if setting == "ordinary":
+        assert intercepted.exists(), "ordinary pytest must prove wrapper interception"
+        assert process.returncode == 1, stderr
+        assert "1 failed" in stdout
+    else:
+        assert not intercepted.exists(), "interactive pytest must retain native stdin/output"
+        assert process.returncode == 2, stderr
+        assert "(Pdb)" in stdout
 
 
 @pytest.mark.parametrize("shell", ["bash", "zsh", "fish"])
@@ -135,7 +374,12 @@ def test_shell_wrapper_routes_argv_without_recursion_or_interpretation(tmp_path,
             "sys.exit(17)\n"
         )
         path.chmod(0o755)
-    env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]}
+    env = {
+        **os.environ,
+        "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+        "PYTEST_ADDOPTS": "",
+    }
     cases = [(argv, expected) for argv, expected in _SHELL_ROUTING_CASES if argv]
     special = ["space name", "$(touch PWNED)", "; touch PWNED", "*", "", "a\nb", "'\"\\"]
     cases.extend([(["pytest", *special], True), (["git", "commit", *special], False)])
