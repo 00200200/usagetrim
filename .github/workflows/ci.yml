@@ -9,12 +9,19 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v7
+
+      - name: Install Qt system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libegl1
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -43,6 +50,35 @@ jobs:
           wheel="$(realpath dist/*.whl)"
           cd "$(mktemp -d)"
           uv tool run --isolated --from "$wheel" usagetrim demo --json
+
+  windows-companion:
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONFAULTHANDLER: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install locked companion and test dependencies
+        run: uv sync --locked --python 3.12 --extra companion --group dev
+
+      - name: Verify Qt runtime and test companion process exit status
+        shell: pwsh
+        run: |
+          & .\.venv\Scripts\python.exe -c "import PySide6, shiboken6; from PySide6.QtWidgets import QApplication; print('PySide6:', PySide6.__version__, 'Shiboken6:', shiboken6.__version__)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\.venv\Scripts\python.exe -X faulthandler -m pytest tests/test_companion_qt.py tests/test_companion_desktop.py -v
+          $testExitCode = $LASTEXITCODE
+          Write-Host "Companion pytest process exit code: $testExitCode"
+          if ($testExitCode -ne 0) { exit $testExitCode }
 
   benchmark:
     runs-on: ubuntu-latest

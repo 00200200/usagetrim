@@ -284,6 +284,104 @@ usagetrim rules --optimize --write -f CLAUDE.md # strips filler, aligns prompt c
 
 ## Desktop companion
 
+**Linux / Windows MVP:** install `pip install 'usagetrim[companion]'`, then run
+`usagetrim companion` in a graphical desktop session. The optional PySide6 window
+shows today's actual monitor aggregates (operations, raw/compact token estimates,
+and signed net reduction), refreshes every five seconds and can pause/resume
+optimization using the same local settings as CLI/MCP. An empty history is shown
+as unavailable measurements, not invented savings. After a refresh failure, pause
+controls remain disabled until a successful read restores the current state.
+Closing the window immediately stops UI updates and cancels queued monitor work
+without waiting on the GUI thread. A monitor call already running is allowed to finish;
+Python may wait for it before the process exits. This MVP cannot guarantee an
+immediate process exit if local filesystem or database operations stall. It does
+not forcibly terminate threads or apply their results to a closed window.
+
+On Windows, install and launch from PowerShell (the module form does not require
+the Python Scripts directory on `PATH`):
+
+```powershell
+py -3.12 -m pip install "usagetrim[companion]"
+py -3.12 -m usagetrim.cli companion
+```
+
+Drag the standard title bar to move the window. The opaque, normally decorated
+window works through Qt's native Windows, X11 or Wayland support; a working Qt
+platform plugin and system GUI libraries are required. The optional always-on-top
+hint is saved in `companion.json`, but compositors may ignore it (especially on
+Wayland); the normal window remains usable.
+
+Use **Desktop Pet** to show the bundled Mint robot (the same artwork as macOS),
+and **Statistics panel** to return. Drag Mint or the standard title bar. Pet mode
+uses a frameless transparent window only when Windows composition or an X11
+compositor can be confirmed. Otherwise it keeps normal window decorations and an
+opaque background, including on Wayland. On Wayland global coordinates are not
+saved or restored; placement and dragging remain under compositor control.
+Mode and supported Pet coordinates are stored in the existing `companion.json`;
+restored positions are clamped to an available screen. Preference writes use an
+independent, serialized worker and are coalesced during dragging. Normal closing
+captures the final mode and position even before the drag timer fires, and drains
+the final atomic settings write without waiting for a monitor read in the GUI.
+Normal Python process shutdown waits for that settings worker. This does not
+guarantee persistence after a process/system crash or a filesystem write failure.
+The Mint tray icon provides Show/Hide Desktop Pet, Show Statistics, Pause/Resume,
+Always on Top and Quit. **Hide Controls** leaves just Mint; restore controls with
+**Show Pet Controls** in the tray menu or Mint's right-click menu. Hiding the Pet
+keeps monitoring active. Quit removes the icon, stops GUI timers and exits the Qt
+event loop; running monitor work finishes safely as described above.
+
+The tray menu also has a read-only summary: Active/Paused/Unavailable status,
+today's returned UsageTrim operation count and signed net token reduction.
+These are existing local OpenAI token estimates, not AI-provider billing or
+account balances. Negative net reduction remains negative and indicates expansion,
+not savings. Empty history is shown as no measurements; initial loading and
+monitor errors show unavailable values. The summary follows the same five-second
+monitor updates even while Mint is hidden; opening the menu adds no data reads
+or network requests.
+
+Tray support depends on the desktop shell (including GNOME/Wayland). No GNOME
+extension is required: without a detected tray, all controls remain available and
+hiding the whole Pet is disabled. If tray support disappears, controls and a
+previously hidden Pet are restored on the next availability check (every five
+seconds). Mint's right-click menu provides another route to statistics and Quit.
+Control visibility and hidden-window state are session-only; startup always keeps
+controls accessible.
+
+Mint gently floats by 2–3 pixels inside its widget, with a cached bitmap and at
+most ten idle redraws per second. The window itself does not move. A small status
+indicator and tooltip distinguish idle, paused, new measurements and unavailable
+monitor data. Activity means an increase in today's returned UsageTrim operation
+count between existing snapshots, not a running command or invented savings.
+Existing history at startup, a day rollover or a cleared history does not trigger
+activity. Missing history is idle; read errors are unavailable. Activity feedback
+is brief, and a paused pet is muted and returns gently to its neutral position.
+
+Turn off **Mint animations** in the panel or tray/right-click menu to keep Mint
+still; the preference is saved in `companion.json`. Static state indicators remain
+available. Motion stops when the Pet is hidden, minimized or replaced by the panel,
+and resumes when shown. Quit stops all pet timers and animations. There is no
+blinking or eye-layer manipulation of the original PNG, and no notifications or
+account-limit network polling. Animation adds no monitor or provider requests.
+
+CI runs the companion tests on Ubuntu and Windows (Python 3.12 on Windows) using
+Qt's `offscreen` plugin and mocked system tray support. The Windows job installs
+locked dependencies, loads the real Windows Qt bindings, queries native DWM and
+checks the interpreter's final exit status, including failures after tests pass.
+This verifies headless behavior, not the appearance of an interactive desktop.
+The Qt 6.12.0 binding release is excluded because of the observed Python 3.11
+shutdown crash; the lockfile currently selects Essentials/Shiboken 6.11.3.
+
+Manual checks remain necessary on Windows, X11 with/without a compositor, and
+actual Wayland sessions: transparency, native dragging, focus/always-on-top,
+multi-monitor and mixed-DPI placement, tray visibility and disappearance, and Quit
+from a hidden Pet. On Wayland, tests model rejected global positioning; they do
+not establish support for every compositor's move protocol. Tray tests cannot
+confirm whether a particular GNOME/KDE setup or Windows notification area exposes
+the icon. Missing tray support keeps controls accessible as described above.
+
+This command leaves the
+existing macOS application unchanged; on macOS use the application below.
+
 Mint robot on your Mac — draggable pet or menu-bar mode. Local measurements, task memory, optional account-limit readings. English UI. No extra AI calls.
 
 <p align="center">
