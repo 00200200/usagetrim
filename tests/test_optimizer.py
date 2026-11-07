@@ -11,6 +11,144 @@ from usagetrim.core.optimizer import mask_completed_observations, optimize_conte
 from usagetrim.metrics.tokenizer import count_tokens
 
 
+@pytest.fixture
+def model_optimizer(monkeypatch):
+    from types import SimpleNamespace
+
+    from usagetrim.core import adaptive, optimizer, specialized
+    from usagetrim.metrics import tokenizer
+
+    stored = {}
+
+    class MemoryCache:
+        def store(self, text, *, source):
+            stored["tc_0123456789abcdef"] = text
+            return "tc_0123456789abcdef"
+
+    def unavailable(name):
+        raise ValueError("No instantiated encoding")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("model path must not use legacy counting")
+
+    monkeypatch.setattr(optimizer, "ContextCache", MemoryCache)
+    monkeypatch.setattr(adaptive, "ContextCache", MemoryCache)
+    monkeypatch.setattr(tokenizer, "_model_encoding", unavailable)
+    monkeypatch.setattr(optimizer, "count_tokens", forbidden)
+    monkeypatch.setattr(adaptive, "count_tokens", forbidden)
+    monkeypatch.setattr(adaptive, "compact_terminal_output", lambda text, options: text)
+    monkeypatch.setattr(specialized, "filter_traceback", lambda text: text)
+    monkeypatch.setattr(specialized, "filter_dev_server_logs", lambda text: text)
+    monkeypatch.setattr(
+        optimizer,
+        "compact_text",
+        lambda text, **kwargs: SimpleNamespace(
+            text=text, compacted_tokens=0, original_tokens=99999, content_type="text"
+        ),
+    )
+    return optimizer, tokenizer, stored
+
+
+@pytest.mark.parametrize("model", ["openai", "claude", "gemini", "llama", "generic"])
+def test_optimizer_model_budget_statistics_and_redacted_recovery(model_optimizer, model):
+    from usagetrim.core.redactor import redact_secrets
+
+    optimizer, tokenizer, stored = model_optimizer
+    secret = "sk-proj-" + "a" * 30
+    raw = f"token={secret}\n" + "diagnostic 漢字🙂 " * 500
+    result = optimizer.optimize_context(raw, 140, False, model=model)
+    before = tokenizer.count_model_tokens(redact_secrets(raw), model).count
+    after = tokenizer.count_model_tokens(result.text, model).count
+    assert result.original_tokens == before
+    assert result.optimized_tokens == after <= 140
+    assert result.saved_tokens == max(0, before - after)
+    assert result.reduction_pct == round(100 * result.saved_tokens / before, 1)
+    assert result.ref_id in result.text
+    assert stored[result.ref_id] == redact_secrets(raw)
+    assert secret not in result.text
+
+
+@pytest.mark.parametrize("kind", ["table", "conversation", "fence"])
+@pytest.mark.parametrize("smaller", [True, False])
+def test_optimizer_model_recounts_candidates_instead_of_foreign_statistics(
+    monkeypatch, model_optimizer, kind, smaller
+):
+    from types import SimpleNamespace
+
+    optimizer, tokenizer, _ = model_optimizer
+    raw = {
+        "table": '[{"value": "' + "x" * 200 + '"}]',
+        "conversation": "User: " + "question " * 30,
+        "fence": '```json\n[{"value": "' + "x" * 200 + '"}]\n```',
+    }[kind]
+    candidate = "short candidate" if smaller else "expanded candidate " * 300
+    foreign = SimpleNamespace(
+        text=candidate,
+        compacted_tokens=99999 if smaller else 0,
+        original_tokens=1,
+        distilled_tokens=99999 if smaller else 0,
+    )
+    monkeypatch.setattr(optimizer, "compact_table", lambda *args, **kwargs: foreign)
+    monkeypatch.setattr(optimizer, "distill_conversation", lambda *args, **kwargs: foreign)
+    result = optimizer.optimize_context(raw, 10000, False, model="generic")
+    if smaller:
+        assert candidate in result.text
+        assert result.optimized_tokens < result.original_tokens
+    else:
+        assert result.text == raw
+    assert result.optimized_tokens == tokenizer.count_model_tokens(result.text, "generic").count
+
+
+def test_optimizer_passes_model_to_prompt_alignment(monkeypatch, model_optimizer):
+    from types import SimpleNamespace
+
+    optimizer, _, _ = model_optimizer
+    calls = []
+
+    def align(text, *, model):
+        calls.append(model)
+        return SimpleNamespace(aligned_text=text)
+
+    monkeypatch.setattr(optimizer, "lint_prompt", lambda text: {"issues": ["dynamic prefix"]})
+    monkeypatch.setattr(optimizer, "align_prompt", align)
+    optimizer.optimize_context("Current time: 12:00\n" + "Keep rules.\n" * 20, model="llama")
+    assert calls == ["llama"]
+
+
+def test_optimizer_unknown_model_precedes_cache(monkeypatch):
+    from usagetrim.core import optimizer
+
+    def forbidden():
+        pytest.fail("unsupported model must not construct cache")
+
+    monkeypatch.setattr(optimizer, "ContextCache", forbidden)
+    with pytest.raises(ValueError, match="Unknown model"):
+        optimizer.optimize_context("payload", model="unknown")
+
+
+def test_optimizer_model_small_input_still_enforces_budget(model_optimizer):
+    optimizer, _, _ = model_optimizer
+    with pytest.raises(ValueError, match="recovery reference"):
+        optimizer.optimize_context("abcdefgh", 1, False, model="generic")
+
+
+def test_optimizer_none_keeps_legacy_counting(monkeypatch, model_optimizer):
+    from usagetrim.metrics.tokenizer import TokenCount
+
+    optimizer, _, _ = model_optimizer
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("legacy path must not invoke model counting")
+
+    monkeypatch.setattr(optimizer, "count_model_tokens", forbidden)
+    monkeypatch.setattr(optimizer, "count_tokens", lambda text: TokenCount(3, 2, 1))
+    implicit = optimizer.optimize_context("hello")
+    explicit = optimizer.optimize_context("hello", model=None)
+    assert implicit == explicit
+    assert explicit.original_tokens == explicit.optimized_tokens == 2
+    assert explicit.text == "hello"
+
+
 def test_optimize_intra_fence_json_to_toon():
     users = [{"id": i, "name": f"User_{i}", "role": "developer", "active": True} for i in range(25)]
     prompt = f"""You are a senior data analyst.

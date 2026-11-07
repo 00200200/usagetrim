@@ -1703,6 +1703,105 @@ def test_compress_to_budget():
     assert "Ref: tc_" in budget_fitted
 
 
+@pytest.fixture
+def adaptive_memory_cache(monkeypatch):
+    from usagetrim.core import adaptive
+
+    stored = {}
+
+    class MemoryCache:
+        def store(self, text, *, source):
+            stored.update(text=text, source=source)
+            return "tc_0123456789abcdef"
+
+    monkeypatch.setattr(adaptive, "ContextCache", MemoryCache)
+    return stored
+
+
+@pytest.mark.parametrize("model", ["openai", "claude", "gemini", "llama", "generic"])
+def test_adaptive_explicit_model_budget_includes_redacted_recovery_and_suffix(
+    monkeypatch, adaptive_memory_cache, model
+):
+    from usagetrim.core import adaptive
+    from usagetrim.core.redactor import redact_secrets
+    from usagetrim.metrics import tokenizer
+
+    def unavailable(name):
+        raise ValueError("No instantiated encoding")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("explicit model must not use the legacy budget counter")
+
+    monkeypatch.setattr(tokenizer, "_model_encoding", unavailable)
+    monkeypatch.setattr(adaptive, "count_tokens", forbidden)
+    # Keep compaction deterministic and exercise final candidate budgeting.
+    monkeypatch.setattr(adaptive, "compact_terminal_output", lambda text, options: text)
+    secret = "sk-proj-" + "a" * 30
+    raw = f"token={secret}\n" + "diagnostic 漢字🙂 " * 500
+    suffix = "\n[exit code: 1]"
+    output = compress_to_budget(raw, 140, model=model, suffix=suffix)
+
+    assert tokenizer.count_model_tokens(output, model).count <= 140
+    assert output.endswith(suffix)
+    assert "Ref: tc_0123456789abcdef" in output
+    assert secret not in output
+    assert adaptive_memory_cache == {"text": redact_secrets(raw), "source": "adaptive"}
+
+
+def test_adaptive_model_fitting_text_avoids_cache_and_counts_suffix(monkeypatch):
+    from usagetrim.core import adaptive
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("fitting model-counted text must not access cache or legacy counting")
+
+    monkeypatch.setattr(adaptive, "ContextCache", forbidden)
+    monkeypatch.setattr(adaptive, "count_tokens", forbidden)
+    assert compress_to_budget("abc", 2, model="generic", suffix="def") == "abcdef"
+
+
+def test_adaptive_unknown_model_is_rejected_before_cache(monkeypatch):
+    from usagetrim.core import adaptive
+
+    def forbidden():
+        pytest.fail("unknown model must be rejected before cache construction")
+
+    monkeypatch.setattr(adaptive, "ContextCache", forbidden)
+    with pytest.raises(ValueError, match="Unknown model"):
+        compress_to_budget("payload", 100, model="unknown")
+
+
+def test_adaptive_model_suffix_cannot_exceed_budget(adaptive_memory_cache):
+    with pytest.raises(ValueError, match="recovery reference"):
+        compress_to_budget("abc", 1, model="generic", suffix="def")
+
+
+@pytest.mark.parametrize("provider", ["claude", "openai", "gemini"])
+def test_adaptive_no_model_preserves_provider_budgeting(
+    monkeypatch, adaptive_memory_cache, provider
+):
+    from usagetrim.core import adaptive
+    from usagetrim.metrics.tokenizer import TokenCount
+
+    def legacy_count(text):
+        return TokenCount(claude=len(text) * 3, openai=len(text), gemini=len(text) * 2)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("legacy path must not call model counting")
+
+    monkeypatch.setattr(adaptive, "count_tokens", legacy_count)
+    monkeypatch.setattr(adaptive, "count_model_tokens", forbidden)
+    monkeypatch.setattr(adaptive, "compact_terminal_output", lambda text, options: text)
+    raw = "diagnostic " * 500
+    suffix = "\n[exit code: 1]"
+    implicit = compress_to_budget(raw, 300, provider, suffix=suffix)
+    explicit = compress_to_budget(raw, 300, provider, suffix=suffix, model=None)
+    assert implicit == explicit
+    assert getattr(legacy_count(explicit), provider) <= 300
+    assert explicit.endswith(suffix)
+    assert "Ref: tc_0123456789abcdef" in explicit
+    assert adaptive_memory_cache["text"] == raw
+
+
 @pytest.mark.parametrize("provider", ["claude", "openai", "gemini"])
 @pytest.mark.parametrize("budget", [64, 100, 500])
 @pytest.mark.parametrize(

@@ -8,7 +8,13 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from usagetrim.metrics.tokenizer import count_tokens
+from usagetrim.core.redactor import redact_secrets
+from usagetrim.metrics.tokenizer import (
+    check_cache_breakpoint,
+    count_model_tokens,
+    count_tokens,
+    model_counting,
+)
 
 _TIMESTAMP_PATTERN = re.compile(
     r"\b(?:today(?:'s)? date|current time|timestamp|date is|time is|utc|iso8601)\b[^\n]*|"
@@ -86,20 +92,28 @@ def lint_prompt(text: str) -> dict[str, Any]:
     }
 
 
-def align_prompt(text: str) -> PromptAlignResult:
+def _prompt_size(text: str, model: str | None) -> int:
+    """Use local model-family counting (possibly estimated) or the legacy counter."""
+    if model is not None:
+        return count_model_tokens(text, model).count
+    return count_tokens(text).openai
+
+
+@model_counting
+def align_prompt(text: str, *, model: str | None = None) -> PromptAlignResult:
     """Restructure prompt: static invariants at the top, volatile variables at the bottom."""
     lines = text.splitlines(keepends=True)
-    orig_tokens = count_tokens(text).openai
+    orig_tokens = _prompt_size(text, model)
 
     lint_res = lint_prompt(text)
     issues = lint_res["issues"]
 
-    if not issues:
+    if not issues or (model is not None and _safe_alignment_layout(text) is None):
         return PromptAlignResult(
             original_tokens=orig_tokens,
             aligned_tokens=orig_tokens,
             cacheability_score=lint_res["cacheability_score"],
-            issues_found=[],
+            issues_found=issues,
             aligned_text=text,
         )
 
@@ -125,7 +139,14 @@ def align_prompt(text: str) -> PromptAlignResult:
         )
 
     aligned_text = "\n".join(sections).strip() + "\n"
-    aligned_tokens = count_tokens(aligned_text).openai
+    if model is not None:
+        static, volatile = _safe_alignment_layout(text)
+        marker = "<!-- DYNAMIC RUNTIME CONTEXT (ISOLATED TO PRESERVE PROMPT CACHE) -->"
+        if [line for line in aligned_text.splitlines() if line.strip()] != static + [
+            marker
+        ] + volatile:
+            aligned_text = text
+    aligned_tokens = _prompt_size(aligned_text, model)
 
     # Post-check score
     new_lint = lint_prompt(aligned_text)
@@ -137,6 +158,78 @@ def align_prompt(text: str) -> PromptAlignResult:
         issues_found=issues,
         aligned_text=aligned_text,
     )
+
+
+_STANDALONE_METADATA = re.compile(
+    r"(?:session_id|request_id|turn_id|conversation_id)"
+    r"\s*[:=]\s*[A-Za-z0-9_-]+|"
+    r"(?:current time|timestamp|today's date)\s*:\s*"
+    r"(?:\d{4}-\d{2}-\d{2}(?:T| )?)?\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?",
+    re.IGNORECASE,
+)
+_STRUCTURED_LINE = re.compile(
+    r"^(?: {4}|\t| {0,3}(?:[>#`~]|<!--|[-=]{2,}\s*$|"
+    r"(?:[-+*]|\d+[.)])[ \t]|(?:\*[ \t]*){3,}$|(?:_[ \t]*){3,}$))"
+)
+
+
+def _safe_alignment_layout(text: str) -> tuple[list[str], list[str]] | None:
+    """Allow only leading scalar metadata followed by unstructured prose.
+
+    Obvious Markdown blocks make relocation ambiguous. In particular Setext
+    underlines can bind several preceding lines, including a metadata-looking
+    title. Preserve such documents rather than attempting a Markdown parser.
+    """
+    static, volatile = [], []
+    static_started = False
+    for line in text.splitlines():
+        if _STRUCTURED_LINE.match(line):
+            return None
+        if not line.strip():
+            continue
+        if _STANDALONE_METADATA.fullmatch(line):
+            if static_started:
+                return None
+            volatile.append(line)
+        else:
+            static_started = True
+            if (
+                _TIMESTAMP_PATTERN.search(line)
+                or _UUID_PATTERN.search(line)
+                or _DYNAMIC_SESSION_PATTERN.search(line)
+            ):
+                return None
+            static.append(line)
+    return (static, volatile) if volatile else None
+
+
+@model_counting
+def align_to_cache_boundary(
+    text: str, target_boundary: int = 1024, *, model: str = "claude"
+) -> str:
+    """Align a sufficiently long stable prefix without padding or dropping content.
+
+    Counts may be estimates; reaching the threshold does not guarantee cache hits.
+    Only a leading run of standalone runtime metadata may be relocated here.
+    """
+    check_cache_breakpoint("", model=model, min_tokens=target_boundary)
+    layout = _safe_alignment_layout(text)
+    if layout is None:
+        return text
+
+    aligned = align_prompt(text, model=model).aligned_text
+    marker = "<!-- DYNAMIC RUNTIME CONTEXT (ISOLATED TO PRESERVE PROMPT CACHE) -->"
+    if marker in text:
+        return text
+    # Reject normalization that would alter any nonempty source line (including
+    # significant trailing spaces). The only new content is the section marker.
+    static, volatile = layout
+    if [line for line in aligned.splitlines() if line.strip()] != static + [marker] + volatile:
+        return text
+    prefix = aligned.partition(marker)[0].rstrip()
+    if check_cache_breakpoint(prefix, model=model, min_tokens=target_boundary).threshold_reached:
+        return aligned
+    return text
 
 
 _FILLER_PHRASES: list[tuple[re.Pattern[str], str]] = [
@@ -200,15 +293,17 @@ class PromptMinifyResult:
         }
 
 
-def minify_prompt(text: str) -> PromptMinifyResult:
+@model_counting
+def minify_prompt(text: str, *, model: str | None = None) -> PromptMinifyResult:
     """Minify system prompts, CLAUDE.md, and AGENTS.md instructions without semantic loss.
 
     Removes markdown comments, collapses hyper-verbose phrasing, strips excessive blank lines,
     and normalizes list indentation to save 20-40% prompt tokens.
     """
-    orig_tokens = count_tokens(text).openai
+    orig_tokens = _prompt_size(text, model)
     if not text.strip():
-        return PromptMinifyResult(0, 0, 0, 0.0, text)
+        unchanged_tokens = 0 if model is None else orig_tokens
+        return PromptMinifyResult(unchanged_tokens, unchanged_tokens, 0, 0.0, text)
 
     # 1. Strip HTML comments (<!-- ... -->)
     content = re.sub(r"<!--[\s\S]*?-->", "", text)
@@ -242,8 +337,8 @@ def minify_prompt(text: str) -> PromptMinifyResult:
         prev_line = stripped
         cleaned_lines.append(stripped)
 
-    minified_text = "\n".join(cleaned_lines).strip() + "\n"
-    minified_tokens = count_tokens(minified_text).openai
+    minified_text = redact_secrets("\n".join(cleaned_lines).strip() + "\n")
+    minified_tokens = _prompt_size(minified_text, model)
     saved = max(0, orig_tokens - minified_tokens)
     pct = round((saved / orig_tokens * 100.0), 1) if orig_tokens > 0 else 0.0
 
@@ -262,7 +357,8 @@ _VOLATILE_PATH_PATTERN = re.compile(
 )
 
 
-def stabilize_cache_prefix(text: str) -> str:
+@model_counting
+def stabilize_cache_prefix(text: str, *, model: str | None = None) -> str:
     """Normalize volatile elements in text prefixes to protect prompt cache hits.
 
     1. Normalizes CRLF \\r\\n to \\n and strips trailing whitespace.
@@ -270,14 +366,17 @@ def stabilize_cache_prefix(text: str) -> str:
        to dynamic context sections so that Anthropic (1024-token) and OpenAI (128-token)
        prompt caching achieves optimal hit rates.
     """
+    if model is not None:
+        count_model_tokens("", model)
     if not text.strip():
         return text
 
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     normalized = re.sub(r"\n{3,}", "\n\n", normalized)
 
-    aligned = align_prompt(normalized).aligned_text
-    stabilized = _VOLATILE_PATH_PATTERN.sub("<tmpdir>", aligned)
+    model_options = {} if model is None else {"model": model}
+    aligned = align_prompt(normalized, **model_options).aligned_text
+    stabilized = redact_secrets(_VOLATILE_PATH_PATTERN.sub("<tmpdir>", aligned))
 
     return stabilized
 

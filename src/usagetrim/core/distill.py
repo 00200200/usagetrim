@@ -10,7 +10,7 @@ from typing import Any
 
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.redactor import redact_secrets
-from usagetrim.metrics.tokenizer import count_tokens
+from usagetrim.metrics.tokenizer import count_model_tokens, count_tokens, model_counting
 
 _COLOR = re.compile(r"\x1b\[[0-9;]*m")
 _THOUGHT_BLOCK = re.compile(
@@ -98,12 +98,23 @@ def _parse_messages(text: str) -> list[tuple[str, str]]:
     return [("User", p) for p in paragraphs] or [("User", text)]
 
 
-def distill_conversation(text: str, budget: int = 1500) -> DistillResult:
+@model_counting
+def distill_conversation(
+    text: str, budget: int = 1500, *, model: str | None = None
+) -> DistillResult:
     """Distill raw multi-turn conversation into dense executive context with zero loss CCR recovery."""
+    if model is not None:
+        count_model_tokens("", model)
+
+    def size(value: str) -> int:
+        if model is not None:
+            return count_model_tokens(value, model).count
+        return count_tokens(value).openai
+
     cleaned = _COLOR.sub("", text)
     cleaned = _THOUGHT_BLOCK.sub("", cleaned)
     redacted = redact_secrets(cleaned)
-    original_tokens = count_tokens(redacted).openai
+    original_tokens = size(redacted)
 
     cache = ContextCache()
     ref_id = cache.store(redacted, source="conversation-distill")
@@ -189,22 +200,34 @@ def distill_conversation(text: str, budget: int = 1500) -> DistillResult:
         sections.append(f"\n## Active Working State\n{last_action}")
 
     distilled_text = "\n".join(sections).strip() + f"\n\n[Full transcript reference: {ref_id}]\n"
-    distilled_tokens = count_tokens(distilled_text).openai
+    distilled_text = redact_secrets(distilled_text)
+    distilled_tokens = size(distilled_text)
 
     # Enforce budget ceiling
-    if distilled_tokens > budget:
+    if model is not None and distilled_tokens > budget:
+        from usagetrim.core.adaptive import compress_to_budget
+
+        distilled_text = compress_to_budget(
+            distilled_text,
+            budget,
+            original_text=redacted,
+            source="conversation-distill",
+            model=model,
+        )
+        distilled_tokens = size(distilled_text)
+    elif distilled_tokens > budget:
         notice = f"\n\n[Summary truncated to fit {budget} tokens. Full transcript: usagetrim retrieve {ref_id}]\n"
         # A single long assistant line can exceed the entire budget. Bound the
         # complete emitted text, including recovery, without splitting Unicode.
         low, high = 0, len(distilled_text)
         while low < high:
             middle = (low + high + 1) // 2
-            if count_tokens(distilled_text[:middle] + notice).openai <= budget:
+            if size(distilled_text[:middle] + notice) <= budget:
                 low = middle
             else:
                 high = middle - 1
         distilled_text = distilled_text[:low] + notice
-        distilled_tokens = count_tokens(distilled_text).openai
+        distilled_tokens = size(distilled_text)
 
     saved = max(0, original_tokens - distilled_tokens)
     pct = round((saved / original_tokens) * 100, 1) if original_tokens else 0.0
