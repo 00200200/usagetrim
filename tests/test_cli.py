@@ -17,6 +17,116 @@ def test_cli_help():
     assert "Context compression engine" in res.output
 
 
+@pytest.mark.parametrize("model", ["openai", "claude", "llama"])
+def test_cli_tokens(model, monkeypatch):
+    from usagetrim.metrics import tokenizer
+
+    class Encoding:
+        name = "o200k_base"
+
+        def encode(self, text, *, disallowed_special):
+            return text.split()
+
+    monkeypatch.setattr(tokenizer, "get_o200k", lambda: Encoding())
+    monkeypatch.setattr(tokenizer, "_model_encoding", lambda name: Encoding())
+    result = runner.invoke(app, ["tokens", "hello world", "--model", model])
+    assert result.exit_code == 0
+    assert model in result.stdout and "tokens" in result.stdout
+    if model == "openai":
+        assert "2 tokens" in result.stdout and "o200k_base" in result.stdout
+        assert "estimate" not in result.stdout
+    else:
+        assert "estimate" in result.stdout
+        assert (
+            "legacy-o200k_base-x1.10" if model == "claude" else "utf8-bytes-div4-ceil"
+        ) in result.stdout
+
+
+def test_cli_tokens_defaults_to_openai(monkeypatch):
+    import tiktoken.registry
+
+    from usagetrim.metrics import tokenizer
+
+    for variable in ("LLM_MODEL", "ANTHROPIC_MODEL", "OPENAI_MODEL"):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setattr(tokenizer, "_O200K_ENC", None)
+    monkeypatch.setattr(tokenizer, "_CL100K_ENC", None)
+    monkeypatch.setattr(tiktoken.registry, "ENCODINGS", {})
+    result = runner.invoke(app, ["tokens", "hello world"])
+    assert result.exit_code == 0
+    assert "openai" in result.stdout and "estimate" in result.stdout
+    assert "utf8-bytes-div4-ceil" in result.stdout
+
+
+def test_cli_tokens_unknown_model():
+    result = runner.invoke(app, ["tokens", "hello world", "--model", "unknown"])
+    assert result.exit_code == 2
+    assert "Unknown model" in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize(
+    "environment,flag,expected",
+    [
+        ({}, None, None),
+        ({"LLM_MODEL": "unknown"}, None, None),
+        ({"OPENAI_MODEL": "gpt-4o"}, None, "openai"),
+        ({"ANTHROPIC_MODEL": "claude-sonnet-4", "OPENAI_MODEL": "gpt-4o"}, None, "claude"),
+        ({"LLM_MODEL": "deepseek-ai/DeepSeek-R1", "ANTHROPIC_MODEL": "claude"}, None, "deepseek"),
+        ({"LLM_MODEL": "unknown", "OPENAI_MODEL": "gpt-4o"}, None, None),
+        ({"LLM_MODEL": "claude", "OPENAI_MODEL": "gpt-4o"}, "deepseek", "deepseek"),
+        ({"LLM_MODEL": "deepseek"}, "generic", "generic"),
+    ],
+)
+def test_cli_model_selection_and_offline_fallback(monkeypatch, environment, flag, expected):
+    from usagetrim.core import prepare
+    from usagetrim.metrics import tokenizer
+
+    for variable in ("LLM_MODEL", "ANTHROPIC_MODEL", "OPENAI_MODEL"):
+        monkeypatch.delenv(variable, raising=False)
+    for variable, value in environment.items():
+        monkeypatch.setenv(variable, value)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("CLI model selection must not load vocabulary")
+
+    def unavailable(name):
+        raise ValueError("No instantiated encoding")
+
+    monkeypatch.setattr(
+        tokenizer, "_model_encoding", forbidden if expected == "deepseek" else unavailable
+    )
+    monkeypatch.setattr(prepare, "safe_compact_output", lambda text, **kwargs: text)
+    monkeypatch.setattr(prepare, "count_tokens", lambda text: tokenizer.TokenCount(3, 2, 1))
+    options = [] if flag is None else ["--model", flag]
+    tokens = runner.invoke(app, ["tokens", "hello world", *options])
+    assert tokens.exit_code == 0, tokens.output
+    assert f"· {expected or 'openai'} · estimate ·" in tokens.stdout
+    result = runner.invoke(app, ["prepare", "--json", *options], input="hello world")
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["text"] == "hello world"
+    if expected is None:
+        assert "model" not in payload
+        assert payload["method"] == "o200k_base"
+    else:
+        assert payload["family"] == expected
+        assert payload["is_estimate"] is True
+        assert "utf8-bytes-div4-ceil" in payload["method"]
+
+
+@pytest.mark.parametrize("command", ["tokens", "prepare"])
+def test_cli_explicit_unknown_model_overrides_known_environment(monkeypatch, command):
+    monkeypatch.setenv("LLM_MODEL", "deepseek")
+    args = [command, "--model", "unknown"]
+    if command == "tokens":
+        args.append("hello")
+    result = runner.invoke(app, args, input="hello")
+    assert result.exit_code == 2
+    assert "Unknown model" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_cli_pricing_lists_static_reference_rates(monkeypatch):
     from rich.console import Console
 
@@ -118,8 +228,8 @@ def test_demo_measures_recovery_and_preserves_user_cache(tmp_path, monkeypatch):
     }
     assert data["specialized"]["cargo_test"] == {
         "raw_tokens": 3795,
-        "output_tokens": 185,
-        "reduction_pct": 95.1,
+        "output_tokens": 197,
+        "reduction_pct": 94.8,
     }
     assert data["specialized"]["go_test"] == {
         "raw_tokens": 3281,
@@ -1216,3 +1326,20 @@ def test_rules_cleanup_failure_does_not_mask_original_exception(tmp_path, monkey
     assert "original replace failure" in result.output
     assert "secondary cleanup failure" not in result.output
     assert target.read_bytes() == original
+
+
+def test_cli_tokens_handles_surrogate_text(monkeypatch):
+    import tiktoken.registry
+
+    from usagetrim.metrics import tokenizer
+
+    monkeypatch.setattr(tokenizer, "_O200K_ENC", None)
+    monkeypatch.setattr(tokenizer, "_CL100K_ENC", None)
+    monkeypatch.setattr(tiktoken.registry, "ENCODINGS", {})
+
+    result = runner.invoke(app, ["tokens", "bad-\udcff", "--model", "openai"])
+
+    assert result.exit_code == 0
+    assert "openai" in result.stdout
+    assert "estimate" in result.stdout
+    assert "Unknown model" not in result.output

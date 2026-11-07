@@ -489,24 +489,14 @@ TOOLS_DEFINITIONS = [
     },
 ]
 
+# Text stays in CallToolResult.content. Structured output carries only status,
+# so schema-validating clients do not receive a second copy of the text.
 _DEFAULT_OUTPUT_SCHEMA = {
     "type": "object",
-    "properties": {
-        "content": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "type": {"type": "string"},
-                    "text": {"type": "string"},
-                },
-                "required": ["type", "text"],
-            },
-        },
-        "isError": {"type": "boolean"},
-    },
-    "required": ["content"],
+    "properties": {"isError": {"type": "boolean"}},
+    "required": ["isError"],
 }
+
 
 for _tool in TOOLS_DEFINITIONS:
     if "outputSchema" not in _tool:
@@ -819,6 +809,25 @@ def handle_usagetrim_code(arguments: dict[str, Any]) -> str:
     return _record(result, output, operation="code", project=arguments["root"])
 
 
+def _specialized_with_recovery(raw: str, specialized: str) -> str:
+    """Redact a specialized command summary and keep the full output recoverable.
+
+    Specialized filters drop lines (passing records, stack frames, ...), so the
+    redacted original is cached and referenced like ``safe_compact_output`` does.
+    If caching fails, the redacted original is returned instead of a lossy view.
+    """
+    original = redact_secrets(raw)
+    compact = redact_secrets(specialized)
+    if compact == original:
+        return original
+    try:
+        ref = ContextCache().store(original, source="exec")
+    except Exception:
+        return original
+    separator = "" if compact.endswith(("\n", "\r")) else "\n"
+    return compact + separator + recovery_notice(ref)
+
+
 @_timed
 def handle_usagetrim_exec(arguments: dict[str, Any]) -> str:
     start = time.perf_counter()
@@ -867,7 +876,7 @@ def handle_usagetrim_exec(arguments: dict[str, Any]) -> str:
     else:
         specialized = auto_specialize_command_output(command, combined_raw)
         if specialized is not None:
-            output = specialized + footer
+            output = _specialized_with_recovery(combined_raw, specialized) + footer
         else:
             output = safe_compact_output(combined_raw, command=command) + footer
     return _record(
@@ -1307,10 +1316,9 @@ def _respond(req: Any, *, profile: str = "full") -> dict[str, Any] | None:
         is_error = output.startswith("Error:")
     except Exception as exc:
         output, is_error = f"Error: {redact_secrets(str(exc))[:500]}", True
-    return {
-        **response,
-        "result": {"content": [{"type": "text", "text": output}], "isError": is_error},
-    }
+    result = {"content": [{"type": "text", "text": output}], "isError": is_error}
+    # Match _DEFAULT_OUTPUT_SCHEMA while preserving the legacy text result.
+    return {**response, "result": {**result, "structuredContent": {"isError": is_error}}}
 
 
 def run_mcp_stdio_server(profile: str = "full"):

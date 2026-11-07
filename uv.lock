@@ -2218,6 +2218,7 @@ companion = [
 ]
 mcp = [
     { name = "mcp" },
+    { name = "uvicorn" },
 ]
 semantic = [
     { name = "fastembed" },
@@ -2239,6 +2240,7 @@ requires-dist = [
     { name = "rich", specifier = ">=13.7.0" },
     { name = "tiktoken", specifier = ">=0.7.0" },
     { name = "typer", specifier = ">=0.12.0" },
+    { name = "uvicorn", marker = "extra == 'mcp'", specifier = ">=0.30.0" },
 ]
 provides-extras = ["companion", "mcp", "semantic"]
 

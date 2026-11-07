@@ -65,7 +65,7 @@ verbose tool text  →  keep the failure  →  recover the rest by reference
 | `docker build` BuildKit | 18,360 → **107** (99.4%) |
 | `go test` + goroutine dump | 3,281 → **64** (98.0%) |
 | `terraform plan` refresh/read | 6,409 → **276** (95.7%) |
-| `cargo test` + backtrace | 3,795 → **185** (95.1%) |
+| `cargo test` + backtrace | 3,795 → **197** (94.8%) |
 | pytest noisy (xdist + I/O) | 5,111 → **349** (93.2%) |
 | `kubectl describe` pod | 8,127 → **595** (92.7%) |
 | pytest recovery demo | 1,562 → **174** (88.9%) |
@@ -105,6 +105,55 @@ usagetrim prepare --file draft.txt
 ```
 
 [Details and tradeoffs →](https://github.com/00200200/usagetrim/blob/main/docs/guide.md)
+
+### Local Llama 3 text token counting
+
+You can explicitly supply an already-obtained April 2024 Llama 3
+`tokenizer.model` file. UsageTrim never downloads it or installs a backend:
+
+```sh
+export USAGETRIM_LLAMA3_TOKENIZER_PATH=/absolute/path/to/tokenizer.model
+usagetrim tokens "hello world" --model llama
+usagetrim prepare --file draft.txt --model llama --budget 1000
+```
+
+In PowerShell, set `$env:USAGETRIM_LLAMA3_TOKENIZER_PATH` to the local file path.
+The optional path is consulted only for the `llama` family. It does not change
+legacy calls with `model=None` or the Claude/OpenAI counting paths.
+
+With tiktoken available and a valid file, the method is
+`llama3-2024-04-local-sha256-<file digest>` and `is_estimate=False`: this is a
+real count of plain text under that specific local vocabulary and the April
+2024 Llama 3 segmentation rules. It does not certify that the file came from
+Meta. Use the tokenizer supplied for your exact model; the file digest identifies
+the artifact, not a general guarantee for every Llama version or derivative.
+SentencePiece files and other vocabulary formats are not supported by this adapter.
+
+The adapter accepts regular files named `tokenizer.model`, at most 16 MiB, in
+base64-token/integer-rank format with 128,000 unique contiguous ranks and complete
+byte fallback. URL and UNC paths are refused. No file is executed. Missing,
+unreadable, oversized or structurally incompatible files, or unavailable tiktoken,
+use the existing deterministic `utf8-bytes-div4-ceil` estimate instead. Configuration
+errors are reflected by the fallback method and estimate label. Structural
+validation cannot detect every vocabulary intended for a different model.
+One encoding snapshot is pinned throughout an optimization/preparation operation;
+changing the file or environment affects only subsequent operations.
+
+No BOS/EOS, chat templates, role markers or API message framing are added.
+Text resembling a special token is counted as ordinary text. These counts are
+therefore not counts for an entire API request. Budget enforcement uses the
+selected local method; the UTF-8 fallback is not an upper bound on provider tokens.
+
+The adapter uses tiktoken's Encoding API and the published segmentation rules;
+it does not bundle Meta vocabulary, model weights or the Meta tokenizer class.
+Obtain and use Meta artifacts under the
+[Meta Llama 3 Community License](https://github.com/meta-llama/llama3/blob/main/LICENSE).
+The synthetic CI vocabulary tests loading, byte fallback and merges, not agreement
+with an official model. An optional manual comparison can use an independently
+installed [Meta tokenizer](https://github.com/meta-llama/llama3/blob/main/llama/tokenizer.py)
+and the same local file: compare counts with `bos=False`, `eos=False`, and special
+tokens treated as ordinary text, across code, JSON, whitespace and Unicode.
+No official vocabulary is required by the regular test suite.
 
 ### Measured on real sessions
 
@@ -168,6 +217,58 @@ Manual MCP configuration for Claude Desktop, Cursor, Codex, Windsurf:
 ```
 
 Path: `command -v usagetrim`. Use `--profile full` for every tool, `--profile coding` for core terminal tools, or `--profile desktop` for chat apps. [Client setup →](https://github.com/00200200/usagetrim/blob/main/docs/guide.md#connect-clients)
+
+### Legacy HTTP+SSE transport
+
+Install the optional MCP dependencies and start the SSE server:
+
+```sh
+pip install 'usagetrim[mcp]'
+usagetrim mcp --transport sse --profile coding --host 127.0.0.1 --port 8080
+```
+
+Configure a native MCP SSE client with `http://127.0.0.1:8080/sse`. The stream
+advertises `/messages?session_id=...` for client POST requests. This is legacy
+MCP HTTP+SSE (protocol version `2024-11-05`), **not Streamable HTTP**. Browser
+clients are not supported; requests containing `Origin` are rejected.
+
+Both transports support `--profile minimal` (4 tools), `coding` (9, the CLI
+default), `desktop` (11), and `full` (all tools). You can also set
+`USAGETRIM_MCP_PROFILE`. `usagetrim mcp` continues to use stdio by default;
+`--transport stdio` selects it explicitly.
+
+To require authentication, supply `--auth-token` or set the environment variable:
+
+```sh
+export USAGETRIM_MCP_AUTH_TOKEN='replace-with-a-long-random-secret'
+usagetrim mcp --transport sse --profile coding
+```
+
+An explicit `--auth-token` overrides the environment variable. The client must
+send `Authorization: Bearer <token>` on **both** GET `/sse` and POST `/messages`.
+Listening outside localhost (for example, `--host 0.0.0.0`) requires a token.
+For remote access, use HTTPS through a reverse proxy or a secure tunnel; the
+server itself serves plain HTTP, and Bearer authentication does not encrypt it.
+
+Without a token, both the Host and the actual ASGI peer must be loopback.
+Remote reverse-proxy deployments must configure Bearer authentication; do not
+trust forwarded client headers as authentication.
+
+SSE buffers default to a 4 MiB JSON response limit and a global 32 MiB response
+budget, including SSE framing. `SSEApplication` accepts keyword-only
+`max_response_bytes` and `max_pending_response_bytes` overrides. The budget is
+reserved before serialization (including room for the temporary buffer copy)
+and held through queueing and sending. The global limit must fit two maximum
+framed responses to allow that copy. Exceeding either limit closes the affected session without sending truncated JSON; clients
+must reconnect. These limits bound transport buffering, not the memory used by
+synchronous MCP handlers or temporary JSON encoder allocations. Serialization
+runs outside the event loop. A disconnected or cancelled request cannot forcibly
+stop an already running Python handler; execution remains serialized until it
+actually returns.
+
+The stats tool's legacy “Session Savings” label means **process-wide** counters,
+shared by all SSE clients, not per-HTTP-session or per-user accounting. Clients
+share the server's tools, operating-system permissions, and cache.
 
 ```sh
 # Prepare messy logs or stack traces with prompt-cache prefix stabilization:

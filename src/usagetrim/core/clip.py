@@ -13,7 +13,7 @@ from usagetrim.core.diff_slimmer import slim_git_diff
 from usagetrim.core.json_slimmer import slim_json
 from usagetrim.core.redactor import redact_secrets
 from usagetrim.core.safe_filter import safe_compact_output
-from usagetrim.metrics.tokenizer import count_tokens
+from usagetrim.metrics.tokenizer import count_model_tokens, count_tokens, model_counting
 
 _COLOR = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -91,13 +91,26 @@ def _compact_traceback(lines: list[str]) -> tuple[list[str], bool]:
     return result, changed
 
 
-def compact_text(text: str, budget: int = 2000) -> ClipResult:
+@model_counting
+def compact_text(text: str, budget: int = 2000, *, model: str | None = None) -> ClipResult:
     """Deterministically compact raw clipboard/chat text with secret scrubbing and CCR recovery."""
+    if model is not None:
+        count_model_tokens("", model)
+
+    def size(value: str) -> int:
+        if model is not None:
+            return count_model_tokens(value, model).count
+        return count_tokens(value).openai
+
+    model_options = {} if model is None else {"model": model}
+
     cleaned = _COLOR.sub("", text)
     redacted = redact_secrets(cleaned)
-    original_tokens = count_tokens(redacted).openai
+    original_tokens = size(redacted)
 
-    if not redacted.strip() or original_tokens <= 12:
+    if (not redacted.strip() or original_tokens <= 12) and (
+        model is None or original_tokens <= budget
+    ):
         return ClipResult(
             original_tokens=original_tokens,
             compacted_tokens=original_tokens,
@@ -118,8 +131,8 @@ def compact_text(text: str, budget: int = 2000) -> ClipResult:
         stripped.startswith("[") and stripped.endswith("]")
     ):
         try:
-            json_preview = slim_json(stripped)
-            if count_tokens(json_preview).openai < original_tokens:
+            json_preview = redact_secrets(slim_json(stripped))
+            if size(json_preview) < original_tokens:
                 compacted = json_preview
                 content_type = "json"
         except Exception:
@@ -128,8 +141,8 @@ def compact_text(text: str, budget: int = 2000) -> ClipResult:
     # 2. Detect Git diff
     if content_type == "plain" and ("diff --git " in redacted or "--- a/" in redacted):
         content_type = "diff"
-        diff_res = slim_git_diff(redacted)
-        if count_tokens(diff_res).openai < original_tokens:
+        diff_res = redact_secrets(slim_git_diff(redacted))
+        if size(diff_res) < original_tokens:
             compacted = diff_res
 
     # 3. Detect pytest / test runner
@@ -137,8 +150,8 @@ def compact_text(text: str, budget: int = 2000) -> ClipResult:
         "test session starts" in redacted or " PASSED" in redacted or " FAILURES " in redacted
     ):
         content_type = "pytest"
-        test_res = safe_compact_output(redacted, command="pytest")
-        if count_tokens(test_res).openai < original_tokens:
+        test_res = safe_compact_output(redacted, command="pytest", **model_options)
+        if size(test_res) < original_tokens:
             compacted = test_res
 
     # 4. Detect traceback recursion and library frame compaction
@@ -154,8 +167,8 @@ def compact_text(text: str, budget: int = 2000) -> ClipResult:
 
         tb_lines, changed = _compact_traceback(redacted.splitlines(keepends=True))
         base_tb = "".join(tb_lines) if changed else redacted
-        tb_filtered = filter_traceback(base_tb)
-        if count_tokens(tb_filtered).openai < original_tokens:
+        tb_filtered = redact_secrets(filter_traceback(base_tb))
+        if size(tb_filtered) < original_tokens:
             compacted = tb_filtered
 
     # 5. General stream compaction: fold duplicate consecutive lines
@@ -183,7 +196,8 @@ def compact_text(text: str, budget: int = 2000) -> ClipResult:
             compacted = "".join(res_lines)
 
     # 6. Check budget enforcement & CCR caching
-    current_tokens = count_tokens(compacted).openai
+    compacted = redact_secrets(compacted)
+    current_tokens = size(compacted)
     if current_tokens > budget:
         # Bounded truncation with recovery ref
         cache = ContextCache()
@@ -200,7 +214,7 @@ def compact_text(text: str, budget: int = 2000) -> ClipResult:
             f"Ref: {ref_id} - recover with: usagetrim retrieve {ref_id} ...]\n"
         )
         compacted = "".join(head) + trunc_block + "".join(tail)
-        current_tokens = count_tokens(compacted).openai
+        current_tokens = size(compacted)
         while current_tokens > budget and (len(head) > 2 or len(tail) > 2):
             if len(head) >= len(tail):
                 head.pop()
@@ -212,7 +226,7 @@ def compact_text(text: str, budget: int = 2000) -> ClipResult:
                 f"Ref: {ref_id} - recover with: usagetrim retrieve {ref_id} ...]\n"
             )
             compacted = "".join(head) + trunc_block + "".join(tail)
-            current_tokens = count_tokens(compacted).openai
+            current_tokens = size(compacted)
     elif compacted != redacted:
         cache = ContextCache()
         ref_id = cache.store(redacted, source="clip-compaction")
@@ -220,8 +234,17 @@ def compact_text(text: str, budget: int = 2000) -> ClipResult:
             compacted += (
                 f"\n[UsageTrim: full original cached ({original_tokens} tokens). Ref: {ref_id}]\n"
             )
-            current_tokens = count_tokens(compacted).openai
+            current_tokens = size(compacted)
 
+    compacted = redact_secrets(compacted)
+    current_tokens = size(compacted)
+    if model is not None and current_tokens > budget:
+        from usagetrim.core.adaptive import compress_to_budget
+
+        compacted = compress_to_budget(
+            compacted, budget, original_text=redacted, source="clip-compaction", model=model
+        )
+        current_tokens = size(compacted)
     saved = max(0, original_tokens - current_tokens)
     pct = round((saved / original_tokens) * 100, 1) if original_tokens else 0.0
 

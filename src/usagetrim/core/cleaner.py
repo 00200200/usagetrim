@@ -6,11 +6,11 @@ from dataclasses import dataclass
 
 from usagetrim.core.cache import ContextCache
 from usagetrim.core.redactor import redact_secrets
-
-# Regular expressions for ANSI & terminal control sequences
-ANSI_CSI_PATTERN = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
-ANSI_OSC_PATTERN = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
-ANSI_GENERIC_PATTERN = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+from usagetrim.core.terminal_text import (
+    ANSI_CSI_PATTERN,
+    ANSI_GENERIC_PATTERN,
+    ANSI_OSC_PATTERN,
+)
 
 # Progress indicator patterns (spinners, dots, hashes)
 SPINNER_CHARS = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "◐", "◓", "◑", "◒", "-\\|/"}
