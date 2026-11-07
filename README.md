@@ -84,6 +84,64 @@ usagetrim run -- terraform plan
 usagetrim run -- npx eslint . --format codeframe
 ```
 
+### Opt-in bounded command capture
+
+`run --bounded --compact` uses the bounded execution runner instead of the
+default full-output capture and compaction path:
+
+```sh
+usagetrim run --bounded --compact --timeout 60 -- pytest -v
+usagetrim run --bounded --compact --max-lines 20 -- docker build .
+usagetrim retrieve tc_0123456789abcdef --lines 1-40
+```
+
+Each stream has a separate, pattern-redacted CCR artifact and a preview read of
+at most 4096 bytes. Stdout previews go to stdout; stderr previews and execution,
+capture and recovery metadata go to stderr, without Rich markup interpretation.
+`--max-lines` (default 80) limits each displayed preview, not stored content.
+Streams are not merged and their display order is not emission chronology.
+The mode inherits stdin, the current directory and environment, preserves argv,
+and uses no shell or PTY. It is intended for non-interactive commands: debugger,
+password and other interactive prompts may be quarantined, unavailable or only
+visible after execution ends. Use the existing unbounded path for interaction.
+
+`--compact` is required as explicit consent to preview-only display. `--safe`
+(including its default) is rejected because full diagnostic preservation on
+screen cannot be provided. `--budget` is currently unsupported; no full-output
+token budget or streaming filter is applied. `--engine none`, companion pause
+and already wrapped commands are rejected rather than silently changing raw
+passthrough. `--quiet` omits only the optional elapsed-time summary: recovery,
+termination and integrity/cleanup diagnostics remain visible. `--timeout` must
+be finite and positive and requires `--bounded`; it includes execution and pipe
+capture, followed by M3's bounded cleanup phases.
+
+`capture=complete` and `recovery=complete` concern the redacted, decoded
+representation, not original bytes. Preview truncation is separate from stored
+capture completeness. Only currently available references are printed; partial,
+unknown and unavailable recovery is labeled explicitly. Quotas, oversized lines,
+unsupported terminal syntax, storage failures and eviction can prevent complete
+recovery. Redaction is conservative and pattern-based; it cannot identify all
+secrets. References are local and can expire through eviction/clear. Read large
+artifacts in bounded line ranges and check retrieval's truncation/completeness
+metadata rather than assuming one `retrieve` returns the entire log.
+
+Normal child exit codes are preserved. A child terminated by signal N maps to
+CLI status `128+N`, while metadata retains the observed returncode. Timeout exits
+124, cancellation/Ctrl-C exits 130 after cleanup, failed start exits 126, and
+runner failure exits 1. Capture/storage/cleanup problems also turn an otherwise
+successful exit into 1; an already nonzero child code remains unchanged and the
+problem is still reported. Metadata distinguishes these CLI statuses from the
+actual child status (which may be 0 even after a descendant-held-pipe timeout).
+Errors are categories only, without exception bodies. Validation errors exit 2
+before child execution.
+
+No text-reduction telemetry or replay snapshots are recorded for bounded runs
+in M4: full token counts are unavailable, and previews must not be reported as
+complete command output or savings. M3 records artifact/recovery metadata.
+Without `--bounded`, the existing execution, telemetry, output and exit behavior
+is unchanged. See [runner details](docs/execution-runner.md) for platform cleanup
+and synchronous-storage limitations. MCP integration is separate work.
+
 ---
 
 ## What you get

@@ -1,9 +1,10 @@
 # Internal bounded command capture and shutdown (M3A–M3B)
 
-`core.execution_runner.run_execution` is an internal prototype, not a replacement
-for CLI `run` or MCP `usagetrim_exec`. Neither entry point uses it. Timeout,
-per-execution cancellation and owned-tree shutdown are implemented internally;
-native platform verification and the remaining M3 work precede public integration.
+`core.execution_runner.run_execution` provides internal bounded capture, timeout,
+per-execution cancellation and owned-tree shutdown. M4 exposes it through the
+opt-in CLI `run --bounded --compact` path, documented in the
+[CLI guide](../README.md#opt-in-bounded-command-capture). Default CLI execution and
+MCP `usagetrim_exec` retain their existing paths; MCP integration is separate work.
 
 ## API
 
