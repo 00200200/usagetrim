@@ -1,7 +1,8 @@
 # Incremental CCR execution artifacts (M2)
 
-This internal API is not connected to `run`, MCP, a subprocess runner, or M1's
-value types. It stores a sanitized decoded view, not original output bytes.
+This internal API is used by the prototype [M3A runner](execution-runner.md),
+but is not connected to CLI `run` or MCP. It stores a sanitized decoded view,
+not original output bytes.
 Existing content-addressed CCR references, compression formats, retrieval, FTS
 search and the execution/result contract retain their existing behavior.
 

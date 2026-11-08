@@ -30,6 +30,9 @@ _CREDENTIAL = re.compile(
 _PEM_START = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 _PEM_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----")
 _TOKEN_RUN = re.compile(r"[A-Za-z0-9_.-]+")
+# Single character class, no nested repetition/backtracking. Runs contain only
+# printable ASCII or TAB: one UTF-8 byte per character, never terminal syntax.
+_ASCII_RUN = re.compile(r"[\x20-\x7e\t]+")
 
 
 def _jwt_like(line):
@@ -116,15 +119,35 @@ class StreamingRedactor:
         return (MASK if suppress else line) + ("\n" if newline else "")
 
     def _consume(self, text):
-        for character in text:
+        position, length = 0, len(text)
+        while position < length:
             if self.incomplete:
                 return
+            character = text[position]
+            value = ord(character)
+            state = self._terminal
+            if (
+                state == "text"
+                and not self._pending_cr
+                and (character == "\t" or 0x20 <= value < 0x7F)
+            ):
+                run = _ASCII_RUN.match(text, position)
+                if run is not None:
+                    size = run.end() - position
+                    if self._line_bytes + size > LINE_LIMIT:
+                        self._fail()
+                        return
+                    # Quarantine only. Credential/PEM checks still run on the
+                    # joined, complete line in _record(), including split tokens.
+                    self._line.append(run.group())
+                    self._line_bytes += size
+                    position = run.end()
+                    continue
+            position += 1
             if self._pending_cr:
                 self._pending_cr = False
                 if character != "\n":
                     self._tainted_line = True
-            value = ord(character)
-            state = self._terminal
             if state != "text":
                 self._control_length += 1
                 if self._control_length > CONTROL_LIMIT:
