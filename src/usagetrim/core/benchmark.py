@@ -138,3 +138,120 @@ def benchmark_suite(cases: Iterable[BenchmarkCase]) -> BenchmarkSuiteResult:
         signals_preserved=all(result.signals_preserved for result in results),
         exact_recovery=all(result.exact_recovery for result in results),
     )
+
+
+def benchmark_bounded_case(case: BenchmarkCase) -> dict:
+    """Offline fixture replay, not subprocess/RSS evidence or a new baseline.
+
+    Compare bounded display with the existing safe filter on the same normalized
+    input, only below 64 KiB. The legacy-safe comparison explicitly uses generic
+    estimates, not the specialized CLI/MCP pipeline or a provider tokenizer.
+    """
+    import hashlib
+
+    from usagetrim.core.bounded_filter import SMALL_TEXT_BYTES, filter_execution
+    from usagetrim.core.execution_contract import (
+        CaptureView,
+        ExecutionMode,
+        ExecutionRequest,
+        ExecutionResult,
+        RecoveryInfo,
+        StreamCapture,
+        TerminationReason,
+    )
+    from usagetrim.core.stream_redactor import StreamingRedactor
+
+    if len(case.raw_output) > SMALL_TEXT_BYTES:
+        raise ValueError("quality replay accepts only small fixtures; use the resource harness")
+    data = case.raw_output.encode("utf-8")
+    if len(data) > SMALL_TEXT_BYTES:
+        raise ValueError("quality fixture exceeds the 64 KiB UTF-8 input limit")
+    previous_cache = os.environ.get("USAGETRIM_CACHE_DIR")
+    with TemporaryDirectory(prefix="usagetrim-bounded-quality-") as directory:
+        try:
+            os.environ["USAGETRIM_CACHE_DIR"] = directory
+            cache = ContextCache()
+            writer = cache.begin_artifact(stream="stdout")
+            stderr = cache.begin_artifact(stream="stderr", execution_id=writer.execution_id)
+            for start in range(0, len(data), 8192):
+                writer.append(data[start : start + 8192])
+            writer.finish()
+            stderr.finish()
+            streams = []
+            for item in (writer, stderr):
+                view = cache.read_artifact(item.ref_id, max_bytes=4096)
+                streams.append(
+                    StreamCapture(
+                        item.stream.value,
+                        CaptureView(view.text, "preview", "separate", view.metadata.complete),
+                        RecoveryInfo(
+                            item.ref_id,
+                            available=view.metadata.available,
+                            complete=view.metadata.complete,
+                        ),
+                        view.response_truncated,
+                    )
+                )
+            # Exit status is manifest metadata, never a measured child result.
+            fixture_result = ExecutionResult(
+                ExecutionRequest(ExecutionMode.SHELL, shell_command=case.command),
+                TerminationReason.EXITED,
+                case.exit_code if case.exit_code is not None else 0,
+                capture=CaptureView(
+                    text_scope="preview",
+                    stream_layout="separate",
+                    complete=all(s.capture.complete for s in streams),
+                ),
+                execution_id=writer.execution_id,
+                streams=tuple(streams),
+            )
+            started = perf_counter()
+            filtered = filter_execution(fixture_result, cache=cache)
+            latency = (perf_counter() - started) * 1000
+            display = filtered.views[0].text
+            missing = [signal for signal in case.required_signals if signal not in display]
+            expected, recovered = hashlib.sha256(), hashlib.sha256()
+            redactor = StreamingRedactor()
+            for record in redactor.feed(data):
+                expected.update(record.encode("utf-8"))
+            for record in redactor.finish():
+                expected.update(record.encode("utf-8"))
+            for fragment in cache.iter_artifact(writer.ref_id):
+                recovered.update(fragment.data)
+            legacy = None
+            metadata = cache.artifact_metadata(writer.ref_id)
+            if metadata.complete and metadata.stored_bytes <= SMALL_TEXT_BYTES:
+                original = cache.read_artifact(writer.ref_id, max_bytes=SMALL_TEXT_BYTES).text
+                started = perf_counter()
+                safe = safe_compact_output(original, command=case.command, model="generic")
+                legacy = {
+                    "scope": "existing safe filter only, same redacted-normalized input; generic estimate",
+                    "display_bytes_including_notice": len(safe.encode("utf-8")),
+                    "latency_ms": (perf_counter() - started) * 1000,
+                    "missing_signals": [
+                        signal for signal in case.required_signals if signal not in safe
+                    ],
+                }
+            return {
+                "case_id": case.case_id,
+                "source_sha256": hashlib.sha256(data).hexdigest(),
+                "scope": "fixture replay; no child process/RSS/live progress measurement",
+                "manifest_exit_code": case.exit_code,
+                "raw_bytes": len(data),
+                "display_body_bytes": len(display.encode("utf-8")),
+                "filter_state": filtered.views[0].state,
+                "coverage": filtered.views[0].coverage,
+                "filter_note": filtered.views[0].note,
+                "latency_ms": latency,
+                "signals_preserved": not missing,
+                "missing_signals": missing,
+                "exact_redacted_normalized_recovery": (
+                    expected.digest() == recovered.digest() and not redactor.incomplete
+                ),
+                "legacy_safe_filter": legacy,
+            }
+        finally:
+            if previous_cache is None:
+                os.environ.pop("USAGETRIM_CACHE_DIR", None)
+            else:
+                os.environ["USAGETRIM_CACHE_DIR"] = previous_cache

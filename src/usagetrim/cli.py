@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -1102,8 +1103,36 @@ def run(
             help="Preserve unknown output and diagnostics; --compact permits truncation",
         ),
     ] = True,
+    bounded: Annotated[
+        bool,
+        typer.Option(
+            "--bounded", help="Opt into bounded capture with CCR previews; requires --compact"
+        ),
+    ] = False,
+    timeout: Annotated[
+        float | None,
+        typer.Option("--timeout", help="Finite positive timeout in seconds; requires --bounded"),
+    ] = None,
 ):
     """Execute a command and optimize its output for AI context windows."""
+    if timeout is not None:
+        if not bounded:
+            raise typer.BadParameter("--timeout requires --bounded", param_hint="--timeout")
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise typer.BadParameter("must be finite and positive", param_hint="--timeout")
+    if bounded:
+        if safe:
+            raise typer.BadParameter(
+                "--bounded requires --compact; --safe cannot preserve full diagnostics in a preview",
+                param_hint="--bounded",
+            )
+        if budget is not None:
+            raise typer.BadParameter(
+                "--budget is not supported with --bounded; previews are not full-output compaction",
+                param_hint="--budget",
+            )
+        if max_lines < 1:
+            raise typer.BadParameter("must be positive with --bounded", param_hint="--max-lines")
     full_cmd = shlex.join(command)
     try:
         selected = select_engine(engine)
@@ -1112,6 +1141,14 @@ def run(
     wrapped = already_wrapped(full_cmd)
     if wrapped:
         selected = "none"
+    if bounded:
+        if selected == "none":
+            raise typer.BadParameter(
+                "--bounded cannot preserve passthrough (--engine none, paused, or already wrapped)",
+                param_hint="--bounded",
+            )
+        _run_bounded_command(command, timeout=timeout, max_lines=max_lines, quiet=quiet)
+        return
     start_time = time.perf_counter()
 
     # Preserve argument boundaries and literal shell metacharacters. Shell syntax
@@ -1198,6 +1235,163 @@ def run(
 
     if proc.returncode != 0:
         raise typer.Exit(code=proc.returncode)
+
+
+def _bounded_issues(issues) -> None:
+    """Print fixed runner categories only, never exception messages or payloads."""
+    for issue in issues:
+        phase = (
+            issue.phase
+            if issue.phase in {"start", "capture", "processing", "storage", "cleanup"}
+            else "unknown"
+        )
+        category = (
+            issue.error_type
+            if re.fullmatch(r"[a-z0-9_]{1,80}", issue.error_type)
+            else "unclassified"
+        )
+        sys.stderr.write(f"[usagetrim bounded issue: {phase}/{category}]\n")
+
+
+def _bounded_exit_code(result) -> int:
+    from usagetrim.core.execution_contract import TerminationReason
+
+    if result.termination_reason is TerminationReason.TIMED_OUT:
+        return 124
+    if result.termination_reason is TerminationReason.CANCELLED:
+        return 130
+    if result.termination_reason is TerminationReason.FAILED_TO_START:
+        return 126
+    if result.returncode is None:
+        return 1
+    if result.termination_reason is TerminationReason.SIGNALED and result.returncode < 0:
+        return 128 - result.returncode
+    if result.returncode != 0:
+        return result.returncode
+    if (
+        result.termination_reason is not TerminationReason.EXITED
+        or result.issues
+        or result.capture.complete is not True
+        or {stream.stream for stream in result.streams} != {"stdout", "stderr"}
+        or any(
+            stream.capture.complete is not True
+            or stream.recovery is None
+            or stream.recovery.available is not True
+            or stream.recovery.complete is not True
+            for stream in result.streams
+        )
+    ):
+        return 1
+    return 0
+
+
+def _render_bounded_result(result, *, max_lines: int, quiet: bool, filter_views=()) -> None:
+    """Render bounded display views and original execution/recovery metadata."""
+
+    def completeness(value):
+        return "complete" if value is True else "incomplete" if value is False else "unknown"
+
+    for index, stream in enumerate(result.streams):
+        # Each M3 preview is already byte-bounded. This only limits visible lines;
+        # display truncation must never change stored-capture completeness.
+        filtered = filter_views[index] if filter_views else None
+        lines = (filtered.text if filtered else stream.capture.text).splitlines(keepends=True)
+        text = "".join(lines[:max_lines])
+        target = sys.stdout if stream.stream == "stdout" else sys.stderr
+        if text:
+            target.write(text)
+            if not text.endswith("\n"):
+                target.write("\n")
+        source_truncated = (
+            filtered.coverage == "sampled"
+            if filtered is not None and filtered.state == "pytest"
+            else stream.preview_truncated
+        )
+        preview = (
+            "truncated"
+            if len(lines) > max_lines or source_truncated is True
+            else "complete"
+            if source_truncated is False
+            else "unknown"
+        )
+        recovery, ref, availability = "unavailable", "", "unavailable"
+        info = stream.recovery
+        if info is not None:
+            if info.available is True:
+                availability = "available"
+                recovery = completeness(info.complete)
+                if info.ref_id:
+                    ref = f"; ref={info.ref_id}"
+            elif info.available is None:
+                recovery = availability = "unknown"
+        sys.stderr.write(
+            f"[usagetrim bounded {stream.stream}: "
+            f"capture={completeness(stream.capture.complete)}; preview={preview}; "
+            f"recovery={recovery}{ref}; availability={availability}]\n"
+        )
+        if filtered is not None:
+            sys.stderr.write(
+                f"[usagetrim bounded {stream.stream} filter: {filtered.state}; "
+                f"coverage={filtered.coverage}; note={filtered.note}]\n"
+            )
+    # Termination, integrity and cleanup diagnostics are essential even in quiet
+    # mode. In particular, a timed-out child may have an observed returncode of 0.
+    child_exit = "unknown" if result.returncode is None else str(result.returncode)
+    sys.stderr.write(
+        f"[usagetrim bounded execution: {result.termination_reason.value}; "
+        f"child_exit={child_exit}; capture={completeness(result.capture.complete)}]\n"
+    )
+    _bounded_issues(result.issues)
+    if not quiet:
+        elapsed = "unknown" if result.elapsed_seconds is None else f"{result.elapsed_seconds:.2f}s"
+        sys.stderr.write(
+            f"[usagetrim bounded summary: elapsed={elapsed}; view=redacted-normalized]\n"
+        )
+
+
+def _run_bounded_command(command, *, timeout, max_lines, quiet) -> None:
+    from usagetrim.core.execution_contract import ExecutionMode, ExecutionRequest
+    from usagetrim.core.execution_runner import (
+        CaptureLimits,
+        ExecutionInterrupted,
+        ExecutionRunnerError,
+        run_execution,
+    )
+
+    interrupted = False
+    try:
+        request = ExecutionRequest(
+            ExecutionMode.ARGV, argv=tuple(command), cwd=str(Path.cwd()), timeout_seconds=timeout
+        )
+        result = run_execution(request, limits=CaptureLimits(preview_bytes=4096))
+    except ExecutionInterrupted as error:
+        interrupted, result = True, error.result
+    except ExecutionRunnerError as error:
+        sys.stderr.write("[usagetrim bounded runner failed: capture/recovery state unknown]\n")
+        _bounded_issues(error.issues)
+        raise typer.Exit(code=1) from None
+    except KeyboardInterrupt:
+        sys.stderr.write("[usagetrim bounded execution interrupted; recovery state unknown]\n")
+        raise typer.Exit(code=130) from None
+    except Exception:
+        # M3 owns cleanup after child allocation. Do not expose exception bodies
+        # from initialization/storage here, or invent a successful execution.
+        sys.stderr.write("[usagetrim bounded runner failed: capture/recovery state unknown]\n")
+        raise typer.Exit(code=1) from None
+    try:
+        from usagetrim.core.bounded_filter import filter_execution
+
+        filtered = filter_execution(result)
+        result = filtered.result
+        _render_bounded_result(
+            result, max_lines=max_lines, quiet=quiet, filter_views=filtered.views
+        )
+    except KeyboardInterrupt:
+        # M3 has already settled the child and readers before returning a result.
+        raise typer.Exit(code=130) from None
+    # M4 has no full-output token counts. Do not record previews as whole command
+    # output or fabricate savings; M3 already records artifact/recovery metadata.
+    raise typer.Exit(code=130 if interrupted else _bounded_exit_code(result))
 
 
 @app.command()

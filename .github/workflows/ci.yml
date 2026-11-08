@@ -80,6 +80,33 @@ jobs:
           Write-Host "Companion pytest process exit code: $testExitCode"
           if ($testExitCode -ne 0) { exit $testExitCode }
 
+  execution-portability:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install ${{ matrix.python-version }}
+      - name: Install locked dependencies
+        run: uv sync --locked --all-extras --python ${{ matrix.python-version }}
+      - name: Native execution, recovery and resource-harness tests
+        shell: bash
+        run: >-
+          uv run --locked --python ${{ matrix.python-version }} python -m pytest -q
+          tests/test_execution_contract.py tests/test_execution_artifacts.py
+          tests/test_execution_streams.py tests/test_execution_runner.py
+          tests/test_execution_shutdown.py tests/test_execution_process.py
+          tests/test_benchmark_execution.py
+
   benchmark:
     runs-on: ubuntu-latest
     steps:

@@ -10,6 +10,7 @@ from usagetrim.core.execution_contract import (
     ExecutionRequest,
     ExecutionResult,
     RecoveryInfo,
+    StreamCapture,
     TerminationReason,
 )
 
@@ -26,6 +27,15 @@ def test_command_representations_preserve_input_and_hide_payloads():
     assert command not in repr(shell) and "space name" not in repr(request())
     with pytest.raises(FrozenInstanceError):
         shell.shell_command = "changed"
+
+
+def test_protocol_stdin_is_opt_in_and_legacy_inheritance_remains_default():
+    assert request().stdin_mode == "inherit"
+    isolated = ExecutionRequest(ExecutionMode.SHELL, shell_command="fixture", stdin_mode="null")
+    assert isolated.stdin_mode == "null"
+    for mode in (None, True, "pipe", []):
+        with pytest.raises(ValueError, match="stdin mode"):
+            ExecutionRequest(ExecutionMode.ARGV, argv=("fixture",), stdin_mode=mode)
 
 
 @pytest.mark.parametrize(
@@ -127,3 +137,31 @@ def test_invalid_durations(value):
         ExecutionResult(request(), TerminationReason.EXITED, 0, elapsed_seconds=value)
     with pytest.raises(ValueError):
         ExecutionRequest(ExecutionMode.ARGV, argv=("tool",), timeout_seconds=value)
+
+
+def test_separate_streams_are_additive_and_nested_repr_remains_safe():
+    secret = "private-stream-payload"
+    stream = StreamCapture(
+        "stdout",
+        CaptureView(secret, text_scope="preview", stream_layout="separate", complete=True),
+        RecoveryInfo(ref_id=secret, available=True, complete=True),
+        preview_truncated=True,
+    )
+    result = ExecutionResult(
+        request(),
+        TerminationReason.EXITED,
+        0,
+        execution_id=secret,
+        streams=(stream,),
+    )
+    assert result.streams[0].capture.complete
+    assert result.streams[0].preview_truncated
+    assert secret not in repr(result) and secret not in repr(stream)
+    assert StreamCapture("stderr").capture.stream_layout == "separate"
+    legacy = ExecutionResult(request(), TerminationReason.EXITED, 0)
+    assert legacy.streams == () and legacy.execution_id is None
+    assert legacy.capture.stream_layout == "merged"
+    with pytest.raises(ValueError, match="unique"):
+        ExecutionResult(request(), TerminationReason.EXITED, 0, streams=(stream, stream))
+    with pytest.raises(ValueError, match="unknown capture stream"):
+        StreamCapture("merged")

@@ -84,6 +84,66 @@ usagetrim run -- terraform plan
 usagetrim run -- npx eslint . --format codeframe
 ```
 
+### Opt-in bounded command capture
+
+`run --bounded --compact` uses the bounded execution runner instead of the
+default full-output capture and compaction path:
+
+```sh
+usagetrim run --bounded --compact --timeout 60 -- pytest -v
+usagetrim run --bounded --compact --max-lines 20 -- docker build .
+usagetrim retrieve tc_0123456789abcdef --lines 1-40
+```
+
+Each stream has a separate, pattern-redacted CCR artifact and a preview read of
+at most 4096 bytes. M6 may replace it with a filtered diagnostic view capped at
+16 KiB. Stdout views go to stdout; stderr views and execution,
+capture and recovery metadata go to stderr, without Rich markup interpretation.
+`--max-lines` (default 80) limits each displayed preview, not stored content.
+Streams are not merged and their display order is not emission chronology.
+The mode inherits stdin, the current directory and environment, preserves argv,
+and uses no shell or PTY. It is intended for non-interactive commands: debugger,
+password and other interactive prompts may be quarantined, unavailable or only
+visible after execution ends. Use the existing unbounded path for interaction.
+
+`--compact` is required as explicit consent to preview-only display. `--safe`
+(including its default) is rejected because full diagnostic preservation on
+screen cannot be provided. `--budget` is currently unsupported; no full-output
+token budget is applied. M6 adds the bounded pytest display filter described below.
+`--engine none`, companion pause
+and already wrapped commands are rejected rather than silently changing raw
+passthrough. `--quiet` omits only the optional elapsed-time summary: recovery,
+termination and integrity/cleanup diagnostics remain visible. `--timeout` must
+be finite and positive and requires `--bounded`; it includes execution and pipe
+capture, followed by M3's bounded cleanup phases.
+
+`capture=complete` and `recovery=complete` concern the redacted, decoded
+representation, not original bytes. Preview truncation is separate from stored
+capture completeness. Only currently available references are printed; partial,
+unknown and unavailable recovery is labeled explicitly. Quotas, oversized lines,
+unsupported terminal syntax, storage failures and eviction can prevent complete
+recovery. Redaction is conservative and pattern-based; it cannot identify all
+secrets. References are local and can expire through eviction/clear. Read large
+artifacts in bounded line ranges and check retrieval's truncation/completeness
+metadata rather than assuming one `retrieve` returns the entire log.
+
+Normal child exit codes are preserved. A child terminated by signal N maps to
+CLI status `128+N`, while metadata retains the observed returncode. Timeout exits
+124, cancellation/Ctrl-C exits 130 after cleanup, failed start exits 126, and
+runner failure exits 1. Capture/storage/cleanup problems also turn an otherwise
+successful exit into 1; an already nonzero child code remains unchanged and the
+problem is still reported. Metadata distinguishes these CLI statuses from the
+actual child status (which may be 0 even after a descendant-held-pipe timeout).
+Errors are categories only, without exception bodies. Validation errors exit 2
+before child execution.
+
+No text-reduction telemetry or replay snapshots are recorded for bounded runs
+in bounded mode: full token counts are unavailable, and previews must not be reported as
+complete command output or savings. M3 records artifact/recovery metadata.
+Without `--bounded`, the existing execution, telemetry, output and exit behavior
+is unchanged. See [runner details](docs/execution-runner.md) for platform cleanup
+and synchronous-storage limitations. MCP has its own bounded opt-in described below.
+
 ---
 
 ## What you get
@@ -217,6 +277,131 @@ Manual MCP configuration for Claude Desktop, Cursor, Codex, Windsurf:
 ```
 
 Path: `command -v usagetrim`. Use `--profile full` for every tool, `--profile coding` for core terminal tools, or `--profile desktop` for chat apps. [Client setup →](https://github.com/00200200/usagetrim/blob/main/docs/guide.md#connect-clients)
+
+### Opt-in bounded MCP execution (stdio)
+
+`usagetrim_exec` retains its existing shell-command behavior unless `bounded`
+is explicitly true:
+
+```json
+{
+  "name": "usagetrim_exec",
+  "arguments": {
+    "command": "python -m pytest -q",
+    "bounded": true,
+    "timeout": 60,
+    "max_lines": 40
+  }
+}
+```
+
+An optional absolute `cwd` is passed to the shell without changing the command
+string or the server's working directory. Environment is inherited. Bounded MCP
+children receive **empty stdin**, so a command cannot consume JSON-RPC messages;
+there is no PTY or interactive debugger/password support. The small internal
+stdin override leaves the runner/CLI default of inherited stdin unchanged.
+
+The result retains `content`, `isError`, and `structuredContent: {"isError": ...}`.
+Text includes separate stdout/stderr base previews (4096-byte read limits per
+stream), or M6 filtered views capped at 16 KiB,
+observed child returncode, termination reason, capture completeness, currently
+available CCR references and recovery completeness. `max_lines` limits each
+preview (default 80). Preview truncation does not imply incomplete storage.
+Recovery concerns redacted, decoded/normalized text, not original bytes. Use
+`usagetrim_retrieve` with line ranges and inspect its truncation/completeness
+notice; references can expire through eviction. Redaction is conservative and
+pattern-based and cannot guarantee removal of every sensitive value.
+
+Unlike legacy exec's historical nonzero/isError behavior, bounded exec sets
+`isError=true` for nonzero exit, signal, timeout, failed start, cancellation or
+capture/storage/cleanup failures. Status is taken from M3 metadata, never log
+prefixes. No unrestricted full-text filter, replay snapshot, reduction estimate or
+savings telemetry is produced from a preview. M6's bounded pytest display filter
+uses committed CCR fragments. `max_tokens`, `budget`, engine/passthrough
+options and unknown bounded arguments are rejected before execution, as are
+paused/already-wrapped commands. `timeout` requires bounded mode, is finite and
+positive, defaults to 120 seconds and is capped at 3600 seconds. It includes
+execution/capture; M3's cleanup phases can follow the deadline.
+
+Stdio admits at most **two bounded requests**, including queued and cancelling
+work, using two fixed worker threads. There is no overflow backlog: excess calls
+receive JSON-RPC error `-32000` and may be retried later. `ping`, `tools/list`
+and further requests remain readable while bounded commands execute; legacy
+handlers still run synchronously. Replies may arrive out of order and must be
+matched by ID. All response writes are serialized; child output is captured,
+never written directly to protocol stdout. Duplicate active IDs receive an
+invalid-request error with `id: null`; the original request is left intact.
+
+Cancel an active bounded request using a notification (no `id`):
+
+```json
+{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":42}}
+```
+
+Each request owns a separate cancellation event. Cancellation accepted before
+reply publication suppresses that reply, requests M3 process-tree cleanup and
+retains any available **incomplete** recovery in CCR when execution is interrupted.
+Cancellation racing with an already finished execution cannot retroactively
+make its genuinely complete artifact incomplete. The slot remains occupied
+until actual worker cleanup finishes. Unknown, malformed or late cancellations
+do nothing; notifications receive no response. Cancellation racing with reply
+publication may be too late. Cancelled requests have no returned references;
+retained artifacts remain in the existing local CCR metadata/cache explorer.
+
+EOF/disconnect cancels pending bounded work and waits up to 20 seconds for the
+workers. A cleanup overrun is reported on stderr and exits nonzero rather than
+claiming clean shutdown. Python cannot safely interrupt native SQLite/kernel
+I/O or a blocked stdout write; such operations and M3's non-daemon readers may
+delay final process exit. Clients must continuously drain stdout. This limits
+bounded execution admission/output, not legacy operations, input JSON line size,
+or all memory in the server. No new authentication or sandbox is introduced.
+
+If a response write fails because the client closed its stdout reader, the
+server also stops waiting for more stdin, even if the client keeps that pipe
+open or has sent only part of a JSON line. Native input uses bounded reads with
+readiness polling (POSIX selectors; Windows `PeekNamedPipe`), without an extra
+reader thread or queue. UTF-8 decoding/newline state is retained across reads.
+The transport exclusively owns its fresh stdin descriptor; embedded callers
+must not pre-read it through a buffered wrapper. Fileless custom iterators and
+the native Windows console retain legacy iteration and require cooperative
+EOF/return from their reads; the interruptible guarantee applies to MCP pipes,
+including Windows anonymous/named pipes. SSE is unaffected.
+
+The synchronous HTTP+SSE tool path can use bounded capture and timeout, retaining
+its existing execution lock and transport quotas. **M5 cancellation and the
+two-request dispatcher apply only to stdio**; SSE cancellation is not implemented.
+
+### Bounded pytest filtering and rollout (M6)
+
+Bounded CLI/MCP can now reduce recognized pytest logs by reading committed,
+already-redacted CCR fragments incrementally. Existing safe-filter recognizers
+fold routine pass/xdist records before diagnostics. A direct pytest command or
+the existing complete-session signature (header, collection, final summary) is
+required. Stdout and stderr remain separate; filters never infer execution status.
+
+Filtering scans at most 8 MiB / 131072 lines, with a two-second cooperative scan
+budget. A display candidate is capped at 16 KiB per stream. If it overflows,
+bounded first/latest diagnostic context windows in each third of the log plus
+head/tail excerpts are shown, explicitly marked as sampled. Lines in sampled
+windows may be excerpts, not complete records. For input up to 64 KiB, an existing
+pure pytest diagnostic helper may also fold captured I/O and repetitive frames.
+Unrestricted specialized/full-text filters are not run on large bounded logs.
+
+Unknown formats, input/time limits, incomplete captures and filter failures use
+the existing preview + CCR response with a visible filter note. A filter failure
+does not replace the observed exit status or destroy valid recovery. A detected
+storage/integrity failure invalidates stale recovery claims and is reported as
+an execution/storage problem. Display limits (`max_lines`/`--max-lines`) still
+apply and can omit diagnostics from the visible summary; status, filter coverage
+and recovery metadata remain outside that limit, including with `--quiet`.
+Token budgets remain unsupported rather than silently dropping those notices.
+
+This is post-capture processing, **not live progress**. Recovery is the full
+redacted-normalized artifact only when M3 and the current lookup confirm it;
+sampled diagnostics are never presented as the full log. No tokenizer vocabulary
+download or second command capture is required by this filtering path.
+
+**Rollout decision: keep bounded execution opt-in.** Local Linux measurements confirmed that increasing captured output from 16 MiB to 1 GiB did not increase peak runner RSS: the measured difference was −32 KiB, within the 64 MiB acceptance threshold. Cross-platform M6 CI validation, end-to-end workload measurements and further performance review remain necessary before enabling bounded execution by default.
 
 ### Legacy HTTP+SSE transport
 
