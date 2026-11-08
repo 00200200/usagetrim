@@ -56,6 +56,7 @@ from usagetrim.core.doctor import (
     write_claude_desktop_extension,
 )
 from usagetrim.core.engines import select_engine
+from usagetrim.core.event_replay import EventInspection
 from usagetrim.core.gain import build_gain_report
 from usagetrim.core.hooks import (
     install_shell_wrapper,
@@ -125,6 +126,46 @@ def _emit(text: str) -> str:
     emitted = text + ("\n" if text and not text.endswith("\n") else "")
     sys.stdout.write(emitted)
     return emitted
+
+
+@app.command("tui")
+def tui_command():
+    """Open the local telemetry dashboard (requires the tui extra)."""
+    try:
+        from usagetrim.tui.app import UsageTrimDashboard
+    except ModuleNotFoundError as exc:
+        if exc.name != "textual" and not (exc.name or "").startswith("textual."):
+            raise
+        typer.echo(
+            "The dashboard requires Textual. Install with: pip install 'usagetrim[tui]'", err=True
+        )
+        raise typer.Exit(code=1) from None
+    UsageTrimDashboard().run()
+
+
+@app.command("tokens")
+def tokens_command(
+    text: Annotated[str, typer.Argument(help="Plain text to count.")],
+    model: Annotated[
+        str | None,
+        typer.Option(
+            help="Family: openai, claude, gemini, llama, generic, deepseek. "
+            "Default: LLM_MODEL > ANTHROPIC_MODEL > OPENAI_MODEL, then openai."
+        ),
+    ] = None,
+):
+    """Count text with an explicit tokenizer or a labeled size estimate."""
+    from usagetrim.metrics.tokenizer import count_model_tokens, detect_model_family
+
+    if model is None:
+        detected = detect_model_family()
+        model = detected.value if detected is not None else "openai"
+    try:
+        result = count_model_tokens(text, model)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--model") from exc
+    kind = "estimate" if result.is_estimate else "encoding count"
+    typer.echo(f"{result.count} tokens · {result.family.value} · {kind} · {result.method}")
 
 
 @app.command("pricing")
@@ -507,10 +548,22 @@ def prepare_command(
     json_output: Annotated[
         bool, typer.Option("--json", help="Include local preview measurements")
     ] = False,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            help="Family: openai, claude, gemini, llama, generic, deepseek. "
+            "Default: LLM_MODEL > ANTHROPIC_MODEL > OPENAI_MODEL, then legacy counting.",
+        ),
+    ] = None,
 ):
     """Preview shorter input before pasting it into any chat; never sends or counts usage."""
     from usagetrim.core.prepare import MAX_INPUT_BYTES, prepare_text
+    from usagetrim.metrics.tokenizer import detect_model_family
 
+    if model is None:
+        detected = detect_model_family()
+        model = detected.value if detected is not None else None
     selected_mode = "desktop" if desktop else mode
     try:
         if file is not None:
@@ -531,7 +584,10 @@ def prepare_command(
             )
         if len(raw) > MAX_INPUT_BYTES:
             raise ValueError("Draft exceeds 128 KiB; select a smaller relevant excerpt")
-        result = prepare_text(raw.decode("utf-8"), mode=selected_mode, budget=budget)
+        model_options = {} if model is None else {"model": model}
+        result = prepare_text(
+            raw.decode("utf-8"), mode=selected_mode, budget=budget, **model_options
+        )
     except (OSError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     if json_output:
@@ -545,11 +601,17 @@ def prepare_command(
             err_console.print(
                 "[bold green]✓ Copied prepared text to system clipboard (ready to paste)![/bold green]"
             )
+        counting_label = "local o200k estimate"
+        if model is not None:
+            accuracy = "estimate" if result["is_estimate"] else "encoding count"
+            counting_label = f"{result['family']} · {result['method']} · {accuracy}"
         err_console.print(
-            f"Tokens: {result['counts']}  ·  local o200k estimate · not usage savings. "
+            f"Tokens: {result['counts']}  ·  {counting_label} · not usage savings. "
             "Review before pasting into Claude Desktop / Codex. "
             "Credentials are redacted; compaction may cache a redacted original."
         )
+        if result.get("ref_id"):
+            err_console.print(f"Original redacted draft: usagetrim retrieve {result['ref_id']}")
         if selected_mode == "summary":
             err_console.print(
                 "Summary is heuristic and lossy; verify goals, constraints and decisions."
@@ -1005,6 +1067,18 @@ def optimize_command(
     _emit(result.text)
 
 
+@app.command("companion")
+def companion_command():
+    """Open the optional Linux/Windows desktop window with local measurements."""
+    from usagetrim.companion import CompanionUnavailable, create_backend
+
+    try:
+        code = create_backend().run()
+    except (CompanionUnavailable, OSError) as exc:
+        raise typer.BadParameter(str(exc)) from None
+    raise typer.Exit(code)
+
+
 @app.command()
 def monitor(stdio: Annotated[bool, typer.Option("--stdio")] = False):
     """Local companion JSON-lines protocol (stdin/stdout; no listening port)."""
@@ -1118,6 +1192,13 @@ def run(
             duration_s=time.perf_counter() - start_time,
             engine=selected,
             operation=operation,
+            cache_allowed=selected == "usagetrim",
+            inspection=EventInspection(
+                child_returncode=proc.returncode,
+                termination_reason=(
+                    "signaled" if os.name == "posix" and proc.returncode < 0 else "exited"
+                ),
+            ),
         )
 
     if proc.returncode != 0:
@@ -1189,6 +1270,7 @@ def cat(
                 project=file_path,
                 duration_s=time.perf_counter() - start,
                 engine="none" if paused() else "usagetrim",
+                cache_allowed=not paused(),
             )
             return
 
@@ -1223,6 +1305,7 @@ def cat(
         project=file_path,
         duration_s=time.perf_counter() - start,
         engine="none" if paused() else "usagetrim",
+        cache_allowed=not paused(),
     )
 
 
@@ -1265,6 +1348,7 @@ def types_cmd(
         project=file_path,
         duration_s=time.perf_counter() - start,
         engine="none" if paused() else "usagetrim",
+        cache_allowed=not paused(),
     )
 
 
@@ -1311,6 +1395,7 @@ def json_cmd(
         project=p if target and p.is_file() else None,
         duration_s=time.perf_counter() - start,
         engine="none" if paused() else "usagetrim",
+        cache_allowed=not no_cache and not paused(),
     )
 
 
@@ -1323,23 +1408,59 @@ def retrieve(
     lines: Annotated[
         str | None, typer.Option("--lines", "-l", help="Line range to inspect (e.g. 20-60)")
     ] = None,
+    semantic: Annotated[
+        bool, typer.Option("--semantic", help="Allow offline semantic fallback for --query.")
+    ] = False,
+    budget: Annotated[
+        int | None,
+        typer.Option(
+            "--budget", min=64, max=32000, help="Token budget for --semantic (default 1000)."
+        ),
+    ] = None,
 ):
     """Retrieve full uncompressed raw output from the local Compress-Cache-Retrieve store."""
     cache = ContextCache()
     if query is not None and lines is not None:
         raise typer.BadParameter("Choose --query or --lines, not both")
+    if semantic and (query is None or lines is not None):
+        raise typer.BadParameter("--semantic requires --query and cannot be combined with --lines")
+    if budget is not None and not semantic:
+        raise typer.BadParameter("--budget requires --semantic")
     try:
-        raw = (
-            cache.search(ref_id, query)
-            if query is not None
-            else cache.retrieve(ref_id, lines_range=lines)
-        )
+        if semantic:
+            recovered = cache.hybrid_search_result(
+                ref_id,
+                query,
+                budget=budget if budget is not None else 1000,
+                token_provider="openai",
+            )
+        else:
+            recovered = (
+                cache.search_result(ref_id, query)
+                if query is not None
+                else cache.retrieve_result(ref_id, lines_range=lines)
+            )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    emitted = _emit(raw)
+    emitted = _emit(recovered.text)
     # Recovery is additional context, not a second saving of the original log.
     try:
-        record_text("", emitted, operation="retrieve", engine=recovery_engine(ref_id))
+        record_text(
+            "",
+            emitted,
+            operation="retrieve",
+            engine=recovery_engine(ref_id),
+            offline=semantic,
+            cache_allowed=False,
+            inspection=(
+                EventInspection(
+                    recovery_ref=ref_id,
+                    recovery_scope="query" if query is not None else "lines" if lines else "full",
+                )
+                if recovered.recovered
+                else None
+            ),
+        )
     except Exception:
         pass
 
@@ -1976,6 +2097,7 @@ def pipe(
         operation="pipe",
         duration_s=time.perf_counter() - start,
         engine="none" if paused() else "usagetrim",
+        cache_allowed=not paused(),
     )
 
 
@@ -2028,6 +2150,7 @@ def diff(
         operation="diff",
         duration_s=time.perf_counter() - start,
         engine="none" if paused() else "usagetrim",
+        cache_allowed=not paused(),
     )
 
 
@@ -2264,6 +2387,12 @@ def mcp(
             help="minimal: 4 tools, smallest schema footprint; coding: 9 core tools with compact schemas (default); desktop: 11 tools; full: all tools",
         ),
     ] = "coding",
+    transport: Annotated[str, typer.Option("--transport", help="stdio or sse")] = "stdio",
+    host: Annotated[str, typer.Option("--host")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", min=1, max=65535)] = 8080,
+    auth_token: Annotated[
+        str | None, typer.Option("--auth-token", envvar="USAGETRIM_MCP_AUTH_TOKEN")
+    ] = None,
 ):
     """Start the Model Context Protocol (MCP) server for Claude Code, Cursor, and Codex."""
     from usagetrim.mcp.server import tool_definitions
@@ -2272,7 +2401,19 @@ def mcp(
         tool_definitions(profile)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    run_mcp_stdio_server(profile)
+    if transport not in {"stdio", "sse"}:
+        raise typer.BadParameter("transport must be stdio or sse")
+    if transport == "stdio":
+        run_mcp_stdio_server(profile)
+    else:
+        from usagetrim.mcp.sse import run_mcp_sse_server
+
+        try:
+            run_mcp_sse_server(profile, host, port, auth_token)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        except ImportError as exc:
+            raise typer.BadParameter("SSE requires: pip install 'usagetrim[mcp]'") from exc
 
 
 @app.command()

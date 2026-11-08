@@ -4,7 +4,38 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from usagetrim.core.redactor import redact_secrets
+
+
+@pytest.mark.parametrize(
+    "escape", ["\x1b[31m", "\x1b[?25l", "\x1b]0;title\x07", "\x9b31m", "\x9d0;title\x9c"]
+)
+def test_redacts_secrets_across_ansi_without_removing_unrelated_escapes(escape):
+    raw = "\x1b[32mstatus\x1b[0m\n" + "ghp_" + escape + "A" * 36 + "\nend"
+    result = redact_secrets(raw)
+    assert result == "\x1b[32mstatus\x1b[0m\n[REDACTED_GITHUB_TOKEN]\nend"
+    assert redact_secrets(result) == result
+
+
+def test_redacts_multiple_ansi_split_credentials_with_correct_offsets():
+    raw = (
+        "prefix ghp_\x1b[31m"
+        + "A" * 18
+        + "\x1b[0m"
+        + "A" * 18
+        + " next sk-proj-\x1b[32m"
+        + "b" * 30
+        + " suffix"
+    )
+    output = redact_secrets(raw)
+    assert output == "prefix [REDACTED_GITHUB_TOKEN] next [REDACTED_OPENAI_KEY] suffix"
+
+
+def test_redactor_preserves_terminal_bytes_when_no_secret_exists():
+    raw = "\x1b[31mred\x1b[0m\n\x1b]0;title\x07plain"
+    assert redact_secrets(raw) == raw
 
 
 def test_redacts_github_tokens():
