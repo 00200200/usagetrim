@@ -24,7 +24,7 @@ class TerminationReason(Enum):
     SIGNALED = "signaled"
     TIMED_OUT = "timed_out"
     FAILED_TO_START = "failed_to_start"
-    CANCELLED = "cancelled"  # Reserved for a future runner, not implemented here.
+    CANCELLED = "cancelled"
 
 
 def _duration(value: float | None, *, positive: bool = False) -> None:
@@ -48,7 +48,8 @@ class ExecutionRequest:
     shell_command: str | None = field(default=None, repr=False)
     cwd: str | None = field(default=None, repr=False)
     timeout_seconds: float | None = None
-    # Current paths inherit env and stdin. No environment snapshot is retained.
+    stdin_mode: Literal["inherit", "null"] = "inherit"
+    # Environment is inherited. Protocol hosts may explicitly isolate stdin.
     # A shell string stays opaque: it must never be reconstructed from argv.
 
     def __post_init__(self) -> None:
@@ -71,23 +72,26 @@ class ExecutionRequest:
         else:
             raise ValueError("unknown execution mode")
         _duration(self.timeout_seconds, positive=True)
+        if type(self.stdin_mode) is not str or self.stdin_mode not in {"inherit", "null"}:
+            raise ValueError("unknown stdin mode")
 
 
 @dataclass(frozen=True)
 class CaptureView:
     text: str = field(default="", repr=False)
     text_scope: Literal["full", "preview", "partial"] = "full"
-    stream_layout: Literal["merged", "unknown"] = "merged"
+    stream_layout: Literal["merged", "separate", "unknown"] = "merged"
     complete: bool | None = None
     encoding: str | None = None
     replacement_occurred: bool | None = None
 
     # There are deliberately no inferred stdout/stderr fields for merged text.
-    # A future complete capture may expose just a preview and a recovery ref.
+    # A complete capture may expose just a preview and a recovery ref.
 
     def __post_init__(self) -> None:
         if self.text_scope not in {"full", "preview", "partial"} or self.stream_layout not in {
             "merged",
+            "separate",
             "unknown",
         }:
             raise ValueError("unknown capture representation")
@@ -112,9 +116,23 @@ class RecoveryInfo:
 
 @dataclass(frozen=True)
 class ExecutionIssue:
-    phase: Literal["start", "capture", "processing", "storage"]
+    phase: Literal["start", "capture", "processing", "storage", "cleanup"]
     error_type: str = field(repr=False)
     message: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class StreamCapture:
+    """One explicitly identified stream; never inferred from a merged string."""
+
+    stream: Literal["stdout", "stderr"]
+    capture: CaptureView = field(default_factory=lambda: CaptureView(stream_layout="separate"))
+    recovery: RecoveryInfo | None = None
+    preview_truncated: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.stream not in {"stdout", "stderr"}:
+            raise ValueError("unknown capture stream")
 
 
 @dataclass(frozen=True)
@@ -126,6 +144,8 @@ class ExecutionResult:
     elapsed_seconds: float | None = None  # Execution/capture time, not rendering time.
     recovery: RecoveryInfo | None = None
     issues: tuple[ExecutionIssue, ...] = ()
+    execution_id: str | None = field(default=None, repr=False)
+    streams: tuple[StreamCapture, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.termination_reason, TerminationReason):
@@ -142,3 +162,7 @@ class ExecutionResult:
         if self.termination_reason is TerminationReason.SIGNALED and self.returncode == 0:
             raise ValueError("signal termination cannot be exit zero")
         _duration(self.elapsed_seconds)
+        if not all(isinstance(stream, StreamCapture) for stream in self.streams):
+            raise ValueError("streams must contain StreamCapture values")
+        if len({stream.stream for stream in self.streams}) != len(self.streams):
+            raise ValueError("capture streams must be unique")

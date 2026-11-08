@@ -161,6 +161,17 @@ TOOLS_DEFINITIONS = [
                     "type": "integer",
                     "description": "Compatibility alias for max_tokens; explicitly permits truncation.",
                 },
+                "bounded": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Opt into bounded capture with separate redacted previews and CCR refs. No full-output filters or savings estimates. Child stdin is empty.",
+                },
+                "timeout": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "maximum": 3600,
+                    "description": "Bounded-only execution/capture timeout in seconds (default 120).",
+                },
             },
             "required": ["command"],
         },
@@ -703,6 +714,8 @@ def _budget(arguments: dict[str, Any]) -> int:
 
 _START: ContextVar[float | None] = ContextVar("usagetrim_started", default=None)
 _RETRIEVE_ERROR: ContextVar[bool | None] = ContextVar("usagetrim_retrieve_error", default=None)
+_EXEC_ERROR: ContextVar[bool | None] = ContextVar("usagetrim_exec_error", default=None)
+_BOUNDED_CANCEL: ContextVar[Any] = ContextVar("usagetrim_bounded_cancel", default=None)
 
 
 def _timed(handler):
@@ -847,6 +860,16 @@ def _specialized_with_recovery(raw: str, specialized: str) -> str:
 
 @_timed
 def handle_usagetrim_exec(arguments: dict[str, Any]) -> str:
+    if type(arguments.get("bounded", False)) is not bool:
+        raise ValueError("bounded must be a boolean")
+    if arguments.get("bounded", False):
+        from usagetrim.mcp.bounded_exec import execute
+
+        output, failed = execute(arguments, cancel_event=_BOUNDED_CANCEL.get())
+        _EXEC_ERROR.set(failed)
+        return output
+    if "timeout" in arguments:
+        raise ValueError("timeout requires bounded=true")
     start = time.perf_counter()
     budget = _budget(arguments)
     command = arguments["command"]
@@ -1179,8 +1202,13 @@ def _validate_arguments(name: str, arguments: Any) -> None:
     types = {"string": str, "integer": int, "boolean": bool, "object": dict, "array": list}
     for key, value in arguments.items():
         spec = schema["properties"].get(key)
-        if spec and type(value) is not types[spec["type"]]:
-            raise ValueError(f"{key} must be {spec['type']}")
+        if spec:
+            if spec["type"] == "number":
+                valid = type(value) in {int, float}
+            else:
+                valid = type(value) is types[spec["type"]]
+            if not valid:
+                raise ValueError(f"{key} must be {spec['type']}")
 
 
 @_timed
@@ -1373,38 +1401,40 @@ def _respond(req: Any, *, profile: str = "full") -> dict[str, Any] | None:
     }:
         return {**response, "error": {"code": -32602, "message": "Unknown tool"}}
     error_token = _RETRIEVE_ERROR.set(False if name == "usagetrim_retrieve" else None)
+    exec_token = _EXEC_ERROR.set(None)
     try:
         _validate_arguments(name, arguments)
         output = handlers[name](arguments)
         recovery_error = _RETRIEVE_ERROR.get()
-        is_error = recovery_error if recovery_error is not None else output.startswith("Error:")
+        exec_error = _EXEC_ERROR.get()
+        is_error = (
+            exec_error
+            if exec_error is not None
+            else recovery_error
+            if recovery_error is not None
+            else output.startswith("Error:")
+        )
     except Exception as exc:
         output, is_error = f"Error: {redact_secrets(str(exc))[:500]}", True
     finally:
         _RETRIEVE_ERROR.reset(error_token)
+        _EXEC_ERROR.reset(exec_token)
     result = {"content": [{"type": "text", "text": output}], "isError": is_error}
     # Match _DEFAULT_OUTPUT_SCHEMA while preserving the legacy text result.
     return {**response, "result": {**result, "structuredContent": {"isError": is_error}}}
 
 
 def run_mcp_stdio_server(profile: str = "full"):
-    """Run JSON-RPC 2.0 stdio loop for Model Context Protocol."""
-    tool_definitions(profile)  # Validate before reading stdin or executing anything.
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
+    """Keep bounded executions off the reader; preserve synchronous legacy calls."""
+    from usagetrim.mcp.stdio import serve
 
+    tool_definitions(profile)  # Validate before reading stdin or executing anything.
+
+    def respond(request, cancel_event=None):
+        token = _BOUNDED_CANCEL.set(cancel_event)
         try:
-            req = json.loads(line)
-        except json.JSONDecodeError:
-            resp = {
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32700, "message": "Parse error"},
-            }
-        else:
-            resp = _respond(req, profile=profile)
-        if resp is not None:
-            sys.stdout.write(json.dumps(resp) + "\n")
-            sys.stdout.flush()
+            return _respond(request, profile=profile)
+        finally:
+            _BOUNDED_CANCEL.reset(token)
+
+    serve(sys.stdin, sys.stdout, sys.stderr, respond)
