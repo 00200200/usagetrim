@@ -51,6 +51,43 @@ jobs:
           cd "$(mktemp -d)"
           uv tool run --isolated --from "$wheel" usagetrim demo --json
 
+  windows-native-hooks:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies and native console launcher
+        run: uv sync --locked --all-extras --python 3.12
+
+      - name: Require PowerShell 7 and native Git
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 7) { throw 'PowerShell 7 is required' }
+          $git = Get-Command git -CommandType Application -ErrorAction Stop
+          if ([IO.Path]::GetExtension($git.Path) -ne '.exe') { throw 'Native git.exe is required' }
+
+      - name: Test native PowerShell hooks with Python 3.12
+        run: >-
+          uv run --locked --python 3.12 pytest -v
+          tests/test_native_hooks.py::test_native_shim_windows_exe_launcher_and_batch_passthrough
+          tests/test_native_hooks.py::test_native_powershell_shim_windows_launcher_normalizes_exe_name
+          tests/test_native_hooks.py::test_native_shim_activation_requires_owned_file
+          tests/test_native_hooks.py::test_powershell_shell_wrapper_routes_argv_and_preserves_native_arguments
+          tests/test_native_hooks.py::test_powershell_literal_native_command_semantics
+          tests/test_native_hooks.py::test_powershell_intercepted_native_command_semantics
+          tests/test_native_hooks.py::test_powershell_shell_wrapper_preserves_alias_and_function
+          tests/test_native_hooks.py::test_powershell_shell_wrapper_preserves_preexisting_helpers
+
   windows-companion:
     runs-on: windows-latest
     env:
