@@ -1285,27 +1285,33 @@ def _bounded_exit_code(result) -> int:
     return 0
 
 
-def _render_bounded_result(result, *, max_lines: int, quiet: bool) -> None:
-    """Render M3's bounded views only; no filters, tokenization or full retrieval."""
+def _render_bounded_result(result, *, max_lines: int, quiet: bool, filter_views=()) -> None:
+    """Render bounded display views and original execution/recovery metadata."""
 
     def completeness(value):
         return "complete" if value is True else "incomplete" if value is False else "unknown"
 
-    for stream in result.streams:
+    for index, stream in enumerate(result.streams):
         # Each M3 preview is already byte-bounded. This only limits visible lines;
         # display truncation must never change stored-capture completeness.
-        lines = stream.capture.text.splitlines(keepends=True)
+        filtered = filter_views[index] if filter_views else None
+        lines = (filtered.text if filtered else stream.capture.text).splitlines(keepends=True)
         text = "".join(lines[:max_lines])
         target = sys.stdout if stream.stream == "stdout" else sys.stderr
         if text:
             target.write(text)
             if not text.endswith("\n"):
                 target.write("\n")
+        source_truncated = (
+            filtered.coverage == "sampled"
+            if filtered is not None and filtered.state == "pytest"
+            else stream.preview_truncated
+        )
         preview = (
             "truncated"
-            if len(lines) > max_lines or stream.preview_truncated is True
+            if len(lines) > max_lines or source_truncated is True
             else "complete"
-            if stream.preview_truncated is False
+            if source_truncated is False
             else "unknown"
         )
         recovery, ref, availability = "unavailable", "", "unavailable"
@@ -1323,6 +1329,11 @@ def _render_bounded_result(result, *, max_lines: int, quiet: bool) -> None:
             f"capture={completeness(stream.capture.complete)}; preview={preview}; "
             f"recovery={recovery}{ref}; availability={availability}]\n"
         )
+        if filtered is not None:
+            sys.stderr.write(
+                f"[usagetrim bounded {stream.stream} filter: {filtered.state}; "
+                f"coverage={filtered.coverage}; note={filtered.note}]\n"
+            )
     # Termination, integrity and cleanup diagnostics are essential even in quiet
     # mode. In particular, a timed-out child may have an observed returncode of 0.
     child_exit = "unknown" if result.returncode is None else str(result.returncode)
@@ -1368,7 +1379,13 @@ def _run_bounded_command(command, *, timeout, max_lines, quiet) -> None:
         sys.stderr.write("[usagetrim bounded runner failed: capture/recovery state unknown]\n")
         raise typer.Exit(code=1) from None
     try:
-        _render_bounded_result(result, max_lines=max_lines, quiet=quiet)
+        from usagetrim.core.bounded_filter import filter_execution
+
+        filtered = filter_execution(result)
+        result = filtered.result
+        _render_bounded_result(
+            result, max_lines=max_lines, quiet=quiet, filter_views=filtered.views
+        )
     except KeyboardInterrupt:
         # M3 has already settled the child and readers before returning a result.
         raise typer.Exit(code=130) from None

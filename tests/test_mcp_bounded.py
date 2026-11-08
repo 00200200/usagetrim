@@ -764,3 +764,29 @@ def test_disconnected_dispatcher_does_not_admit_more_work():
     dispatcher.write({"jsonrpc": "2.0", "id": 1, "result": {}})
     assert not dispatcher.workers and not dispatcher.active and dispatcher.jobs.empty()
     assert output.getvalue() == ""
+
+
+def test_real_stdio_pytest_filter_preserves_diagnostic_tail_and_protocol_status(client, tmp_path):
+    raw = (
+        "================ test session starts ================\ncollected 501 items\n"
+        + "tests/test_ok.py::test_ok PASSED\n" * 500
+        + "E AssertionError: middle diagnostic\nlast actionable context\n"
+        + "================ 1 failed, 500 passed in 0.10s ================\n"
+    )
+    path = tmp_path / "pytest.log"
+    path.write_text(raw, encoding="utf-8")
+    script = (
+        "import shutil,sys; f=open(sys.argv[1],encoding='utf-8'); "
+        "shutil.copyfileobj(f,sys.stdout,4096); print('stderr separate',file=sys.stderr); "
+        "raise SystemExit(7)"
+    )
+    client.send(call(command=shell([sys.executable, "-c", script, str(path)])))
+    response = client.receive()
+    output = text(response)
+    assert response["result"]["isError"]
+    assert "middle diagnostic" in output and "last actionable context" in output
+    assert "filter: pytest; coverage=filtered" in output and "child_exit=7" in output
+    assert "stderr separate" in output
+    reference = refs(output)[0]
+    view = ContextCache().read_artifact(reference, max_bytes=32768)
+    assert view.text == raw and view.metadata.complete

@@ -130,7 +130,7 @@ def producer_worker(stats, size):
         )
 
 
-def runner_worker(stats, size, stop_file, timeout, *, profile=False):
+def runner_worker(stats, size, stop_file, timeout, *, profile=False, filters=False):
     """Instrument M2 acknowledgements/finalization only inside this benchmark."""
     from dataclasses import asdict
 
@@ -183,6 +183,10 @@ def runner_worker(stats, size, stop_file, timeout, *, profile=False):
         )
         if warm.returncode != 0 or not warm.capture.complete or warm.issues:
             raise RuntimeError("Runner warm-up did not complete")
+        if filters:
+            from usagetrim.core.bounded_filter import filter_execution
+
+            filter_execution(warm, cache=cache, cancel_event=cancel)
         cache.clear()
         warm_peak = peak_rss_bytes()
         original_begin = cache.begin_artifact
@@ -230,6 +234,15 @@ def runner_worker(stats, size, stop_file, timeout, *, profile=False):
                 limits=limits,
                 cancel_event=cancel,
             )
+            filtered = None
+            filter_elapsed = 0.0
+            if filters:
+                from usagetrim.core.bounded_filter import filter_execution
+
+                filter_started = time.perf_counter()
+                filtered = filter_execution(result, cache=cache, cancel_event=cancel)
+                result = filtered.result
+                filter_elapsed = time.perf_counter() - filter_started
             wall = time.perf_counter() - started
         peak = peak_rss_bytes()  # Before any verification/report rendering.
         recovery = cache.execution_recovery(result.execution_id)
@@ -307,6 +320,47 @@ def runner_worker(stats, size, stop_file, timeout, *, profile=False):
         if profile:
             report["profile"] = instrumentation.report()
             report["parameters"]["profile_enabled"] = True
+        if filters:
+            report["parameters"]["filters_enabled"] = True
+            from usagetrim.core import bounded_filter
+
+            report["parameters"]["filter_limits"] = {
+                key: getattr(bounded_filter, key)
+                for key in (
+                    "SCAN_BYTES",
+                    "SCAN_LINES",
+                    "SMALL_TEXT_BYTES",
+                    "OUTPUT_BYTES",
+                    "SCAN_SECONDS",
+                )
+            }
+            report["parameters"]["filter_source_sha256"] = hashlib.sha256(
+                Path(bounded_filter.__file__).read_bytes()
+            ).hexdigest()
+            report["parameters"]["safe_filter_source_sha256"] = hashlib.sha256(
+                Path(bounded_filter.safe_filter.__file__).read_bytes()
+            ).hexdigest()
+            report["filtering_seconds"] = filter_elapsed
+            report["filter_views"] = [
+                {"state": view.state, "coverage": view.coverage, "note": view.note}
+                for view in filtered.views
+            ]
+            report["display_body_bytes"] = sum(
+                len(view.text.encode("utf-8")) for view in filtered.views
+            )
+            report["first_bounded_progress_seconds"] = None
+            report["progress_scope"] = (
+                "not supported by CLI/MCP; first observation is storage acknowledgement only"
+            )
+            report["retained_disk_bytes"] = sum(
+                path.stat().st_size
+                for path in (
+                    cache.db_path,
+                    Path(str(cache.db_path) + "-wal"),
+                    Path(str(cache.db_path) + "-shm"),
+                )
+                if path.exists()
+            )
         stats.write_text(json.dumps(report), encoding="utf-8")
         return 0 if valid else 1
     except BaseException as error:
@@ -330,11 +384,14 @@ def runner_worker(stats, size, stop_file, timeout, *, profile=False):
         watcher.join(timeout=2)
 
 
-def measure_runner(size, *, timeout=3600, profile=False):
+def measure_runner(size, *, timeout=3600, profile=False, filters=False):
     """One fresh worker per size. Observer RSS is never reported as runner RSS."""
     if type(profile) is not bool:
         raise ValueError("profile must be a boolean")
-    return _measure_worker("runner", size, timeout, ["--profile"] if profile else [])
+    if type(filters) is not bool:
+        raise ValueError("filters must be a boolean")
+    extra = (["--profile"] if profile else []) + (["--filters"] if filters else [])
+    return _measure_worker("runner", size, timeout, extra)
 
 
 def measure_redactor(size, implementation, *, corpus="ascii", timeout=3600):
@@ -758,6 +815,16 @@ def main():
         help="Aggregate runner stage timings in the isolated worker",
     )
     parser.add_argument(
+        "--filters",
+        action="store_true",
+        help="Include M6 bounded display filtering in runner measurement",
+    )
+    parser.add_argument(
+        "--quality",
+        action="store_true",
+        help="Replay the existing fixture corpus through bounded and small-input legacy safe filters",
+    )
+    parser.add_argument(
         "--entry-point", choices=("cli", "mcp", "both", "runner", "redactor"), default="both"
     )
     parser.add_argument(
@@ -772,6 +839,28 @@ def main():
     parser.add_argument("--_bytes", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--_stop-file", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.quality:
+        from usagetrim.core.benchmark import benchmark_bounded_case
+        from usagetrim.core.benchmark_corpus import load_benchmark_cases
+
+        if args._worker or args._producer or args.size_mib or args.sizes_mib:
+            parser.error("--quality is a separate small-fixture report, not a resource profile")
+        cases = load_benchmark_cases(ROOT / "tests/fixtures/benchmarks/manifest.json")
+        rows = [benchmark_bounded_case(case) for case in cases]
+        print(
+            json.dumps(
+                {
+                    "scope": "offline fixture replay; byte sizes, not provider tokens",
+                    "results": rows,
+                    "rollout": "opt-in; native resource/cross-platform gates must be measured separately",
+                    "rss_growth_measured": False,
+                },
+                indent=2,
+            )
+        )
+        return
+    if args.filters and args.entry_point != "runner" and args._worker != "runner":
+        parser.error("--filters requires --entry-point runner")
     if args.profile and args.entry_point != "runner" and args._worker != "runner":
         parser.error("--profile requires --entry-point runner")
     if not 0 < args.timeout_seconds <= 86400:
@@ -789,7 +878,12 @@ def main():
                 parser.error("runner worker requires a stop file and bounded size")
             raise SystemExit(
                 runner_worker(
-                    args._stats, size, args._stop_file, args.timeout_seconds, profile=args.profile
+                    args._stats,
+                    size,
+                    args._stop_file,
+                    args.timeout_seconds,
+                    profile=args.profile,
+                    filters=args.filters,
                 )
             )
         if args._worker == "redactor":
@@ -855,7 +949,12 @@ def main():
         if 1024 in selected and not args.allow_gib:
             parser.error("1 GiB requires explicit --allow-gib")
         results = [
-            measure_runner(count * MIB, timeout=args.timeout_seconds, profile=args.profile)
+            measure_runner(
+                count * MIB,
+                timeout=args.timeout_seconds,
+                profile=args.profile,
+                filters=args.filters,
+            )
             for count in selected
         ]
         print(

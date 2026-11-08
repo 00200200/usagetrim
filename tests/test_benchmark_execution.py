@@ -237,3 +237,16 @@ def test_microbenchmark_comparison_requires_output_and_completeness_parity(harne
     assert harness.redactor_comparison([before, mismatch])["equivalent_output"] is False
     mismatch = after | {"redaction_incomplete": True}
     assert harness.redactor_comparison([before, mismatch])["scalar_over_ascii_wall_ratio"] is None
+
+
+def test_small_filter_resource_profile_reports_no_invented_progress(harness):
+    result = harness.measure_runner(65536, timeout=60, filters=True)
+    assert result["measurement_valid"] and result["capture_complete"]
+    assert result["runner_pid"] != result["producer_pid"]
+    assert result["parameters"]["filters_enabled"] is True
+    assert result["filtering_seconds"] >= 0
+    assert result["first_bounded_progress_seconds"] is None
+    assert result["retained_disk_bytes"] >= result["retained_bytes"]
+    assert result["display_body_bytes"] <= 2 * 16384
+    assert all(view["note"] == "unsupported_format" for view in result["filter_views"])
+    assert not harness.rss_growth([result])["measured"]

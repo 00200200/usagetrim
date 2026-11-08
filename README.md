@@ -96,7 +96,8 @@ usagetrim retrieve tc_0123456789abcdef --lines 1-40
 ```
 
 Each stream has a separate, pattern-redacted CCR artifact and a preview read of
-at most 4096 bytes. Stdout previews go to stdout; stderr previews and execution,
+at most 4096 bytes. M6 may replace it with a filtered diagnostic view capped at
+16 KiB. Stdout views go to stdout; stderr views and execution,
 capture and recovery metadata go to stderr, without Rich markup interpretation.
 `--max-lines` (default 80) limits each displayed preview, not stored content.
 Streams are not merged and their display order is not emission chronology.
@@ -108,7 +109,8 @@ visible after execution ends. Use the existing unbounded path for interaction.
 `--compact` is required as explicit consent to preview-only display. `--safe`
 (including its default) is rejected because full diagnostic preservation on
 screen cannot be provided. `--budget` is currently unsupported; no full-output
-token budget or streaming filter is applied. `--engine none`, companion pause
+token budget is applied. M6 adds the bounded pytest display filter described below.
+`--engine none`, companion pause
 and already wrapped commands are rejected rather than silently changing raw
 passthrough. `--quiet` omits only the optional elapsed-time summary: recovery,
 termination and integrity/cleanup diagnostics remain visible. `--timeout` must
@@ -136,7 +138,7 @@ Errors are categories only, without exception bodies. Validation errors exit 2
 before child execution.
 
 No text-reduction telemetry or replay snapshots are recorded for bounded runs
-in M4: full token counts are unavailable, and previews must not be reported as
+in bounded mode: full token counts are unavailable, and previews must not be reported as
 complete command output or savings. M3 records artifact/recovery metadata.
 Without `--bounded`, the existing execution, telemetry, output and exit behavior
 is unchanged. See [runner details](docs/execution-runner.md) for platform cleanup
@@ -300,7 +302,8 @@ there is no PTY or interactive debugger/password support. The small internal
 stdin override leaves the runner/CLI default of inherited stdin unchanged.
 
 The result retains `content`, `isError`, and `structuredContent: {"isError": ...}`.
-Text includes separate stdout/stderr previews (4096-byte read limits per stream),
+Text includes separate stdout/stderr base previews (4096-byte read limits per
+stream), or M6 filtered views capped at 16 KiB,
 observed child returncode, termination reason, capture completeness, currently
 available CCR references and recovery completeness. `max_lines` limits each
 preview (default 80). Preview truncation does not imply incomplete storage.
@@ -312,8 +315,9 @@ pattern-based and cannot guarantee removal of every sensitive value.
 Unlike legacy exec's historical nonzero/isError behavior, bounded exec sets
 `isError=true` for nonzero exit, signal, timeout, failed start, cancellation or
 capture/storage/cleanup failures. Status is taken from M3 metadata, never log
-prefixes. No full-text filter, replay snapshot, reduction estimate or savings
-telemetry is produced from a preview. `max_tokens`, `budget`, engine/passthrough
+prefixes. No unrestricted full-text filter, replay snapshot, reduction estimate or
+savings telemetry is produced from a preview. M6's bounded pytest display filter
+uses committed CCR fragments. `max_tokens`, `budget`, engine/passthrough
 options and unknown bounded arguments are rejected before execution, as are
 paused/already-wrapped commands. `timeout` requires bounded mode, is finite and
 positive, defaults to 120 seconds and is capped at 3600 seconds. It includes
@@ -366,6 +370,38 @@ including Windows anonymous/named pipes. SSE is unaffected.
 The synchronous HTTP+SSE tool path can use bounded capture and timeout, retaining
 its existing execution lock and transport quotas. **M5 cancellation and the
 two-request dispatcher apply only to stdio**; SSE cancellation is not implemented.
+
+### Bounded pytest filtering and rollout (M6)
+
+Bounded CLI/MCP can now reduce recognized pytest logs by reading committed,
+already-redacted CCR fragments incrementally. Existing safe-filter recognizers
+fold routine pass/xdist records before diagnostics. A direct pytest command or
+the existing complete-session signature (header, collection, final summary) is
+required. Stdout and stderr remain separate; filters never infer execution status.
+
+Filtering scans at most 8 MiB / 131072 lines, with a two-second cooperative scan
+budget. A display candidate is capped at 16 KiB per stream. If it overflows,
+bounded first/latest diagnostic context windows in each third of the log plus
+head/tail excerpts are shown, explicitly marked as sampled. Lines in sampled
+windows may be excerpts, not complete records. For input up to 64 KiB, an existing
+pure pytest diagnostic helper may also fold captured I/O and repetitive frames.
+Unrestricted specialized/full-text filters are not run on large bounded logs.
+
+Unknown formats, input/time limits, incomplete captures and filter failures use
+the existing preview + CCR response with a visible filter note. A filter failure
+does not replace the observed exit status or destroy valid recovery. A detected
+storage/integrity failure invalidates stale recovery claims and is reported as
+an execution/storage problem. Display limits (`max_lines`/`--max-lines`) still
+apply and can omit diagnostics from the visible summary; status, filter coverage
+and recovery metadata remain outside that limit, including with `--quiet`.
+Token budgets remain unsupported rather than silently dropping those notices.
+
+This is post-capture processing, **not live progress**. Recovery is the full
+redacted-normalized artifact only when M3 and the current lookup confirm it;
+sampled diagnostics are never presented as the full log. No tokenizer vocabulary
+download or second command capture is required by this filtering path.
+
+**Rollout decision: keep bounded execution opt-in.** Local Linux measurements confirmed that increasing captured output from 16 MiB to 1 GiB did not increase peak runner RSS: the measured difference was −32 KiB, within the 64 MiB acceptance threshold. Cross-platform M6 CI validation, end-to-end workload measurements and further performance review remain necessary before enabling bounded execution by default.
 
 ### Legacy HTTP+SSE transport
 

@@ -67,22 +67,24 @@ def issue_lines(issues):
         yield f"[bounded issue: {phase}/{category}]\n"
 
 
-def render(result, max_lines):
+def render(result, max_lines, filter_views=()):
     child = "unknown" if result.returncode is None else str(result.returncode)
     parts = [
         f"[bounded execution: {result.termination_reason.value}; child_exit={child}; "
         f"capture={_state(result.capture.complete)}]\n"
     ]
-    for stream in result.streams:
-        lines = stream.capture.text.splitlines(keepends=True)
+    for index, stream in enumerate(result.streams):
+        filtered = filter_views[index] if filter_views else None
+        lines = (filtered.text if filtered else stream.capture.text).splitlines(keepends=True)
         text = "".join(lines[:max_lines])
-        truncated = len(lines) > max_lines or stream.preview_truncated is True
+        source_truncated = (
+            filtered.coverage == "sampled"
+            if filtered is not None and filtered.state == "pytest"
+            else stream.preview_truncated
+        )
+        truncated = len(lines) > max_lines or source_truncated is True
         preview = (
-            "truncated"
-            if truncated
-            else "complete"
-            if stream.preview_truncated is False
-            else "unknown"
+            "truncated" if truncated else "complete" if source_truncated is False else "unknown"
         )
         info = stream.recovery
         availability = (
@@ -98,6 +100,10 @@ def render(result, max_lines):
             f"[{stream.stream} preview; capture={_state(stream.capture.complete)}; "
             f"preview={preview}; recovery={recovery}{ref}; availability={availability}]\n"
         )
+        if filtered is not None:
+            parts.append(
+                f"[filter: {filtered.state}; coverage={filtered.coverage}; note={filtered.note}]\n"
+            )
         parts.append(text)
         if text and not text.endswith("\n"):
             parts.append("\n")
@@ -143,4 +149,7 @@ def execute(arguments, *, cancel_event=None):
         )
     except Exception:
         return "[bounded runner failed; capture/recovery state unknown]\n", True
-    return render(result, lines)
+    from usagetrim.core.bounded_filter import filter_execution
+
+    filtered = filter_execution(result, cancel_event=cancel_event)
+    return render(filtered.result, lines, filtered.views)

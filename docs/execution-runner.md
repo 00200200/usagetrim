@@ -245,7 +245,7 @@ coverage are provided below; no empirical resource result is implied by their ex
 The existing `scripts/benchmark_execution.py` now has an internal-runner mode.
 The legacy CLI/MCP baseline remains available with its previous 1 MiB default.
 Runner measurements default to 16 MiB; 256 MiB is a separate manual variant.
-1 GiB requires an explicit size selection **and** `--allow-gib`.
+1 GiB requires an explicit size selection and `--allow-gib`.
 
 ```bash
 PYTHONPATH=src python scripts/benchmark_execution.py --entry-point runner --size-mib 16
@@ -253,12 +253,16 @@ PYTHONPATH=src python scripts/benchmark_execution.py --entry-point runner --size
 PYTHONPATH=src python scripts/benchmark_execution.py --entry-point runner --sizes-mib 16 256 1024 --allow-gib > runner-resources.json
 ```
 
-Large profiles have **not been measured as part of this implementation**. In
-particular, `peak RSS(1 GiB) - peak RSS(16 MiB) <= 64 MiB` is an unverified target,
-not a claim. JSON reports `measured=false` / `within_64_mib=null` if either sample
-is absent, invalid, unmeasured or has a different method, environment or configuration.
-The target is informational and does not impose a CI performance gate. Repeating
-the same command is recommended; one pair is not a proof of all-size memory bounds.
+The resource harness was originally introduced without large-profile measurements.
+M6 subsequently measured 16 MiB, 256 MiB and 1 GiB workloads on Linux;
+results are documented in the M6 evidence section below.
+
+JSON reports `measured=false` / `within_64_mib=null` if either comparison sample
+is absent, invalid, unmeasured or uses a different measurement method,
+environment or configuration. The RSS target remains informational and does
+not impose a CI performance gate. Repeating measurements is recommended;
+one successful comparison does not prove bounded memory usage for every
+workload or platform.
 
 Each size runs in its own interpreter. That worker warms the actual runner/M2
 path with 64 KiB, clears warm-up artifacts, and measures the requested invocation
@@ -499,7 +503,131 @@ ruff check src/usagetrim/core/stream_redactor.py scripts/benchmark_execution.py 
 ruff format --check src/usagetrim/core/stream_redactor.py scripts/benchmark_execution.py tests/fixtures/execution/redactor_reference.py tests/test_stream_redactor.py tests/test_execution_streams.py tests/test_benchmark_execution.py
 ```
 
-## Manual verification
+## M6 filtering, resource validation and rollout
+
+`core.bounded_filter.filter_execution()` supplies bounded display views alongside
+the original M3 result. It runs after capture, iterating committed CCR fragments
+through the existing checksum-verifying reader. It never feeds raw pipe data to
+a filter, invokes `retrieve()` for a whole log, changes artifacts or records
+preview token savings. Stdout/stderr are filtered independently. No new queues,
+processes or reader threads are introduced by filters. M3 capture remains 8 KiB
+reads, an eight-event queue, 4 KiB stored fragments and 4 KiB base previews.
+
+Supported input is a directly recognized pytest command, using safe-filter's
+existing command policy, or its existing full-session signature. Other commands,
+including structured formats whose specialist needs whole input, stay previews.
+The incremental reducer reuses pass/xdist/diagnostic recognizers, folds routine
+records only before diagnostics and retains diagnostic text. The existing pure
+pytest diagnostic helper is allowed only for inputs at most 64 KiB; public
+whole-text/tokenizer/cache-writing filters are never used in the production
+bounded path. Legacy CLI/MCP filtering and specialized filters remain unchanged.
+
+Bounds per stream are 8 MiB scanned input, 131072 lines, M2's 16 KiB line bound,
+and a 16 KiB display body. A two-second cooperative deadline spans both streams.
+It is checked between bounded reads; a blocked native SQLite/kernel call cannot
+be preempted. Inputs above the cap are not scanned. If the folded candidate
+exceeds the display bound, retain head/tail (six lines each) plus first/latest
+five-line diagnostic windows in each third of the input. Sample lines reuse the
+existing diagnostic-line trimming policy and are additionally capped at 256
+UTF-8 prefix bytes plus an excerpt notice. Overlaps may repeat; coverage is
+explicitly `sampled`, never complete. Otherwise coverage is `filtered`, which
+still does not mean byte-identical output. Auxiliary state is fixed: a candidate
+bytearray, bounded windows, one quarantined line and bounded fragment buffers,
+independent of artifact size. This is a code-derived bound, not a measured RSS.
+
+Filter exceptions and scan/output limits discard candidates and use the M3
+preview, with a fixed safe note. No exception body is displayed. Incomplete
+capture, timeout and cancellation are not reinterpreted by filters. A newly
+observed missing/corrupt artifact or SQLite/permission/read failure invalidates
+stale availability/completeness and adds a storage issue; the actual child code
+and termination reason remain intact. CLI/MCP keep M4/M5 error semantics.
+Eviction can happen after a successful read; refs remain point-in-time local
+recovery, not backups. No candidate is published before iteration completes its
+aggregate integrity check. Redaction precedes artifact persistence and is applied
+again to the bounded display; pattern recognition still cannot detect all secrets.
+
+Status/recovery/filter metadata is outside the display-body/line caps. A caller
+requesting a token ceiling that cannot honestly include it is rejected by the
+existing M4/M5 validation, not silently truncated. `--safe`, passthrough, pause,
+`--engine none`, `--quiet`, request cancellation and stdio worker limits retain
+their existing meanings. Cancellation during post-processing discards its
+candidate; an execution already completed is not retroactively made incomplete.
+No live progress interface exists: first bounded progress is reported as null.
+First observation latency remains a storage acknowledgement, not user delivery.
+
+### Reproduce resource and quality reports
+
+The existing isolated resource harness now accepts `--filters`. It warms that
+same path, reports separate runner/producer peak RSS, total wall/throughput,
+filter latency, display bytes, retained payload and physical DB/WAL/SHM bytes,
+finalization, first observation and bounded-range retrieval latency. Source
+hashes/filter bounds are included for comparability. Logical payload retention
+and allocated SQLite file bytes are different measurements; freed pages may
+remain allocated. Use identical platform, Python, producer, flags and limits.
+
+```bash
+PYTHONPATH=src python scripts/benchmark_execution.py --entry-point runner --size-mib 16 --filters
+PYTHONPATH=src python scripts/benchmark_execution.py --entry-point runner --size-mib 256 --filters
+PYTHONPATH=src python scripts/benchmark_execution.py --entry-point runner --sizes-mib 16 1024 --allow-gib --filters
+PYTHONPATH=src python scripts/benchmark_execution.py --quality > /tmp/usagetrim-bounded-quality.json
+```
+
+256 MiB and 1 GiB remain manual profiles; 1 GiB additionally requires explicit
+opt-in. Ordinary CI uses only the small 64 KiB resource smoke check and fixtures,
+with no speed gates. RSS is self high-water/peak working set in an isolated
+worker; child RSS is separately reported, never added. The existing platform
+measurement caveats and cleanup guards apply. The record producer is an unknown
+format: resource reports honestly measure preview fallback plus filter-dispatch
+overhead, not pytest diagnostic quality. The fixture report covers the latter.
+
+`--quality` reuses the current corpus and does not execute commands. It replays
+fixtures into M2, compares required diagnostics and incremental recovery hashes
+against the redacted-normalized representation, and reports omitted signals
+even for unsupported formats. No baseline is changed. Its optional per-case
+legacy-safe comparison runs the existing `safe_compact_output(model="generic")`
+only below 64 KiB on the same normalized input. It uses no vocabulary download;
+this compares byte sizes and diagnostic preservation, not provider token accuracy
+or every CLI/MCP specialized path. Body bytes and legacy bytes including its
+recovery notice are labeled separately; do not claim equivalent output contracts
+or savings from their ratio. Quality latency is informational (bounded runs
+before the legacy-safe comparison, so it is not a cache-neutral speed contest).
+The original full-corpus `bench` remains available
+with its existing local-tokenizer prerequisite and unchanged baseline.
+
+### Evidence and rollout decision
+
+The following measurements were performed locally on Linux 6.14, Python 3.12.7 and SQLite 3.46.1, using the bounded runner with `--filters`.
+
+| M6 gate | Measured result |
+| --- | --- |
+| 16 MiB | 31.13 MiB peak RSS; 1.88 MiB/s |
+| 256 MiB | 31.32 MiB peak RSS; 1.92 MiB/s |
+| 1 GiB | 31.10 MiB peak RSS; 1.95 MiB/s |
+| RSS(1 GiB) − RSS(16 MiB) ≤ 64 MiB | **PASS: −32 KiB**, measured against a 64 MiB threshold |
+| Capture completeness | Complete for all three sizes; exit code 0 |
+| Corpus required diagnostics | PASS: 28/28 fixtures |
+| Exact redacted-normalized recovery | PASS: 28/28 fixtures |
+| Native Windows/macOS M6 integration | Pending cross-platform CI verification |
+
+The 16 MiB and 1 GiB measurements were collected in the same benchmark invocation. The 256 MiB result was collected separately under the same configuration.
+
+These are single-run measurements, not statistically characterized performance distributions. The synthetic resource producer exercises bounded capture and unsupported-format preview fallback, not large-scale pytest filtering.
+
+At 1 GiB, capture required approximately 526 seconds and 1.18 GiB of physical SQLite storage. Retention therefore remains proportional to captured output even though runner memory usage remains bounded.
+
+**Rollout decision: retain opt-in.** The initial Linux bounded-capture RSS acceptance target has been met. However, this does not establish equivalent resource behavior for all CLI/MCP workloads or operating systems.
+
+Default activation remains blocked pending native M6 CI verification, further end-to-end compatibility evidence and review of throughput, storage costs and unsupported formats.
+
+No live progress API is available. Pytest filtering remains bounded, and unsupported formats continue to use preview plus CCR recovery.
+
+```bash
+PYTHONPATH=src pytest tests/test_bounded_filter.py tests/test_execution_runner.py tests/test_execution_streams.py tests/test_execution_artifacts.py tests/test_execution_shutdown.py tests/test_cli_bounded.py tests/test_mcp_bounded.py tests/test_benchmark_execution.py -q
+ruff check src/usagetrim/core/bounded_filter.py src/usagetrim/core/benchmark.py src/usagetrim/cli.py src/usagetrim/mcp/bounded_exec.py scripts/benchmark_execution.py tests/test_bounded_filter.py tests/test_cli_bounded.py tests/test_mcp_bounded.py tests/test_benchmark_execution.py
+ruff format --check src/usagetrim/core/bounded_filter.py src/usagetrim/core/benchmark.py src/usagetrim/cli.py src/usagetrim/mcp/bounded_exec.py scripts/benchmark_execution.py tests/test_bounded_filter.py tests/test_cli_bounded.py tests/test_mcp_bounded.py tests/test_benchmark_execution.py
+```
+
+## Earlier manual verification commands
 
 The tests use real subprocesses in isolated, deadline-guarded test harnesses,
 bounded summaries and synchronization events. Harness termination is test

@@ -197,6 +197,34 @@ def test_bounded_line_limit_and_quiet_preserve_required_recovery_metadata(monkey
     assert ("bounded summary" in response.stderr) is (not quiet)
 
 
+def test_sampled_filter_metadata_survives_tiny_display_limit(monkeypatch):
+    from usagetrim.core import bounded_filter
+
+    value = result(code=7)
+    monkeypatch.setattr(execution_runner, "run_execution", lambda *args, **kwargs: value)
+    monkeypatch.setattr(
+        bounded_filter,
+        "filter_execution",
+        lambda *args, **kwargs: bounded_filter.FilteredExecution(
+            value,
+            tuple(
+                bounded_filter.FilterView(
+                    "diagnostic excerpt\nomitted context\n", "pytest", "sampled", "redacted_ccr"
+                )
+                for _ in value.streams
+            ),
+        ),
+    )
+    response = invoke("--quiet", "--max-lines", "1")
+    assert response.exit_code == 7
+    assert response.stdout == "diagnostic excerpt\n"
+    assert "coverage=sampled" in response.stderr
+    assert "child_exit=7" in response.stderr
+    assert "preview=truncated; recovery=complete" in response.stderr
+    assert "ref=tc_" + "a" * 16 in response.stderr
+    assert "ref=tc_" + "b" * 16 in response.stderr
+
+
 @pytest.mark.parametrize(
     "code,reason,expected",
     [
@@ -452,3 +480,28 @@ def test_bounded_real_failed_start_does_not_claim_success_or_leak_path(tmp_path)
     assert code == 126 and stdout == ""
     assert "execution: failed_to_start" in stderr and "child_exit=unknown" in stderr
     assert "PRIVATE_MISSING_EXECUTABLE" not in stderr
+
+
+def test_bounded_pytest_filter_keeps_late_failure_and_reference(tmp_path):
+    raw = (
+        "================ test session starts ================\ncollected 501 items\n"
+        + "tests/test_ok.py::test_ok PASSED\n" * 500
+        + "E AssertionError: late failure beyond original preview\n"
+        + "================ 1 failed, 500 passed in 0.10s ================\n"
+    )
+    path = tmp_path / "pytest.log"
+    path.write_text(raw, encoding="utf-8")
+    script = (
+        "import shutil,sys; f=open(sys.argv[1],encoding='utf-8'); "
+        "shutil.copyfileobj(f,sys.stdout,4096); raise SystemExit(7)"
+    )
+    code, stdout, stderr = cli_process([sys.executable, "-c", script, str(path)])
+    assert code == 7
+    assert "late failure beyond original preview" in stdout
+    assert "passing tests" in stdout and len(stdout.encode()) < 4096
+    assert "filter: pytest; coverage=filtered" in stderr
+    assert "child_exit=7" in stderr and "recovery=complete" in stderr
+    cache = ContextCache()
+    ref = references(stderr)["stdout"]
+    view = cache.read_artifact(ref, max_bytes=32768)
+    assert view.text == raw and view.metadata.complete
