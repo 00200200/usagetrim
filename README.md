@@ -140,7 +140,7 @@ in M4: full token counts are unavailable, and previews must not be reported as
 complete command output or savings. M3 records artifact/recovery metadata.
 Without `--bounded`, the existing execution, telemetry, output and exit behavior
 is unchanged. See [runner details](docs/execution-runner.md) for platform cleanup
-and synchronous-storage limitations. MCP integration is separate work.
+and synchronous-storage limitations. MCP has its own bounded opt-in described below.
 
 ---
 
@@ -275,6 +275,97 @@ Manual MCP configuration for Claude Desktop, Cursor, Codex, Windsurf:
 ```
 
 Path: `command -v usagetrim`. Use `--profile full` for every tool, `--profile coding` for core terminal tools, or `--profile desktop` for chat apps. [Client setup →](https://github.com/00200200/usagetrim/blob/main/docs/guide.md#connect-clients)
+
+### Opt-in bounded MCP execution (stdio)
+
+`usagetrim_exec` retains its existing shell-command behavior unless `bounded`
+is explicitly true:
+
+```json
+{
+  "name": "usagetrim_exec",
+  "arguments": {
+    "command": "python -m pytest -q",
+    "bounded": true,
+    "timeout": 60,
+    "max_lines": 40
+  }
+}
+```
+
+An optional absolute `cwd` is passed to the shell without changing the command
+string or the server's working directory. Environment is inherited. Bounded MCP
+children receive **empty stdin**, so a command cannot consume JSON-RPC messages;
+there is no PTY or interactive debugger/password support. The small internal
+stdin override leaves the runner/CLI default of inherited stdin unchanged.
+
+The result retains `content`, `isError`, and `structuredContent: {"isError": ...}`.
+Text includes separate stdout/stderr previews (4096-byte read limits per stream),
+observed child returncode, termination reason, capture completeness, currently
+available CCR references and recovery completeness. `max_lines` limits each
+preview (default 80). Preview truncation does not imply incomplete storage.
+Recovery concerns redacted, decoded/normalized text, not original bytes. Use
+`usagetrim_retrieve` with line ranges and inspect its truncation/completeness
+notice; references can expire through eviction. Redaction is conservative and
+pattern-based and cannot guarantee removal of every sensitive value.
+
+Unlike legacy exec's historical nonzero/isError behavior, bounded exec sets
+`isError=true` for nonzero exit, signal, timeout, failed start, cancellation or
+capture/storage/cleanup failures. Status is taken from M3 metadata, never log
+prefixes. No full-text filter, replay snapshot, reduction estimate or savings
+telemetry is produced from a preview. `max_tokens`, `budget`, engine/passthrough
+options and unknown bounded arguments are rejected before execution, as are
+paused/already-wrapped commands. `timeout` requires bounded mode, is finite and
+positive, defaults to 120 seconds and is capped at 3600 seconds. It includes
+execution/capture; M3's cleanup phases can follow the deadline.
+
+Stdio admits at most **two bounded requests**, including queued and cancelling
+work, using two fixed worker threads. There is no overflow backlog: excess calls
+receive JSON-RPC error `-32000` and may be retried later. `ping`, `tools/list`
+and further requests remain readable while bounded commands execute; legacy
+handlers still run synchronously. Replies may arrive out of order and must be
+matched by ID. All response writes are serialized; child output is captured,
+never written directly to protocol stdout. Duplicate active IDs receive an
+invalid-request error with `id: null`; the original request is left intact.
+
+Cancel an active bounded request using a notification (no `id`):
+
+```json
+{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":42}}
+```
+
+Each request owns a separate cancellation event. Cancellation accepted before
+reply publication suppresses that reply, requests M3 process-tree cleanup and
+retains any available **incomplete** recovery in CCR when execution is interrupted.
+Cancellation racing with an already finished execution cannot retroactively
+make its genuinely complete artifact incomplete. The slot remains occupied
+until actual worker cleanup finishes. Unknown, malformed or late cancellations
+do nothing; notifications receive no response. Cancellation racing with reply
+publication may be too late. Cancelled requests have no returned references;
+retained artifacts remain in the existing local CCR metadata/cache explorer.
+
+EOF/disconnect cancels pending bounded work and waits up to 20 seconds for the
+workers. A cleanup overrun is reported on stderr and exits nonzero rather than
+claiming clean shutdown. Python cannot safely interrupt native SQLite/kernel
+I/O or a blocked stdout write; such operations and M3's non-daemon readers may
+delay final process exit. Clients must continuously drain stdout. This limits
+bounded execution admission/output, not legacy operations, input JSON line size,
+or all memory in the server. No new authentication or sandbox is introduced.
+
+If a response write fails because the client closed its stdout reader, the
+server also stops waiting for more stdin, even if the client keeps that pipe
+open or has sent only part of a JSON line. Native input uses bounded reads with
+readiness polling (POSIX selectors; Windows `PeekNamedPipe`), without an extra
+reader thread or queue. UTF-8 decoding/newline state is retained across reads.
+The transport exclusively owns its fresh stdin descriptor; embedded callers
+must not pre-read it through a buffered wrapper. Fileless custom iterators and
+the native Windows console retain legacy iteration and require cooperative
+EOF/return from their reads; the interruptible guarantee applies to MCP pipes,
+including Windows anonymous/named pipes. SSE is unaffected.
+
+The synchronous HTTP+SSE tool path can use bounded capture and timeout, retaining
+its existing execution lock and transport quotas. **M5 cancellation and the
+two-request dispatcher apply only to stdio**; SSE cancellation is not implemented.
 
 ### Legacy HTTP+SSE transport
 

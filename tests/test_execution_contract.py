@@ -29,6 +29,15 @@ def test_command_representations_preserve_input_and_hide_payloads():
         shell.shell_command = "changed"
 
 
+def test_protocol_stdin_is_opt_in_and_legacy_inheritance_remains_default():
+    assert request().stdin_mode == "inherit"
+    isolated = ExecutionRequest(ExecutionMode.SHELL, shell_command="fixture", stdin_mode="null")
+    assert isolated.stdin_mode == "null"
+    for mode in (None, True, "pipe", []):
+        with pytest.raises(ValueError, match="stdin mode"):
+            ExecutionRequest(ExecutionMode.ARGV, argv=("fixture",), stdin_mode=mode)
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [

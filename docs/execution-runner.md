@@ -4,7 +4,9 @@
 per-execution cancellation and owned-tree shutdown. M4 exposes it through the
 opt-in CLI `run --bounded --compact` path, documented in the
 [CLI guide](../README.md#opt-in-bounded-command-capture). Default CLI execution and
-MCP `usagetrim_exec` retain their existing paths; MCP integration is separate work.
+MCP `usagetrim_exec` retain their existing paths unless explicitly opted in. M5
+adds bounded MCP execution and stdio cancellation; see the
+[MCP guide](../README.md#opt-in-bounded-mcp-execution-stdio).
 
 ## API
 
@@ -34,7 +36,10 @@ for stream in result.streams:
 
 ARGV is passed directly with `shell=False`; it is never joined or reparsed.
 SHELL passes the opaque command to the platform's ordinary `Popen(shell=True)`
-shell. `cwd` is preserved; stdin and environment are inherited. No PTY is used.
+shell. `cwd` is preserved; environment and, by default, stdin are inherited.
+`ExecutionRequest.stdin_mode="null"` is a narrow opt-in for protocol hosts: M5
+uses DEVNULL so children cannot consume stdio JSON-RPC input. Existing requests
+and M4 CLI retain `stdin_mode="inherit"`. No PTY is used.
 The shell's exit status is the observed child status in shell mode.
 Process isolation is not PTY emulation: a new POSIX session has no controlling
 terminal, even though stdin is inherited. Programs requiring `/dev/tty` or shell

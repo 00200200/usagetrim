@@ -591,6 +591,7 @@ def run_execution(
                         else request.shell_command,
                         shell=request.mode is ExecutionMode.SHELL,
                         cwd=request.cwd,
+                        **({"stdin": subprocess.DEVNULL} if request.stdin_mode == "null" else {}),
                     )
             except (OSError, ValueError, TypeError):
                 issues.add("start", None, "failed_to_start")

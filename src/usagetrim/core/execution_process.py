@@ -25,7 +25,7 @@ class ProcessTree:
         if os.name == "nt":
             self.job = _WindowsJob()
 
-    def start(self, command, *, shell, cwd):
+    def start(self, command, *, shell, cwd, stdin=None):
         if self.job is None and not (
             callable(getattr(os, "waitid", None)) and hasattr(os, "WNOWAIT")
         ):
@@ -42,6 +42,8 @@ class ProcessTree:
         options.update(
             shell=shell, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
         )
+        if stdin is not None:
+            options["stdin"] = stdin
         factory = subprocess.Popen
         if isinstance(factory, type):
             # Retain the object before __init__: KeyboardInterrupt can arrive

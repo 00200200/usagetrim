@@ -48,7 +48,8 @@ class ExecutionRequest:
     shell_command: str | None = field(default=None, repr=False)
     cwd: str | None = field(default=None, repr=False)
     timeout_seconds: float | None = None
-    # Current paths inherit env and stdin. No environment snapshot is retained.
+    stdin_mode: Literal["inherit", "null"] = "inherit"
+    # Environment is inherited. Protocol hosts may explicitly isolate stdin.
     # A shell string stays opaque: it must never be reconstructed from argv.
 
     def __post_init__(self) -> None:
@@ -71,6 +72,8 @@ class ExecutionRequest:
         else:
             raise ValueError("unknown execution mode")
         _duration(self.timeout_seconds, positive=True)
+        if type(self.stdin_mode) is not str or self.stdin_mode not in {"inherit", "null"}:
+            raise ValueError("unknown stdin mode")
 
 
 @dataclass(frozen=True)
